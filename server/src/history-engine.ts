@@ -7,6 +7,7 @@ import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { resolve, dirname, join, sep } from 'node:path';
 import { closeSync, existsSync, readdirSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, renameSync, statfsSync, statSync, unlinkSync, writeSync, chmodSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { deflateSync, inflateSync } from 'node:zlib';
 import { FLAGON_BUDGET as FB, cellToSemanticCell, normalizedRowsDigest, normalizedGapDigest, normalizedCoverageDigest, coverageProjectionDigest, attachCoverage, archiveInventoryMatches, archiveInventoryDigest, segmentContinuityDigest, orderedControlDigest, inputProvenanceDigest, sourceRecordsDigest, sourceSpoolDigest, gapIdentity, validGapUpdate } from './stream-contract';
 import type { FlagOnHistoryPort, SpoolRecord, SpoolAck, RowsAndGapsCommit, RowsAndGapsReceipt, FlagOnRecoveryChunk, RawPosition, OperationFence, PinRequest, SegmentPin, SealedExport, RemoteIndexReceipt, ReclaimReceipt, EvidenceFile, Coverage, CommittedStreamRow } from './stream-contract';
 import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical, streamDigest } from './stream-contract';
@@ -1812,6 +1813,80 @@ CREATE INDEX IF NOT EXISTS fh_v2_session ON fh_v2_pane(session,pane);
 CREATE TABLE IF NOT EXISTS fh_v2_timeline(pane TEXT NOT NULL,n INTEGER NOT NULL,revision INTEGER NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,segment TEXT NOT NULL,payload TEXT,checksum TEXT NOT NULL,PRIMARY KEY(pane,n),UNIQUE(pane,kind,id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS fh_v2_segment ON fh_v2_timeline(pane,segment,n);
 `;
+// HS1: private disk format of H, not a wire/receipt version. Rows and the
+// receipt/checkpoint objects are stored as `HS01` + zlib deflate of their
+// canonical UTF-8, or as the canonical TEXT itself when deflate does not
+// shrink it. Every digest stays over the logical canonical string, so a
+// stored value is decoded (bounded) before its checksum is verified.
+// TEXT written by earlier binaries stays readable; the meta version fence
+// makes those binaries refuse the root before they write next to a BLOB.
+const V2_STORAGE_FORMAT = 'newarch-v2/HS01';
+const V2_PACKED_KINDS = new Set(['receipt', 'checkpoint', 'sealed-checkpoint']);
+type V2StoredRow = Record<string, unknown>;
+function v2Pack(payload: string): string | Uint8Array {
+  const packed = Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from(payload), { level: 6 })]);
+  return packed.byteLength < Buffer.byteLength(payload) ? packed : payload;
+}
+function v2Unpack(stored: unknown, limit: number): string {
+  if (typeof stored === 'string') {
+    fhAssert(Buffer.byteLength(stored) <= limit, 'v2 storage logical bound');
+    return stored;
+  }
+  fhAssert(stored instanceof Uint8Array && stored.byteLength > 4 && stored.byteLength <= limit
+    && Buffer.from(stored.subarray(0, 4)).toString('latin1') === 'HS01', 'v2 storage format tag');
+  const compressed = stored.subarray(4);
+  // maxOutputLength refuses before the oversize buffer exists; `info` exposes
+  // the consumed input because zlib otherwise ignores trailing bytes.
+  const decoded = inflateSync(compressed, { maxOutputLength: limit, info: true } as object) as unknown as
+    { buffer: Buffer; engine: { bytesWritten: number } };
+  fhAssert(decoded.engine.bytesWritten === compressed.byteLength, 'v2 storage trailing data');
+  return new TextDecoder('utf-8', { fatal: true }).decode(decoded.buffer);
+}
+/** Validate the logical row independently of its disk checksum. Also used before ACK. */
+function v2RowShape(row: CommittedStreamRow): void {
+  try {
+    const key = (text: string) => {
+      nonempty(text);
+      fhAssert(text.isWellFormed() && Buffer.byteLength(text) <= V2L.maxIdentityBytes, 'identity bound');
+    };
+    const pane = (p: PaneKey) => { paneKey(p); key(p.serverIdentity); key(p.paneId); };
+    const rowId = (id: SegmentRowId) => {
+      pane(id.pane); key(id.segmentId); safe(id.rowOrdinal);
+      fhAssert(equal(id.pane, row.id.pane), 'origin pane');
+    };
+    rowId(row.id); geometry(row.geometry);
+    fhAssert(row.geometry.columns <= V2L.maxColumns && row.geometry.rows <= V2L.maxRows, 'geometry');
+    content({ ...row, softWrap: row.wrapStatus === 'wrapped' });
+    fhAssert(row.cells.length === row.geometry.columns, 'cell count');
+    fhAssert(row.finalized === true && ['normal', 'alternate'].includes(row.buffer)
+      && ['wrapped', 'unwrapped', 'unknown'].includes(row.wrapStatus), 'row metadata');
+    fhAssert(row.wrapPad <= 1 && (row.wrapPad === 0 || row.wrapStatus === 'wrapped'), 'wrap pad');
+    for (let i = 0; i < row.cells.length; i++) {
+      const cell = row.cells[i]!;
+      fhAssert(cell.width !== 2 || row.cells[i + 1]?.width === 0, 'wide cell continuation');
+      fhAssert(cell.width !== 0 || (i > 0 && row.cells[i - 1]!.width === 2 && cell.text === ''), 'orphan continuation');
+    }
+    const origin = (o: CommittedStreamRow['origin']) => {
+      switch (o.kind) {
+        case 'durable': rowId(o.rowId); break;
+        case 'capture': key(o.snapshotId); safe(o.rowIndex); break;
+        case 'pipe':
+          pane(o.range.epoch.pane); key(o.range.epoch.attachId); key(o.range.epoch.collectorIncarnation);
+          safe(o.range.start); safe(o.range.end); safe(o.ordinal);
+          fhAssert(o.range.start <= o.range.end && equal(o.range.epoch.pane, row.id.pane), 'origin range/pane'); break;
+        default: throw Error('origin kind');
+      }
+    };
+    origin(row.origin);
+    fhAssert(Array.isArray(row.cellOrigins) && row.cellOrigins.length === row.cells.length, 'origin count');
+    row.cellOrigins.forEach(origin);
+  } catch (error) { throw Error('v2 row shape: ' + String(error)); }
+}
+function v2CanonicalValue(payload: string): unknown {
+  const value: unknown = JSON.parse(payload);
+  fhAssert(streamCanonical(value) === payload, 'v2 storage canonical equality');
+  return value;
+}
 class V2Storage {
   readonly #db: Database;
   readonly #cap: V2WriterCapability;
@@ -1826,9 +1901,9 @@ class V2Storage {
       db.exec(V2_SCHEMA);
       db.query('INSERT OR IGNORE INTO fh_v2_meta VALUES(1,0,?,?)').run(randomUUID(), 'newarch-v2');
       const meta = db.query('SELECT * FROM fh_v2_meta WHERE id=1').get() as SqlRow;
-      fhAssert(meta.version === 'newarch-v2', 'unsupported v2 storage');
+      fhAssert(meta.version === 'newarch-v2' || meta.version === V2_STORAGE_FORMAT, 'unsupported v2 storage');
       const next = Number(meta.generation) + 1; safe(next);
-      db.query('UPDATE fh_v2_meta SET generation=? WHERE id=1').run(next);
+      db.query('UPDATE fh_v2_meta SET generation=?,version=? WHERE id=1').run(next, V2_STORAGE_FORMAT);
       return next;
     }).immediate();
     this.#secret = String((db.query('SELECT secret FROM fh_v2_meta WHERE id=1').get() as SqlRow).secret);
@@ -1936,13 +2011,15 @@ class V2Storage {
   private get<T>(kind: string, pane: string, id: string): T | null {
     const r = this.#db.query('SELECT payload,checksum FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').get(kind, pane, id) as SqlRow | null;
     if (!r) return null;
-    fhAssert(r.checksum === v2Digest('stored-object', { kind, pane, id, payload: r.payload }), 'v2 corrupt object');
-    return JSON.parse(String(r.payload)) as T;
+    const payload = v2Unpack(r.payload, V2L.checkpointBytesPerPane + V2L.pageBytes);
+    fhAssert(r.checksum === v2Digest('stored-object', { kind, pane, id, payload }), 'v2 corrupt object');
+    return v2CanonicalValue(payload) as T;
   }
   private put(kind: string, pane: string, id: string, value: unknown): void {
     nonempty(id); const payload = streamCanonical(value);
     fhAssert(Buffer.byteLength(payload) <= V2L.checkpointBytesPerPane + V2L.pageBytes, 'v2 object bound');
-    this.#db.query('INSERT OR REPLACE INTO fh_v2_object VALUES(?,?,?,?,?)').run(kind, pane, id, payload,
+    this.#db.query('INSERT OR REPLACE INTO fh_v2_object VALUES(?,?,?,?,?)').run(kind, pane, id,
+      V2_PACKED_KINDS.has(kind) ? v2Pack(payload) : payload,
       v2Digest('stored-object', { kind, pane, id, payload }));
   }
   private owner(p: PaneKey): V2OwnerRecord | null {
@@ -2098,11 +2175,11 @@ class V2Storage {
           fhAssert(durable && issued?.status === 'ok' && v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint),
             'v2 durable input authority');
           for (const row of b.rows) {
-            content({ ...row, softWrap: row.wrapStatus === 'wrapped' }); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
+            v2RowShape(row); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
             nonempty(row.id.segmentId); safe(row.id.rowOrdinal);
             fhAssert(!this.get('segment-seal', key, row.id.segmentId), 'v2 sealed segment');
             const metrics = this.get<{ bytes: number; rows: number }>('segment-stats', key, row.id.segmentId)
-              ?? this.#db.query("SELECT COALESCE(SUM(length(CAST(payload AS BLOB))+1),0) AS bytes,COUNT(*) AS rows FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row'").get(key, row.id.segmentId) as { bytes: number; rows: number };
+              ?? this.segmentMetrics(key, row.id.segmentId);
             const rowBytes = metrics.bytes + bytes(row) + 1;
             fhAssert(rowBytes <= FB.archiveChunkBytes / 2 && metrics.rows < 65536, 'v2 segment full; seal and rotate');
             fhAssert(row.id.rowOrdinal === metrics.rows, 'v2 row order');
@@ -2172,14 +2249,42 @@ class V2Storage {
   private append(pane: string, revision: number, kind: string, id: string, segment: string, value: unknown): void {
     const n = Number((this.#db.query('SELECT COALESCE(MAX(n),0)+1 AS n FROM fh_v2_timeline WHERE pane=?').get(pane) as SqlRow).n);
     const payload = streamCanonical(value); fhAssert(Buffer.byteLength(payload) <= V2L.pageBytes - 64, 'v2 timeline entry bound');
-    this.#db.query('INSERT INTO fh_v2_timeline VALUES(?,?,?,?,?,?,?,?)').run(pane, n, revision, kind, id, segment, payload,
+    this.#db.query('INSERT INTO fh_v2_timeline VALUES(?,?,?,?,?,?,?,?)').run(pane, n, revision, kind, id, segment, kind === 'row' ? v2Pack(payload) : payload,
       v2Digest('timeline', { pane, n, revision, kind, id, segment, payload }));
   }
-  private timeline(r: SqlRow): V2HistoryPage['entries'][number] {
-    fhAssert(r.payload !== null && r.checksum === v2Digest('timeline', { pane: r.pane, n: r.n, revision: r.revision,
-      kind: r.kind, id: r.id, segment: r.segment, payload: r.payload }), 'v2 corrupt timeline');
-    const value = JSON.parse(String(r.payload));
+  /** The stored timeline record with its payload decoded back to the
+   * canonical string the checksum and every export were defined over. */
+  private logicalTimeline(r: V2StoredRow): V2StoredRow & { payload: string } {
+    const payload = v2Unpack(r.payload, V2L.pageBytes - 64);
+    fhAssert(r.checksum === v2Digest('timeline', { pane: r.pane, n: r.n, revision: r.revision,
+      kind: r.kind, id: r.id, segment: r.segment, payload }), 'v2 corrupt timeline');
+    const value = v2CanonicalValue(payload);
+    if (r.kind === 'row') {
+      const row = value as CommittedStreamRow;
+      v2RowShape(row);
+      fhAssert(v2PaneKey(row.id.pane) === r.pane && streamCanonical(row.id) === r.id
+        && row.id.segmentId === r.segment, 'v2 row storage identity');
+    }
+    return { ...r, payload };
+  }
+  private timeline(r: V2StoredRow): V2HistoryPage['entries'][number] {
+    const value = JSON.parse(this.logicalTimeline(r).payload);
     return r.kind === 'row' ? { kind: 'row', row: value } : { kind: 'incident', incident: value };
+  }
+  /** Logical size of a segment without its stats object: the canonical bytes
+   * SUM(length(payload)) measured before HS1, never the physical BLOB size. */
+  private segmentMetrics(pane: string, segment: string): { bytes: number; rows: number } {
+    const metrics = { bytes: 0, rows: 0 };
+    for (const row of this.#db.query("SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? AND kind='row' ORDER BY n")
+      .iterate(pane, segment) as Iterable<SqlRow>) {
+      metrics.bytes += Buffer.byteLength(this.logicalTimeline(row).payload) + 1;
+      metrics.rows++;
+    }
+    return metrics;
+  }
+  private *exportRecords(pane: string, segment: string): Iterable<V2StoredRow> {
+    for (const row of this.#db.query('SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n')
+      .iterate(pane, segment) as Iterable<SqlRow>) yield this.logicalTimeline(row);
   }
   private token(payload: unknown): string {
     const data = Buffer.from(streamCanonical(payload)).toString('base64url');
@@ -2328,7 +2433,7 @@ class V2Storage {
       finally { closeSync(fd); }
       renameSync(file + '.tmp', file); fhSyncDir(this.root); return fhEvidence(file);
     };
-    const data = write(path, this.#db.query('SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n').iterate(key, seal.segmentId), Math.min(FB.archiveChunkBytes, this.#config.storage.stagingCapBytes));
+    const data = write(path, this.exportRecords(key, seal.segmentId), Math.min(FB.archiveChunkBytes, this.#config.storage.stagingCapBytes));
     const cp = this.get('sealed-checkpoint', key, sealId);
     const meta = write(manifest, [{ schema: 'newarch-v2', storeId: this.storeId, seal, checkpoint: cp, files: [data] }], Math.min(V2L.checkpointBytesPerPane + V2L.pageBytes, this.#config.storage.stagingCapBytes - data.bytes));
     const exported: SealedExport = { kind: 'sealed-export', operationId, storeUUID: this.storeId, pane, segmentId: seal.segmentId,
