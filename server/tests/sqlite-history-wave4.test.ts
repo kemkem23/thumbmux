@@ -1997,3 +1997,276 @@ test('H v2 reserve rearm refuses pending, tampered, foreign and stale-stamped st
     } finally { await f.cleanup(); }
   }
 });
+
+// HS1 (H-STORE PLAN §5.1/§5.3): H's private lossless storage codec. Rows come
+// from the real decoder (v2BirthCheckpoint -> evaluateV2Prefix) with 78 cells
+// and 78 origins each, never the one-cell fixture row, because the disk
+// budget is about the shape burst capture really writes.
+import { deflateSync, inflateSync } from 'node:zlib';
+import { evaluateV2Prefix, v2BirthCheckpoint } from '../src/capture-engine';
+type Hs1Fixture = Awaited<ReturnType<typeof h2fixture>>;
+type Hs1State = { cp: H2.V2LiveCheckpoint; pending: number[]; line: number; segment: string; segments: number; segmentBytes: number;
+  rows: number; commits: number; long: boolean; autoRotate: boolean };
+const HS1_MIB = 1024 * 1024;
+function hs1Text(i: number, long: boolean): string {
+  if (long && i % 7 === 6) return `wrap-${i} ` + 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.repeat(3);
+  switch (i % 5) {
+    case 0: return `B${String(i).padStart(5, '0')}`;
+    case 1: return `สวัสดีประเทศไทย ${i} UTF-8 😀`;
+    case 2: return `\x1b[31mRED\x1b[0m ${i} done`;
+    case 3: return '';
+    default: return `sh-r ${i} \x1b[36mcolor\x1b[0m ไทย漢字😀 ` + 'x'.repeat(12);
+  }
+}
+async function hs1Activate(f: Hs1Fixture, long = false): Promise<Hs1State> {
+  await f.reserve();
+  const cp = v2BirthCheckpoint(f.descriptor, f.ready.byte0);
+  await f.commit({ kind: 'activate', ready: f.ready, checkpoint: cp }, 'hs1-activate');
+  return { cp, pending: [], line: 0, segment: 'hs1-seg-0', segments: 1, segmentBytes: 0, rows: 0, commits: 0, long, autoRotate: true };
+}
+/** One decoder prefix as a batch command; state advances only via apply(). */
+function hs1Plan(f: Hs1Fixture, st: Hs1State, maxLines = 256) {
+  // Rotate before a full prefix (<= 2 MiB serialized) could cross H's 8 MiB segment.
+  if (st.autoRotate && st.segmentBytes + 2 * HS1_MIB + 4096 > 8 * HS1_MIB) { st.segment = 'hs1-seg-' + st.segments++; st.segmentBytes = 0; }
+  const newlines = () => st.pending.reduce((n, b) => n + (b === 10 ? 1 : 0), 0);
+  while (newlines() < maxLines && newlines() < 256) {
+    let text = ''; for (let j = 0; j < 256; j++) text += hs1Text(st.line++, st.long) + '\r\n';
+    st.pending = [...st.pending, ...Buffer.from(text)];
+  }
+  let cut = st.pending.length;
+  for (let i = 0, seen = 0; i < st.pending.length; i++) if (st.pending[i] === 10 && ++seen === maxLines) { cut = i + 1; break; }
+  const bytes = st.pending.slice(0, cut), start = st.cp.through.byteOffset;
+  const owner = h2value(f.port.reader.owner(f.pane))!;
+  const r = evaluateV2Prefix({ pane: f.descriptor, checkpoint: st.cp, raw: { epoch: st.cp.through.epoch, start, end: start + bytes.length },
+    bytes, observedAtMonoMs: 1, pendingSinceMonoMs: null }, H2.NEWARCH_V2_DEFAULT_CONFIG, { wallMs: 0, clockEpoch: 'replay',
+    durableRevision: owner.durableRevision, rowTarget: { segmentId: st.segment,
+      nextRowOrdinal: st.cp.frontier?.segmentId === st.segment ? st.cp.frontier.rowOrdinal + 1 : 0 } });
+  if ('kind' in r) throw Error('decoder gap ' + JSON.stringify(r).slice(0, 400));
+  const input = f.issue({ kind: 'synced-spool' as const, version: 1 as const, through: r.checkpoint.through, recordDigest: 'b'.repeat(64),
+    commitId: 'hs1-input-' + st.commits + '-' + start, segmentId: 'raw-1' });
+  const command: H2.V2WriteCommand = { kind: 'batch', batch: { rows: r.rows, decisions: [], incidents: [], checkpoint: r.checkpoint, input } };
+  const canonical = r.rows.map(row => H2.streamCanonical(row));
+  return { command, rows: r.rows, canonical, apply() {
+    st.cp = r.checkpoint; st.pending = st.pending.slice(r.consumed.end - r.consumed.start); st.commits++;
+    st.rows += r.rows.length; st.segmentBytes += canonical.reduce((n, c) => n + Buffer.byteLength(c) + 1, 0);
+  } };
+}
+async function hs1Step(f: Hs1Fixture, st: Hs1State, maxLines = 256): Promise<string[]> {
+  const planned = hs1Plan(f, st, maxLines);
+  await f.commit(planned.command, 'hs1-batch-' + st.commits); planned.apply(); return planned.canonical;
+}
+async function hs1ReadAll(f: Hs1Fixture): Promise<{ status: 'ok'; rows: string[] } | { status: 'error'; message: string }> {
+  const rows: string[] = []; let cursor: H2.NewarchV2HistoryCursor | null = null;
+  for (;;) {
+    // Small pages: page() re-measures the whole page per entry (pre-HS1 cost).
+    const page = await f.page(16, cursor);
+    if (page.status !== 'ok') return { status: 'error', message: JSON.stringify(page) };
+    for (const e of page.value.entries) if (e.kind === 'row') rows.push(H2.streamCanonical(e.row));
+    if (page.value.after.kind !== 'more') return { status: 'ok', rows };
+    cursor = page.value.after.cursor;
+  }
+}
+function hs1Db<T>(root: string, f: (db: Database) => T): T {
+  const db = new Database(join(root, 'flag-on-v1.sqlite'));
+  try { return f(db); } finally { db.close(); }
+}
+function hs1Types(db: Database) {
+  const count = (sql: string) => Number((db.query(sql).get() as { n: number }).n);
+  return { rowBlob: count("SELECT COUNT(*) n FROM fh_v2_timeline WHERE kind='row' AND typeof(payload)='blob'"),
+    rowText: count("SELECT COUNT(*) n FROM fh_v2_timeline WHERE kind='row' AND typeof(payload)='text'"),
+    packedObjectText: count("SELECT COUNT(*) n FROM fh_v2_object WHERE kind IN ('receipt','checkpoint','sealed-checkpoint') AND typeof(payload)='text'"),
+    packedObjectBlob: count("SELECT COUNT(*) n FROM fh_v2_object WHERE kind IN ('receipt','checkpoint','sealed-checkpoint') AND typeof(payload)='blob'"),
+    otherBlob: count("SELECT COUNT(*) n FROM fh_v2_object WHERE kind NOT IN ('receipt','checkpoint','sealed-checkpoint') AND typeof(payload)='blob'")
+      + count("SELECT COUNT(*) n FROM fh_v2_pane WHERE typeof(payload)<>'text'") };
+}
+/** Rewrites a root into the pre-HS1 writer's format: canonical TEXT payloads,
+ * untouched checksums and meta version `newarch-v2` (the exact value the base
+ * binary's gate requires). Nothing else is changed. */
+function hs1Downgrade(root: string): number {
+  return hs1Db(root, db => {
+    let n = 0;
+    for (const [table, keys] of [['fh_v2_timeline', ['pane', 'n']], ['fh_v2_object', ['kind', 'pane', 'id']]] as const) {
+      for (const r of db.query(`SELECT ${keys.join(',')},payload FROM ${table} WHERE typeof(payload)='blob'`).all() as Record<string, string | number | Uint8Array>[]) {
+        const text = inflateSync((r.payload as Uint8Array).subarray(4)).toString('utf8');
+        db.query(`UPDATE ${table} SET payload=? WHERE ${keys.map(k => k + '=?').join(' AND ')}`).run(text, ...keys.map(k => r[k] as string | number)); n++;
+      }
+    }
+    db.query("UPDATE fh_v2_meta SET version='newarch-v2' WHERE id=1").run();
+    return n;
+  });
+}
+
+test('HS1 real decoder rows stay within 8 KiB per row on disk, read back byte-identical and export canonical records', async () => {
+  const f = await h2fixture();
+  try {
+    const st = await hs1Activate(f, true), written: string[] = [], segmentA: string[] = [];
+    st.autoRotate = false;
+    // Segment A to >= 7 MiB logical: large prefixes first, then small ones.
+    while (st.segmentBytes < 7 * HS1_MIB) {
+      const rows = await hs1Step(f, st, st.segmentBytes < 5 * HS1_MIB ? 256 : 4); written.push(...rows); segmentA.push(...rows);
+    }
+    h2value(await f.port.writer.close(f.port.capability));
+    // Without its stats object H must size the open segment from LOGICAL bytes.
+    hs1Db(f.root, db => db.query("DELETE FROM fh_v2_object WHERE kind='segment-stats' AND pane=? AND id='hs1-seg-0'").run(H2.v2PaneKey(f.pane)));
+    await f.reload();
+    const revision = h2value(f.port.reader.owner(f.pane))!.durableRevision;
+    const overflow = hs1Plan(f, st, 256);
+    expect(st.segmentBytes + overflow.canonical.reduce((n, c) => n + Buffer.byteLength(c) + 1, 0)).toBeGreaterThan(8 * HS1_MIB);
+    const refused = await f.port.writer.commit(f.port.capability, f.request(overflow.command, 'hs1-overflow'));
+    expect(refused.status).toBe('error');
+    expect(JSON.stringify(refused)).toContain('segment full');
+    expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(revision);
+    const tail = hs1Plan(f, st, 2); await f.commit(tail.command, 'hs1-tail'); tail.apply(); written.push(...tail.canonical); segmentA.push(...tail.canonical);
+    // Segment B.
+    st.segment = 'hs1-seg-' + st.segments++; st.segmentBytes = 0; st.autoRotate = true;
+    for (let i = 0; i < 2; i++) written.push(...await hs1Step(f, st));
+    h2value(await f.port.writer.close(f.port.capability));
+    const disk = hs1Db(f.root, db => {
+      const pages = Number((db.query('PRAGMA page_count').get() as { page_count: number }).page_count);
+      const pageSize = Number((db.query('PRAGMA page_size').get() as { page_size: number }).page_size);
+      const statsRow = db.query("SELECT payload,checksum FROM fh_v2_object WHERE kind='segment-stats' AND pane=? AND id='hs1-seg-0'").get(H2.v2PaneKey(f.pane)) as { payload: string };
+      const physical = Number((db.query("SELECT SUM(length(CAST(payload AS BLOB))) n FROM fh_v2_timeline WHERE kind='row'").get() as { n: number }).n);
+      return { dbBytes: pages * pageSize, physical, stats: JSON.parse(statsRow.payload) as { bytes: number; rows: number }, ...hs1Types(db) };
+    });
+    const logical = written.reduce((n, c) => n + Buffer.byteLength(c), 0);
+    console.log('HS1_DISK', JSON.stringify({ rows: written.length, commits: st.commits, logical, ...disk, dbBytesPerRow: Math.round(disk.dbBytes / written.length) }));
+    expect(written.length).toBe(st.rows);
+    expect(written.length).toBeGreaterThan(300);
+    // The open-segment stats rebuilt from rows equal the canonical bytes, never the BLOB size.
+    expect(disk.stats).toEqual({ bytes: segmentA.reduce((n, c) => n + Buffer.byteLength(c) + 1, 0), rows: segmentA.length });
+    expect({ rowText: disk.rowText, rowBlob: disk.rowBlob, packedObjectText: disk.packedObjectText, otherBlob: disk.otherBlob })
+      .toEqual({ rowText: 0, rowBlob: written.length, packedObjectText: 0, otherBlob: 0 });
+    expect(disk.dbBytes / written.length).toBeLessThanOrEqual(8192);
+    await f.reload();
+    const read = await hs1ReadAll(f);
+    expect(read.status).toBe('ok');
+    if (read.status === 'ok') expect(read.rows).toEqual(written);
+    expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(st.cp);
+    const sealed = await f.commit({ kind: 'seal', segmentId: 'hs1-seg-0' }, 'hs1-seal');
+    await f.commit({ kind: 'materialize-export', sealCommitId: sealed.commitId }, 'hs1-export');
+    const exported = h2value(f.port.reader.export(f.pane, 'hs1-export'))!;
+    const lines = readFileSync(exported.files[0]!.path, 'utf8').trimEnd().split('\n').map(l => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.map(l => l.payload)).toEqual(segmentA);
+    for (const l of lines) expect(l.checksum).toBe(H2.v2Digest('timeline', { pane: l.pane, n: l.n, revision: l.revision, kind: l.kind, id: l.id, segment: l.segment, payload: l.payload }));
+    const manifest = JSON.parse(readFileSync(exported.manifest.path, 'utf8').trimEnd()) as { checkpoint: unknown };
+    expect(manifest.checkpoint).toEqual(st.cp);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HS1 legacy TEXT root stays readable and lossless, gains compressed rows lazily and fences the old binary', async () => {
+  const f = await h2fixture();
+  try {
+    const st = await hs1Activate(f), written: string[] = [];
+    written.push(...await hs1Step(f, st), ...await hs1Step(f, st));
+    const last = hs1Plan(f, st), lastRequest = f.request(last.command, 'hs1-legacy-last');
+    const lastReceipt = h2value(await f.port.writer.commit(f.port.capability, lastRequest)); last.apply(); written.push(...last.canonical);
+    h2value(await f.port.writer.close(f.port.capability));
+    const schema = () => hs1Db(f.root, db => db.query("SELECT name,sql FROM sqlite_master WHERE name LIKE 'fh_v2%' ORDER BY name").all());
+    const before = schema();
+    expect(hs1Downgrade(f.root)).toBeGreaterThan(written.length);
+    const legacy = hs1Db(f.root, hs1Types);
+    expect({ rowBlob: legacy.rowBlob, packedObjectBlob: legacy.packedObjectBlob, rowText: legacy.rowText }).toEqual({ rowBlob: 0, packedObjectBlob: 0, rowText: written.length });
+    await f.reload();
+    // Lost ACK of a pre-upgrade operation: the stored TEXT receipt, unchanged.
+    const lastRetry = { ...lastRequest, fence: { ...lastRequest.fence, expectedGeneration: f.port.capability.generation } };
+    expect(h2value(await f.port.writer.commit(f.port.capability, lastRetry))).toEqual(lastReceipt);
+    const legacyRead = await hs1ReadAll(f);
+    expect(legacyRead.status === 'ok' ? legacyRead.rows : legacyRead).toEqual(written);
+    written.push(...await hs1Step(f, st), ...await hs1Step(f, st));
+    h2value(await f.port.writer.close(f.port.capability));
+    const mixed = hs1Db(f.root, db => ({ ...hs1Types(db), meta: db.query('SELECT generation,version FROM fh_v2_meta WHERE id=1').get() as { generation: number; version: string } }));
+    // History is not rewritten: the legacy TEXT rows remain and new rows are compressed.
+    expect(mixed.rowText).toBe(legacy.rowText);
+    expect(mixed.rowBlob).toBe(written.length - legacy.rowText);
+    expect(mixed.rowBlob).toBeGreaterThan(0);
+    expect(schema()).toEqual(before);
+    // Format fence: the base binary opens only `meta.version === 'newarch-v2'`
+    // and asserts that before its generation write, so it refuses this root.
+    expect(mixed.meta.version).toBe('newarch-v2/HS01');
+    expect(mixed.meta.version === 'newarch-v2').toBe(false);
+    await f.reload();
+    const all = await hs1ReadAll(f);
+    expect(all.status === 'ok' ? all.rows : all).toEqual(written);
+    h2value(await f.port.writer.close(f.port.capability));
+    // An unknown future format is refused before any write.
+    const fenced = hs1Db(f.root, db => db.query('SELECT generation,version FROM fh_v2_meta WHERE id=1').get() as { generation: number; version: string });
+    hs1Db(f.root, db => db.query("UPDATE fh_v2_meta SET version='newarch-v2/HS99' WHERE id=1").run());
+    const refused = await f.open();
+    expect(refused.status).toBe('error');
+    expect(JSON.stringify(refused)).toContain('unsupported v2 storage');
+    expect(hs1Db(f.root, db => db.query('SELECT generation,version FROM fh_v2_meta WHERE id=1').get())).toEqual({ ...fenced, version: 'newarch-v2/HS99' });
+    hs1Db(f.root, db => db.query('UPDATE fh_v2_meta SET version=? WHERE id=1').run(mixed.meta.version));
+    await f.reload();
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HS1 corrupt, truncated, trailing, unknown-tag, foreign and oversize stored payloads are errors, never rows or EOF', async () => {
+  const f = await h2fixture();
+  try {
+    const st = await hs1Activate(f), written: string[] = [];
+    written.push(...await hs1Step(f, st), ...await hs1Step(f, st));
+    h2value(await f.port.writer.close(f.port.capability));
+    const key = H2.v2PaneKey(f.pane);
+    const target = hs1Db(f.root, db => db.query("SELECT n,payload FROM fh_v2_timeline WHERE pane=? AND kind='row' ORDER BY n LIMIT 1 OFFSET 5").get(key) as { n: number; payload: Uint8Array });
+    const original = Buffer.from(target.payload);
+    expect(original.subarray(0, 4).toString('latin1')).toBe('HS01');
+    const flipped = Buffer.from(original); flipped[flipped.length - 6]! ^= 0x55;
+    const cases: [string, Uint8Array | string][] = [
+      ['truncated', original.subarray(0, original.length - 4)],
+      ['trailing', Buffer.concat([original, Buffer.from([0])])],
+      ['bit-flip', flipped],
+      ['unknown-tag', Buffer.concat([Buffer.from('HS02'), original.subarray(4)])],
+      ['foreign-row', Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from(written[6]!), { level: 6 })])],
+      ['invalid-utf8', Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from([0x7b, 0xff, 0xfe, 0x7d]))])],
+      ['empty-blob', new Uint8Array(0)],
+    ];
+    const outcomes: Record<string, string> = {};
+    for (const [name, stored] of cases) {
+      hs1Db(f.root, db => db.query('UPDATE fh_v2_timeline SET payload=? WHERE pane=? AND n=?').run(stored, key, target.n));
+      await f.reload();
+      const read = await hs1ReadAll(f);
+      outcomes[name] = read.status;
+      h2value(await f.port.writer.close(f.port.capability));
+    }
+    hs1Db(f.root, db => db.query('UPDATE fh_v2_timeline SET payload=? WHERE pane=? AND n=?').run(original, key, target.n));
+    expect(outcomes).toEqual(Object.fromEntries(cases.map(([name]) => [name, 'error'])));
+    // A tiny BLOB that inflates past the object bound, with a VALID logical
+    // checksum: only the inflater's output limit can refuse it.
+    const bomb = '{"pad":"' + 'x'.repeat(4 * HS1_MIB + 2 * HS1_MIB) + '"}';
+    const liveCheckpoint = hs1Db(f.root, db => db.query("SELECT payload,checksum FROM fh_v2_object WHERE kind='checkpoint' AND pane=? AND id='live'").get(key) as { payload: Uint8Array; checksum: string });
+    hs1Db(f.root, db => db.query("UPDATE fh_v2_object SET payload=?,checksum=? WHERE kind='checkpoint' AND pane=? AND id='live'")
+      .run(Buffer.concat([Buffer.from('HS01'), deflateSync(Buffer.from(bomb), { level: 9 })]), H2.v2Digest('stored-object', { kind: 'checkpoint', pane: key, id: 'live', payload: bomb }), key));
+    await f.reload();
+    expect(f.port.reader.checkpoint(f.pane).status).toBe('error');
+    h2value(await f.port.writer.close(f.port.capability));
+    hs1Db(f.root, db => db.query("UPDATE fh_v2_object SET payload=?,checksum=? WHERE kind='checkpoint' AND pane=? AND id='live'").run(liveCheckpoint.payload, liveCheckpoint.checksum, key));
+    // Control: the restored root reads every row and the checkpoint again.
+    await f.reload();
+    const control = await hs1ReadAll(f);
+    expect(control.status === 'ok' ? control.rows : control).toEqual(written);
+    expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(st.cp);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HS1 receipts and checkpoints are stored compressed and a lost-ACK retry after reopen returns the original receipt', async () => {
+  const f = await h2fixture();
+  try {
+    const st = await hs1Activate(f);
+    const planned = hs1Plan(f, st), request = f.request(planned.command, 'hs1-receipt');
+    const receipt = h2value(await f.port.writer.commit(f.port.capability, request)); planned.apply();
+    h2value(await f.port.writer.close(f.port.capability));
+    const key = H2.v2PaneKey(f.pane);
+    const stored = hs1Db(f.root, db => Object.fromEntries((db.query("SELECT kind,payload FROM fh_v2_object WHERE pane=? AND ((kind='receipt' AND id='hs1-receipt') OR (kind='checkpoint' AND id='live'))").all(key) as { kind: string; payload: Uint8Array }[])
+      .map(r => [r.kind, r.payload])));
+    expect(Buffer.from(stored.receipt!.subarray(0, 4)).toString('latin1')).toBe('HS01');
+    expect(inflateSync(stored.receipt!.subarray(4)).toString('utf8')).toBe(H2.streamCanonical(receipt));
+    expect(inflateSync(stored.checkpoint!.subarray(4)).toString('utf8')).toBe(H2.streamCanonical(st.cp));
+    await f.reload();
+    expect(f.port.capability.generation).toBeGreaterThan(receipt.generation);
+    // Same operation and digest at the new generation: H answers from storage.
+    const retry = { ...request, fence: { ...request.fence, expectedGeneration: f.port.capability.generation } };
+    expect(h2value(await f.port.writer.commit(f.port.capability, retry))).toEqual(receipt);
+    expect(h2value(f.port.reader.receipt(f.pane, 'hs1-receipt'))).toEqual(receipt);
+    expect(h2value(f.port.reader.checkpoint(f.pane))).toEqual(st.cp);
+  } finally { await f.cleanup(); }
+}, 60_000);
