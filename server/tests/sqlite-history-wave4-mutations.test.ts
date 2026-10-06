@@ -606,3 +606,69 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
     const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b6 pass\b/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);
+
+// HS2 mutants (PLAN §3.2). Same copied-tree runner; only the HS2 cases run and
+// each mutant must fail its NAMED test with an assertion. The contract-side
+// HS2 mutants are K_MUTANTS in contract-fixture.ts. Removing finalize() from
+// fhRows is deliberately absent: a prepare()d statement is never handed to
+// another caller, so it is a leak until GC, not a behaviour change.
+test('HS2 mutants: cached iterate, profile not persisted or not checked or checked late, 4096-byte pages, unbounded WAL', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'hs2-mutants-'));
+  const durable = /\(fail\) HS2 storage profile is durable/;
+  // `bun` = the Bun range where the kill is REQUIRED. Bun 1.3's query() cache
+  // never evicts, and H then happened to get a fresh statement (TMX-TRIAGE #1),
+  // so the cached-iterate mutant may survive there: logged, not asserted.
+  const mutations: { name: string; kills: RegExp; from: string; to: string; from2?: string; to2?: string; bun?: string }[] = [
+    { name: 'hs2-cached-iterate', kills: /\(fail\) HS2 abandoned scans leave the store usable/, bun: '>=1.4.0',
+      from: '  const statement = db.prepare(sql);\n  try { yield* statement.iterate(...params) as Iterable<SqlRow>; } finally { statement.finalize(); }',
+      to: '  yield* db.query(sql).iterate(...params) as Iterable<SqlRow>;' },
+    { name: 'hs2-profile-not-persisted', kills: durable,
+      from: "    if (!stored) this.put('storage-profile', '*', 'root', {", to: "    if (!stored && false) this.put('storage-profile', '*', 'root', {" },
+    { name: 'hs2-profile-mismatch-accepted', kills: durable,
+      from: "    else fhAssert(stored.digest === digest, 'v2 storage profile mismatch');", to: "    else fhAssert(true, 'v2 storage profile mismatch');" },
+    { name: 'hs2-profile-checked-after-generation', kills: durable,
+      from: '      this.bindStorageProfile();\n', to: '',
+      from2: '    this.#secret = String(', to2: '    this.bindStorageProfile(); this.#secret = String(' },
+    { name: 'hs2-page-size-constant-4096', kills: /\(fail\) HS2 page limit follows the real page size/,
+      from: 'v2DatabasePageLimit(this.#profile, pageSize)', to: 'v2DatabasePageLimit(this.#profile, 4096)' },
+    { name: 'hs2-wal-not-bounded', kills: /\(fail\) HS2 WAL stays inside the allocation/,
+      from: '    if (!allocation) return false;\n', to: '    return false;\n' },
+  ];
+  try {
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const run = async (name: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS2'],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err;
+      console.log('HS2_MUTANT', JSON.stringify({ name, bun: Bun.version, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [], summary: output.slice(-600) }));
+      expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      return { exit, output };
+    };
+    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b4 pass\b/);
+    for (const m of mutations) {
+      expect(original.split(m.from).length).toBe(2);
+      let mutant = original.replace(m.from, m.to);
+      if (m.from2) { expect(mutant.split(m.from2).length).toBe(2); mutant = mutant.replace(m.from2, m.to2!); }
+      try {
+        writeFileSync(file, mutant);
+        const red = await run(m.name);
+        if (m.bun && !Bun.semver.satisfies(Bun.version, m.bun)) {
+          console.log('HS2_MUTANT_NOT_REQUIRED', JSON.stringify({ name: m.name, bun: Bun.version, killed: red.exit !== 0 && m.kills.test(red.output) }));
+          continue;
+        }
+        expect(red.exit).not.toBe(0);
+        expect(red.output).toMatch(m.kills);
+      } finally { writeFileSync(file, original); }
+    }
+    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b4 pass\b/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 600_000);
