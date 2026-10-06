@@ -150,6 +150,7 @@ omitting an entire nested block.
 | `mux` | The shared `tmuxMux`. This seam supplies only authoritative session-list pushes to `HubView` and `SessionView`; `EmbedView` does not read it. An override does not replace the fallback HUD connection state, default key transport, or the pane output, history, resize, and connection observation inside `TermView`. Those remain on the shared singleton. | `mux: tmuxMux` |
 | `sendKeys` | Calls `sendKeys` on the shared `tmuxMux`. Both direct keys and the steps produced by composer submission use this transport by default. Supply this adapter to replace input independently; changing `mux` changes only live session rows and does not redirect keys or `TermView`. | `sendKeys: (session, keys) => tmuxMux.sendKeys(session, keys)` |
 | `sendSubmissionKeys` | Optional transport for composer-submission steps (`submitPlan` output). If present, the shell awaits each step before the next one and uses this path instead of `sendKeys` for composer submissions only. | `sendSubmissionKeys: (session, keys) => void` |
+| `submitText` | Absent: COMPOSE sends keep the step path (`sendSubmissionKeys`, else `sendKeys`) exactly as before. Present: `SessionView` and `EmbedView` call it **once** per COMPOSE send with the string ComposerDock produced (ends trimmed, inner blank lines and indentation intact) and do **not** also send that COMPOSE through `sendSubmissionKeys`/`sendKeys`. It resolves a `SubmissionReceipt`; see [2.5](#25-semantic-submit-and-structured-prompt-history). DIRECT input, raw keys, shortcut sends and `SessionActionContext.submit` keep the step path. | `submitText: (session, text) => postSubmission(session, text)` |
 | `submitAgent` | Returns `"generic"`. The value is passed to `submitPlan`; the shell never infers an agent kind from the session name. | `submitAgent: () => "generic"` |
 | `routes` | In `ThumbmuxApp`, omission selects the internal `?session=` adapter. Standalone `HubView` and `SessionView` should receive host routes; their limited fallbacks are not a two-page router. | `routes: { openSession, showHub }` |
 | `routes.openSession` | No external callback by default. `HubView` invokes it with the exact selected name when routes are supplied. | `openSession: (name) => void goto("/terminals/" + encodeURIComponent(name))` |
@@ -238,6 +239,7 @@ fields.
 | `notes.load` | Not called when `notes` is absent. With the block present it is called for the current session. Load errors are swallowed; after an initial or session-changing failure the note remains empty. | `load: (session) => fetchText("/host/notes/" + encodeURIComponent(session))` |
 | `notes.save` | Not called when `notes` is absent. The editor closes immediately; the shell waits for the promise before committing the new note, and failure keeps the previously committed note. | `save: (session, text) => putText("/host/notes/" + encodeURIComponent(session), text)` |
 | `prompts` | No prompt load and no `PromptsPanel`. There is no automatic pane scanner in the app shell. With an adapter, loading begins when the HUD expands by default. If `promptsCollapsible` and `promptsInitiallyOpen` are both true, SessionView instead prefetches on mount, coalesces an in-flight expand with that request, and places the open prompt panel first. | `prompts: (session) => fetchJson("/host/prompts/" + encodeURIComponent(session))` |
+| `promptEntries` | Absent: `prompts` alone, as above. Present: called wherever `prompts` would be (same expand / prefetch timing). An array — **including `[]`** — is authoritative and `prompts` is not called; resolving `null` falls back to `prompts`, rendered exactly as before without source labels. A rejection keeps the last successful snapshot. See [2.5](#25-semantic-submit-and-structured-prompt-history). | `promptEntries: (session) => fetchEntries(session)` |
 | `bashSummaries` | No model call by default. Claude sessions get the stock TOOLS disclosure with direct **SHOW / HIDE / DISTILL** choices. HIDE renders each consecutive high-confidence Bash group as a one-third-row local divider with a left-aligned `hidden bash` label and a green rule filling its right side. DISTILL alone uses this adapter. Codex sessions use the same TOOLS action with **SHOW / HIDE** only and compact proven completed-tool output locally; they never call `bashSummaries`. Active status, background-running HUD, prompt/composer, prose, warnings, approvals and failures remain raw. Proven separator blanks may join a compact range; capture-start padding and retention seams remain raw. A fresh DISTILL view offers this adapter at most its newest ten completed Claude groups; later coalesced live updates offer only their newest newly-completed group, independent of scrolling. Missing adapters, rejected calls, and missing IDs settle once to a deterministic command preview. The host owns model choice, redaction, authentication, lifecycle checks, throttling, and durable caching. Raw rows remain canonical for copy, search, scrollback, retention, and ANSI state in every mode. | `bashSummaries: (session, blocks) => postJson("/host/bash-summaries", { session, blocks })` |
 | `upload` | No upload action, hidden file input, or composer file-paste handler. Supplying the block enables those only for sessions whose endpoint is a non-empty string. | `upload: { endpoint, dir, formatPrefill }` |
 | `upload.endpoint` | Required inside `upload`. Return `null` to intentionally hide upload UI for a session; an empty string is also treated as hidden. `basePath` does not fill this field. | `endpoint: (session) => "/terminal-api/upload?session=" + encodeURIComponent(session)` |
@@ -506,6 +508,82 @@ The snippet slots must be created in Svelte, not manufactured as HTML strings:
 
 <SessionView {session} {adapters} />
 ```
+
+### 2.5 Semantic submit and structured prompt history
+
+Two optional adapters let a host send a COMPOSE draft as one exact string and
+show it back exactly, instead of replaying keystrokes and re-reading the
+screen. Agent TUIs such as Claude Code and Codex wrap long prompts themselves
+(a real newline plus a two-space indent), so text scraped back from the screen
+cannot be trusted to have the lines the user typed. Both adapters are optional;
+omitting them keeps every earlier behavior.
+
+```ts
+import type { PromptEntry, SubmissionReceipt } from '@thumbmux/app/config';
+
+// AppAdapters (both optional; absent = previous behavior)
+submitText?: (session: string, text: string) => Promise<SubmissionReceipt>;
+promptEntries?: (session: string) => Promise<PromptEntry[] | null>;
+
+interface SubmissionReceipt {
+  status: 'sent' | 'rejected' | 'uncertain';
+  submissionId?: string;
+  reason?: string;
+}
+interface PromptEntry {
+  text: string;
+  source: 'ui' | 'screen';
+  state?: 'sent' | 'uncertain';
+  submissionId?: string;
+}
+```
+
+The two types are exported from `@thumbmux/app/config` (the package barrel
+re-exports `AppAdapters`, which names them).
+
+**Receipt statuses** — what the shell does with each:
+
+| Status | Meaning | Shell behavior |
+| --- | --- | --- |
+| `sent` | The host delivered the whole text. | Same as a successful step submission: the draft stays cleared. |
+| `rejected` | Refused before any byte reached the terminal (validation, lifecycle mismatch, id conflict). | The draft is restored to the composer. No notice. |
+| `uncertain` | Delivery may or may not have happened (for example the transport failed after it started, or the id is already in doubt). | The draft is restored and `labels.submissionUncertain` is shown. The shell never retries. |
+| *(promise rejects)* | Treated as `uncertain`. | As `uncertain`. |
+
+Any other or missing status is treated as `uncertain`.
+
+**Ids belong to the host.** The package never creates, reads, or forwards a
+submission id: `submitText` receives only `(session, text)`. A host creates one
+id per `submitText` call, may retry with that same id inside that one call (for
+example on a network error before any response), and a second press of SEND is
+a new call with a new id. `submissionId` on a receipt or entry is passed through
+untouched.
+
+**No timestamps.** Neither type carries a time. `promptEntries` returns rows
+already ordered newest first *within each source*; the panel never interleaves
+the two sources by time.
+
+**`null` versus `[]`.** `promptEntries` resolving an array (including `[]`)
+means "this is the complete answer" — the panel renders it and does not call
+`prompts`. `null` means "this server cannot answer" — the shell falls back to
+`prompts` and renders it exactly as before, with no source labels.
+
+**Rendering.** `PromptsPanel` (new optional `entries` prop) shows `source: 'ui'`
+rows first under `labels.promptSourceUi`, then `source: 'screen'` rows under
+`labels.promptSourceScreen`. An empty section renders no heading. A `ui` row
+with `state: 'uncertain'` carries a `labels.promptUncertain` badge. Headings and
+badges are separate elements: tapping a row prefills `entry.text` byte for byte
+(no whitespace collapsing, no clamping — the preview may be visually clamped,
+the payload never is).
+
+New labels (English defaults; override through `labels`):
+
+| Key | Default |
+| --- | --- |
+| `promptSourceUi` | `sent from this UI` |
+| `promptSourceScreen` | `from screen — check line breaks before sending` |
+| `promptUncertain` | `delivery unknown` |
+| `submissionUncertain` | `Not sure it was sent — your draft is back. Check the terminal before resending.` |
 
 ## 3. Pairing with `createAppRoutes`
 
