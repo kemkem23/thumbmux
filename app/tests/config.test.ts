@@ -51,6 +51,9 @@ const EXPECTED_LABEL_KEYS = [
   'noteEdit',
   'noteEmpty',
   'noteSave',
+  'promptSourceScreen',
+  'promptSourceUi',
+  'promptUncertain',
   'promptsEmpty',
   'promptsLoading',
   'promptsTitle',
@@ -63,6 +66,7 @@ const EXPECTED_LABEL_KEYS = [
   'shortcutSend',
   'shortcutUp',
   'shortcutsTitle',
+  'submissionUncertain',
   'terminalAria',
   'themeBackground',
   'themeCustom',
@@ -76,6 +80,8 @@ const EXPECTED_LABEL_KEYS = [
 const plannedAdapters = {
   sendKeys: (_session: string, _keys: string) => {},
   sendSubmissionKeys: async (_session: string, _keys: string) => {},
+  submitText: async (_session: string, _text: string) => ({ status: 'sent', submissionId: 'host-id' }),
+  promptEntries: async (_session: string) => [{ text: 'a\n\n  b', source: 'ui', state: 'sent' }],
   submitAgent: () => 'generic',
   routes: { openSession: (_name: string) => {}, showHub: () => {} },
   spawn: {
