@@ -26,7 +26,8 @@ v0.20.5 behavior byte for byte.
   pick returns `entry.text` byte for byte. The `prompts` prop is unchanged.
 - **Types** `SubmissionReceipt` and `PromptEntry` from `thumbmux/app` (barrel) and `thumbmux/app/config`.
 - **Labels** `promptSourceUi`, `promptSourceScreen`, `promptUncertain`,
-  `submissionUncertain` (English defaults).
+  `submissionUncertain` — optional `AppLabels` keys with English defaults, so a
+  host that declares the full v0.20.5 `AppLabels` set still compiles.
 
 Contract details (id ownership, statuses, `null` vs `[]`): `docs/app.md` §2.5.
 

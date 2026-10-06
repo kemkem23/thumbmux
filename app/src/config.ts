@@ -431,14 +431,14 @@ export interface AppLabels {
   promptsLoading: string;
   promptsEmpty: string;
   /** Heading over exact rows sent from the UI (`PromptEntry.source: 'ui'`). */
-  promptSourceUi: string;
+  promptSourceUi?: string;
   /** Heading over rows rebuilt from the terminal screen. */
-  promptSourceScreen: string;
+  promptSourceScreen?: string;
   /** Badge on a `ui` row whose delivery is unknown. */
-  promptUncertain: string;
+  promptUncertain?: string;
   /** Shown after `submitText` reports `uncertain` (or rejects) and the draft
    * has been put back. */
-  submissionUncertain: string;
+  submissionUncertain?: string;
 
   shortcutsTitle: string;
   shortcutAdd: string;
@@ -546,4 +546,4 @@ export const DEFAULT_APP_LABELS = Object.freeze({
   composerDirectAria: 'Send keys directly to the terminal',
 
   close: 'Close',
-} satisfies AppLabels);
+} satisfies Required<AppLabels>);

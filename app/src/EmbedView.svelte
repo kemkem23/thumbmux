@@ -28,7 +28,7 @@
     claimGeometry?: boolean;
   } = $props();
 
-  let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
+  let labels = $derived<Required<AppLabels>>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let configuredTermProps = $derived(adapters.termProps?.(session) ?? {});
   let configuredBg = $derived(
     adapters.theme?.bgFor?.(session) ?? adapters.theme?.defaultBg ?? '#101014',

@@ -580,7 +580,7 @@ badges are separate elements: tapping a row prefills `entry.text` byte for byte
 (no whitespace collapsing, no clamping — the preview may be visually clamped,
 the payload never is).
 
-New labels (English defaults; override through `labels`):
+New labels (optional `AppLabels` keys with English defaults; override through `labels`):
 
 | Key | Default |
 | --- | --- |

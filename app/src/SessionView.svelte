@@ -68,7 +68,7 @@
   const prefs = adapters.prefs ?? createLocalPrefs(adapters.theme?.storageKey ?? LOCAL_PREFS_KEY);
 
   const liveSessionsMux = adapters.mux ?? tmuxMux;
-  let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
+  let labels = $derived<Required<AppLabels>>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let localBg = $state(adapters.theme?.defaultBg ?? DARK_BG);
   let storedFontPx = $state(DEFAULT_FONT_PX);
   let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS.map((shortcut) => ({ ...shortcut })));
