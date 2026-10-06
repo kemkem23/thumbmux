@@ -40,6 +40,17 @@ const SERVER_BARREL = join(PACKAGE_ROOT, 'git-dist', 'server', 'index.js');
 type SqlObserver = {
   /** Every statement this process asked SQLite to execute, in order. */
   readonly sql: string[];
+  /**
+   * `db.inTransaction` of the connection each entry of `sql` ran on, read
+   * just before it ran. Asked of SQLite itself, so it does not depend on
+   * whether the driver routes BEGIN/COMMIT/ROLLBACK through a patched method
+   * (Bun 1.3 does, Bun 1.4 does not).
+   */
+  readonly inTransaction: boolean[];
+  /** `db.inTransaction` at the moment the armed fault was thrown, or null. */
+  readonly inTransactionAtFault: () => boolean | null;
+  /** `db.inTransaction` of the connection the fault landed on, read now. */
+  readonly faultedConnectionInTransaction: () => boolean | null;
   /** Every database file this process opened through a patched method. */
   readonly files: string[];
   /** Arm the fault. Before this, the observer only watches. */
@@ -57,13 +68,21 @@ type SqlObserver = {
  */
 function installSqlObserver(faultOn?: RegExp): SqlObserver {
   const sql: string[] = [];
+  const inTransaction: boolean[] = [];
   const files: string[] = [];
   const wrapped = new WeakSet<object>();
   let armed = false;
+  let faultedDb: Database | null = null;
+  let atFault: boolean | null = null;
 
-  const record = (text: string): void => {
+  const record = (db: Database, text: string): void => {
     sql.push(text);
-    if (armed && faultOn?.test(text)) throw new Error(OBSERVER_FAULT_MESSAGE);
+    inTransaction.push(db.inTransaction);
+    if (armed && faultOn?.test(text)) {
+      faultedDb = db;
+      atFault = db.inTransaction;
+      throw new Error(OBSERVER_FAULT_MESSAGE);
+    }
   };
 
   const noteFile = (db: Database): void => {
@@ -76,7 +95,7 @@ function installSqlObserver(faultOn?: RegExp): SqlObserver {
     const original = proto[method]!;
     proto[method] = function (this: Database, ...args: unknown[]) {
       noteFile(this);
-      record(String(args[0]));
+      record(this, String(args[0]));
       return original.apply(this, args);
     };
   }
@@ -85,6 +104,7 @@ function installSqlObserver(faultOn?: RegExp): SqlObserver {
     const original = proto[method]!;
     proto[method] = function (this: Database, ...args: unknown[]) {
       noteFile(this);
+      const db = this;
       const text = String(args[0]);
       const statement = original.apply(this, args) as Statement;
       // `query()` memoises, so the same statement object comes back for the
@@ -95,7 +115,7 @@ function installSqlObserver(faultOn?: RegExp): SqlObserver {
           const inner = (statement as unknown as Record<string, unknown>)[call];
           if (typeof inner !== 'function') continue;
           (statement as unknown as Record<string, unknown>)[call] = function (...inner_args: unknown[]) {
-            record(text);
+            record(db, text);
             return (inner as (...a: unknown[]) => unknown).apply(statement, inner_args);
           };
         }
@@ -106,6 +126,9 @@ function installSqlObserver(faultOn?: RegExp): SqlObserver {
 
   return {
     sql,
+    inTransaction,
+    inTransactionAtFault: () => atFault,
+    faultedConnectionInTransaction: () => (faultedDb === null ? null : (faultedDb as Database).inTransaction),
     files,
     arm() { armed = true; },
   };
@@ -231,6 +254,9 @@ if (mode === 'fault-during-transaction') {
     committed,
     thrown,
     sqlDuringFaultedIngest: observer.sql.slice(sqlBeforeArming),
+    inTransactionDuringFaultedIngest: observer.inTransaction.slice(sqlBeforeArming),
+    inTransactionAtFault: observer.inTransactionAtFault(),
+    inTransactionAfterFault: observer.faultedConnectionInTransaction(),
     files: observer.files,
   })}\n`);
   process.exit(0);

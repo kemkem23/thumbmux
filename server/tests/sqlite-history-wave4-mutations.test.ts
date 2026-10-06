@@ -312,7 +312,9 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string, failed: boolean) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1 storage
+      // cases (seconds each) have their own mutant runner below.
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS1 )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
       console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
@@ -428,3 +430,179 @@ test('BH mutants: issued prefix readback, durable start/end fence, atomic refusa
     const after = await run('clean-after'); expect(after.exit, after.output).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 300000);
+
+// HS1 (H-STORE PLAN §5.1, §5.3, §5.2): burst capacity on the default root.
+// It lives here, not in the wave4 file, because every mutation runner above
+// re-runs the whole wave4 file per mutant; a ~30 s burst there would push
+// those runners past their fixed timeouts. It runs once per gate.
+import { Database } from 'bun:sqlite';
+import { createHash } from 'node:crypto';
+import { inflateSync } from 'node:zlib';
+import { createV2HistoryFactory } from '../src/history-engine';
+import { evaluateV2Prefix, v2BirthCheckpoint } from '../src/capture-engine';
+import * as HS from '../src/stream-contract';
+
+test('HS1 capacity: 10,001 real decoder rows fit one fresh default root within 8 KiB per row, never the 120 MiB SQLITE_FULL', async () => {
+  const MiB = 1024 * 1024, root = mkdtempSync(join(tmpdir(), 'hs1-capacity-'));
+  const value = <T>(r: HS.Result<T>): T => { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; };
+  const config = HS.NEWARCH_V2_DEFAULT_CONFIG, geometry = HS.v2BirthGeometry(config);
+  const pane = { serverIdentity: 'hs1-capacity-server', paneId: '%1', birthGeneration: 1 };
+  const session = { serverIdentity: pane.serverIdentity, sessionId: 'hs1-capacity' };
+  const descriptor = { schema: 'newarch-v2' as const, session, pane, windowId: '@1', owner: 'capture-engine' as const, birthOperationId: 'hs1-birth', geometry, state: 'active' as const };
+  const epoch = { pane, attachId: 'hs1-attach', collectorIncarnation: 'hs1-collector' };
+  // S-issued input stub: H reads back only what was issued for this batch.
+  const issued = new Map<string, HS.V2BatchInput>();
+  const factory = createV2HistoryFactory({ inputReceipt: input => ({ status: 'ok', value: issued.get(HS.streamCanonical(input)) ?? null }) });
+  const port = value(await factory.openForCapture({ rootId: root, engineId: 'hs1-capacity', config }));
+  let operation = 0;
+  const commit = (command: HS.V2WriteCommand) => {
+    const fence = { pane, operationId: 'hs1-op-' + operation++, expectedGeneration: port.capability.generation,
+      expectedRevision: value(port.reader.owner(pane))?.durableRevision ?? 0 };
+    return port.writer.commit(port.capability, { fence: { ...fence, digest: HS.v2WriteDigest({ fence, command }) }, command });
+  };
+  const intent: HS.V2BirthIntent = { schema: 'newarch-v2', operationId: 'hs1-birth', session, geometry, command: 'new-session', owner: 'capture-engine' };
+  try {
+    value(await port.writer.reserveBirth(port.capability, { intent, expectedGeneration: port.capability.generation, digest: HS.v2Digest('birth-reservation', { intent }) }));
+    let cp = v2BirthCheckpoint(descriptor, { epoch, byteOffset: 0 });
+    const ready: HS.V2BirthReady = { intent, pane: descriptor, binding: { kind: 'collector-binding', epoch, attachId: epoch.attachId, rootUUID: 'hs1-root',
+      bootNonce: 'boot', ownerGeneration: 1, process: { pid: 123, startTime: '1', bootId: 'synthetic' }, peerUid: 1000, fifoId: 'fifo', handshakeId: 'h',
+      artifactSha256: 'a'.repeat(64) }, byte0: { epoch, byteOffset: 0 }, journal: { path: '/synthetic/birth', bytes: 1, sha256: 'a'.repeat(64) },
+      geometryReadback: { columns: geometry.columns, rows: geometry.rows }, paneCountInWindow: 1, programHeld: true };
+    value(await commit({ kind: 'activate', ready, checkpoint: cp }));
+    // Every line fits one 78-column row (CR LF, ANSI, Thai, emoji, blank), so
+    // 119 lines fill the screen and each further line scrolls exactly one row.
+    const text = (i: number) => [`B${String(i).padStart(5, '0')}`, `สวัสดีประเทศไทย ${i} UTF-8 😀`, `\x1b[31mRED\x1b[0m ${i} done`, '',
+      `sh-r ${i} \x1b[36mcolor\x1b[0m ไทย漢字😀 ` + 'x'.repeat(12)][i % 5]!;
+    const target = 10_001, totalLines = target + geometry.rows - 1, hashes: string[] = [];
+    let pending: number[] = [], line = 0, segment = 0, segmentBytes = 0, commits = 0, logical = 0, failure: unknown = null;
+    const started = performance.now();
+    while (pending.length || line < totalLines) {
+      if (pending.length < 64 * 1024 && line < totalLines) {
+        let chunk = ''; for (let j = 0; j < 256 && line < totalLines; j++) chunk += text(line++) + '\r\n';
+        pending = [...pending, ...Buffer.from(chunk)];
+      }
+      if (segmentBytes + 2 * MiB + 4096 > 8 * MiB) { segment++; segmentBytes = 0; }
+      const segmentId = 'hs1-seg-' + segment, start = cp.through.byteOffset;
+      const r = evaluateV2Prefix({ pane: descriptor, checkpoint: cp, raw: { epoch, start, end: start + pending.length }, bytes: pending,
+        observedAtMonoMs: 1, pendingSinceMonoMs: null }, config, { wallMs: 0, clockEpoch: 'replay',
+        rowTarget: { segmentId, nextRowOrdinal: cp.frontier?.segmentId === segmentId ? cp.frontier.rowOrdinal + 1 : 0 } });
+      if ('kind' in r) throw Error('decoder gap ' + JSON.stringify(r).slice(0, 400));
+      const input: HS.V2BatchInput = { kind: 'synced-spool', version: 1, through: r.checkpoint.through, recordDigest: 'b'.repeat(64), commitId: 'hs1-in-' + commits, segmentId: 'raw-1' };
+      issued.set(HS.streamCanonical(input), input);
+      const result = await commit({ kind: 'batch', batch: { rows: r.rows, decisions: [], incidents: [], checkpoint: r.checkpoint, input } });
+      issued.clear(); commits++;
+      if (result.status !== 'ok') { failure = { rows: hashes.length, commits, result }; break; }
+      for (const row of r.rows) { const c = HS.streamCanonical(row); hashes.push(createHash('sha256').update(c).digest('hex')); logical += Buffer.byteLength(c); segmentBytes += Buffer.byteLength(c) + 1; }
+      cp = r.checkpoint; pending = pending.slice(r.consumed.end - r.consumed.start);
+    }
+    const writeMs = Math.round(performance.now() - started);
+    // Reader spot checks at both ends of the 10,001-row history.
+    const ends: string[][] = [];
+    if (failure === null) for (const direction of ['after', 'before'] as const) {
+      const page = value(await port.reader.page({ schema: 'newarch-v2', pane, cursor: null, direction, maxEntries: 32, maxBytes: 2 * MiB }));
+      ends.push(page.entries.flatMap(e => e.kind === 'row' ? [createHash('sha256').update(HS.streamCanonical(e.row)).digest('hex')] : []));
+    }
+    value(await port.writer.close(port.capability));
+    const db = new Database(join(root, 'flag-on-v1.sqlite'), { readonly: true });
+    let disk: Record<string, number>, stored: string[] = [];
+    try {
+      const pragma = (name: string) => Number(Object.values(db.query(`PRAGMA ${name}`).get() as Record<string, number>)[0]);
+      disk = { pageSize: pragma('page_size'), pages: pragma('page_count'), freelist: pragma('freelist_count') };
+      // Every stored row decodes to the canonical bytes the decoder produced and
+      // still matches its logical checksum.
+      for (const row of db.query("SELECT * FROM fh_v2_timeline WHERE kind='row' ORDER BY n").all() as Record<string, string | number | Uint8Array>[]) {
+        const payload = typeof row.payload === 'string' ? row.payload : inflateSync((row.payload as Uint8Array).subarray(4)).toString('utf8');
+        expect(row.checksum).toBe(HS.v2Digest('timeline', { pane: row.pane, n: row.n, revision: row.revision, kind: row.kind, id: row.id, segment: row.segment, payload }));
+        stored.push(createHash('sha256').update(payload).digest('hex'));
+      }
+    } finally { db.close(); }
+    const dbBytes = disk.pages * disk.pageSize, capBytes = Math.floor((config.storage.rootCapBytes - config.storage.emergencyReserveBytes) / 8192) * 4096;
+    console.log('HS1_CAPACITY', JSON.stringify({ bun: Bun.version, rows: hashes.length, commits, segments: segment + 1, writeMs, logicalRowBytes: logical,
+      ...disk, dbBytes, capBytes, dbBytesPerRow: Math.round(dbBytes / Math.max(1, hashes.length)), failure }));
+    expect(failure).toBeNull();
+    expect(hashes.length).toBe(target);
+    expect(stored).toEqual(hashes);
+    expect(ends).toEqual([hashes.slice(0, ends[0]!.length), hashes.slice(-ends[1]!.length)]);
+    expect(ends[0]!.length).toBeGreaterThan(0);
+    // The same rows as canonical TEXT exceed the database the default root allows.
+    expect(logical).toBeGreaterThan(capBytes);
+    expect(disk.pageSize).toBe(4096);
+    expect(dbBytes).toBeLessThan(capBytes);
+    expect(dbBytes / target).toBeLessThanOrEqual(8192);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 300_000);
+
+// HS1 mutants (PLAN §5.3). Same copied-tree runner as above; only the HS1
+// cases run, each mutant must fail its NAMED test with an assertion.
+test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segment size, unbounded inflate, raw export, no fence, rebuilt receipt', async () => {
+  const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'hs1-mutants-'));
+  const budget = /\(fail\) HS1 real decoder rows stay within 8 KiB per row/, legacy = /\(fail\) HS1 legacy TEXT root/;
+  const corrupt = /\(fail\) HS1 corrupt, truncated, trailing/, receipt = /\(fail\) HS1 receipts and checkpoints are stored compressed/;
+  const mutations: { name: string; kills: RegExp; from: string; to: string; from2?: string; to2?: string }[] = [
+    { name: 'hs1-no-row-shape', kills: /\(fail\) HS1 row shape and canonical equality/,
+      from: 'function v2RowShape(row: CommittedStreamRow): void {',
+      to: 'function v2RowShape(row: CommittedStreamRow): void { return;' },
+    { name: 'hs1-no-canonical-equality', kills: /\(fail\) HS1 row shape and canonical equality/,
+      from: "  fhAssert(streamCanonical(value) === payload, 'v2 storage canonical equality');", to: '' },
+    { name: 'hs1-store-canonical', kills: budget,
+      from: '  return packed.byteLength < Buffer.byteLength(payload) ? packed : payload;', to: '  return payload;' },
+    { name: 'hs1-lossy-codec-drops-cell-origins', kills: budget,
+      from: 'deflateSync(Buffer.from(payload), { level: 6 })',
+      to: "deflateSync(Buffer.from(payload.replace(/\"cellOrigins\":\\[[^\\]]*\\]/, '\"cellOrigins\":[]')), { level: 6 })" },
+    { name: 'hs1-digest-over-stored-bytes', kills: budget,
+      from: "    this.#db.query('INSERT INTO fh_v2_timeline VALUES(?,?,?,?,?,?,?,?)').run(pane, n, revision, kind, id, segment, kind === 'row' ? v2Pack(payload) : payload,\n      v2Digest('timeline', { pane, n, revision, kind, id, segment, payload }));",
+      to: "    const stored = kind === 'row' ? v2Pack(payload) : payload, hashed = typeof stored === 'string' ? stored : Buffer.from(stored).toString('base64');\n    this.#db.query('INSERT INTO fh_v2_timeline VALUES(?,?,?,?,?,?,?,?)').run(pane, n, revision, kind, id, segment, stored,\n      v2Digest('timeline', { pane, n, revision, kind, id, segment, payload: hashed }));",
+      from2: "      kind: r.kind, id: r.id, segment: r.segment, payload }), 'v2 corrupt timeline');",
+      to2: "      kind: r.kind, id: r.id, segment: r.segment, payload: typeof r.payload === 'string' ? r.payload : Buffer.from(r.payload as Uint8Array).toString('base64') }), 'v2 corrupt timeline');" },
+    { name: 'hs1-physical-segment-bytes', kills: budget,
+      from: '      metrics.bytes += Buffer.byteLength(this.logicalTimeline(row).payload) + 1;',
+      to: "      metrics.bytes += (typeof row.payload === 'string' ? Buffer.byteLength(row.payload) : (row.payload as unknown as Uint8Array).byteLength) + 1;" },
+    { name: 'hs1-unbounded-inflate', kills: corrupt, from: '{ maxOutputLength: limit, info: true }', to: '{ info: true }' },
+    { name: 'hs1-accept-trailing-bytes', kills: corrupt,
+      from: "  fhAssert(decoded.engine.bytesWritten === compressed.byteLength, 'v2 storage trailing data');\n", to: '' },
+    { name: 'hs1-export-stored-bytes', kills: budget,
+      from: 'write(path, this.exportRecords(key, seal.segmentId),',
+      to: "write(path, this.#db.query('SELECT * FROM fh_v2_timeline WHERE pane=? AND segment=? ORDER BY n').iterate(key, seal.segmentId)," },
+    { name: 'hs1-no-format-fence', kills: legacy,
+      from: "db.query('UPDATE fh_v2_meta SET generation=?,version=? WHERE id=1').run(next, V2_STORAGE_FORMAT);",
+      to: "db.query('UPDATE fh_v2_meta SET generation=? WHERE id=1').run(next);" },
+    { name: 'hs1-accept-unknown-format', kills: legacy,
+      from: "fhAssert(meta.version === 'newarch-v2' || meta.version === V2_STORAGE_FORMAT, 'unsupported v2 storage');", to: '/* mutant opens any format */' },
+    { name: 'hs1-rebuild-receipt-on-read', kills: receipt,
+      from: '    return v2CanonicalValue(payload) as T;',
+      to: "    const value = JSON.parse(payload);\n    return (kind === 'receipt' ? { ...value, generation: this.#cap.generation } : value) as T;" },
+  ];
+  try {
+    cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
+    mkdirSync(join(root, 'server/tests/sqlite-history'), { recursive: true });
+    cpSync(join(pkg, 'server/tests/sqlite-history-wave4.test.ts'), join(root, 'server/tests/sqlite-history-wave4.test.ts'));
+    cpSync(join(pkg, 'server/tests/sqlite-history/helpers.ts'), join(root, 'server/tests/sqlite-history/helpers.ts'));
+    const core = join(root, 'node_modules/@thumbmux/core'); mkdirSync(core, { recursive: true });
+    cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
+    writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
+    writeFileSync(join(root, 'package.json'), '{"type":"module"}');
+    const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const run = async (name: string) => {
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS1'],
+        { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const output = out + err;
+      console.log('HS1_MUTANT', JSON.stringify({ name, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [], summary: output.slice(-600) }));
+      expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
+      return { exit, output };
+    };
+    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b6 pass\b/);
+    for (const m of mutations) {
+      expect(original.split(m.from).length).toBe(2);
+      let mutant = original.replace(m.from, m.to);
+      if (m.from2) { expect(mutant.split(m.from2).length).toBe(2); mutant = mutant.replace(m.from2, m.to2!); }
+      try {
+        writeFileSync(file, mutant);
+        const red = await run(m.name);
+        expect(red.exit).not.toBe(0);
+        expect(red.output).toMatch(m.kills);
+      } finally { writeFileSync(file, original); }
+    }
+    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b6 pass\b/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 600_000);
