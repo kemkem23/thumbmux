@@ -789,8 +789,13 @@ CREATE TABLE fh_checkpoint(id TEXT PRIMARY KEY, pane TEXT NOT NULL, segment TEXT
  * never itself proof that the remote index is durable. No verifier => no unlink.
  */
 const V2_STORE = Symbol('capture-engine-only');
+/** HS2 r1 (review M1): the v2 factory's storage-profile fence. It runs on the
+ * owner connection under the writer lock, after read-only inspection and
+ * BEFORE the constructor's first write to the root. */
+const V2_PROFILE_FENCE = Symbol('v2-storage-profile-fence');
 export interface FlagOnHistoryOptions {
   [V2_STORE]?: true;
+  [V2_PROFILE_FENCE]?: (db: Database) => void;
   root: string;
   mode: 'create' | 'recover';
   codecVersions: readonly string[];
@@ -891,6 +896,9 @@ export class FlagOnHistoryStore implements FlagOnHistoryR2 {
       const meta = db.query('SELECT * FROM fh_meta').get() as SqlRow;
       fhAssert(meta?.version === 1 && typeof meta.uuid === 'string', 'unsupported flag-on format');
       fhAssert((db.query('PRAGMA quick_check').get() as SqlRow).quick_check === 'ok', 'corrupt history database');
+      // Everything above only reads an existing root; everything below may write it
+      // (journal mode, replay-pin sweep, schema/index, migration marker, mode).
+      options[V2_PROFILE_FENCE]?.(db);
       db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA busy_timeout=0; PRAGMA journal_size_limit=0;');
       // DB + WAL growth is bounded; exported scratch is separately <=16 MiB.
       db.exec(`PRAGMA max_page_count=${Math.floor((FB.canaryRootCapBytes-FB.reserveBytes-FB.scratchBytes)/4096)};`);
@@ -1813,12 +1821,27 @@ export function createV2HistoryFactory(hooks: V2HistoryOptions = {}): V2FactoryW
       const root = resolve(request.rootId); fhSafePath(root);
       fhAssert(existsSync(join(root, 'flag-on-v1.sqlite')) || !existsSync(root) || readdirSync(root).length === 0,
         'v2 missing owner database in existing root');
+      const digest = v2StorageProfileDigest(profile);
       store = new FlagOnHistoryStore({ root, mode: existsSync(join(root, 'flag-on-v1.sqlite')) ? 'recover' : 'create',
-        codecVersions: ['newarch-v2'], [V2_STORE]: true });
+        codecVersions: ['newarch-v2'], [V2_STORE]: true, [V2_PROFILE_FENCE]: db => { v2ProfileFence(db, digest); } });
       // Do not pass capabilities through ok(): it serializes/copies the token.
       return { status: 'ok', value: store.openV2(V2_STORE, request, hooks) };
     } catch (e) { store?.close(); return v2Failure(e); }
   } });
+}
+/** HS2: the root's stored profile digest must equal `digest`. Read-only; the
+ * row is decoded and checksummed exactly like V2Storage.get(). Returns false
+ * for a root with no row (pre-HS2, or a fresh root): it adopts lazily. */
+function v2ProfileFence(db: Database, digest: string): boolean {
+  if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fh_v2_object'").get()) return false;
+  const kind = 'storage-profile', pane = '*', id = 'root';
+  const r = db.query('SELECT payload,checksum FROM fh_v2_object WHERE kind=? AND pane=? AND id=?').get(kind, pane, id) as SqlRow | null;
+  if (!r) return false;
+  const payload = v2Unpack(r.payload, V2L.checkpointBytesPerPane + V2L.pageBytes);
+  fhAssert(r.checksum === v2Digest('stored-object', { kind, pane, id, payload }), 'v2 corrupt object');
+  const stored = v2CanonicalValue(payload) as { digest: string };
+  fhAssert(stored.digest === digest, 'v2 storage profile mismatch');
+  return true;
 }
 /** HS2: no profile = the legacy shared budget of config.storage (pre-HS2). */
 function v2RequestProfile(request: Parameters<V2HistoryFactory['openForCapture']>[0]): V2StorageProfile {
@@ -1935,18 +1958,27 @@ class V2Storage {
     const pageSize = Number((db.query('PRAGMA page_size').get() as SqlRow).page_size);
     db.exec(`PRAGMA max_page_count=${v2DatabasePageLimit(this.#profile, pageSize)};`);
   }
-  /** HS2: the root keeps the profile it was first opened with. Runs inside the
-   * open transaction BEFORE the generation moves, so a mismatch writes nothing.
-   * Roots from before HS2 have no row and adopt the profile lazily. */
+  /** HS2: the root keeps the profile it was first opened with. The factory's
+   * fence already refused a mismatch before the constructor's first write
+   * (review M1); this re-check runs inside the open transaction BEFORE the
+   * generation moves, and roots without a row (pre-HS2) adopt lazily here.
+   * Still not "the open writes nothing at all": opening a WAL root may create
+   * -shm/run WAL recovery, the writer lock file is opened, and close() of a
+   * refused open checkpoints the WAL (content unchanged). */
   private bindStorageProfile(): void {
     const digest = v2StorageProfileDigest(this.#profile);
-    const stored = this.get<{ digest: string }>('storage-profile', '*', 'root');
-    if (!stored) this.put('storage-profile', '*', 'root', { schema: 'newarch-v2', digest, name: this.#profile.name,
+    if (!v2ProfileFence(this.#db, digest)) this.put('storage-profile', '*', 'root', { schema: 'newarch-v2', digest, name: this.#profile.name,
       storage: this.#profile.storage, allocation: this.#profile.allocation });
-    else fhAssert(stored.digest === digest, 'v2 storage profile mismatch');
   }
-  /** HS2: with an allocation manifest, WAL is a budgeted class. Over budget,
-   * try a TRUNCATE checkpoint; true = still over (a reader pins the WAL). */
+  /** HS2: with an allocation manifest, `walBytes` is a checkpoint THRESHOLD,
+   * not a hard peak cap (review M2). Over it, try a TRUNCATE checkpoint;
+   * true = still over (a reader pins the WAL). tx() checks before a write
+   * (refusing it) and checkpoints after commit, so one transaction that starts
+   * under the threshold may still grow the WAL past it by its own full size;
+   * nothing reserves that growth. Writes outside tx() are not gated at all:
+   * the open transaction (constructor) and cleanupReclaim's incremental
+   * vacuum. The whole root-shared 1,024 MiB of r-canary-8g is H's alone here;
+   * splitting WAL between H/S/ledger and a peak bound are HS3's. */
   private walOverBudget(): boolean {
     const allocation = this.#profile.allocation;
     if (!allocation) return false;
@@ -2042,15 +2074,16 @@ class V2Storage {
   private tx<T>(cap: V2WriterCapability, phase: string, f: () => T): Result<T> {
     try {
       this.live();
-      // A WAL still over its allocation refuses before any mutation; the same
-      // operationId retries exactly once after the pinning reader is gone.
+      // A WAL still over its threshold refuses this write before it mutates; the
+      // same operationId retries exactly once after the pinning reader is gone.
       fhAssert(!this.walOverBudget(), 'v2 storage wal budget');
       const result = this.#db.transaction(() => {
         this.authorize(cap); // The registry/generation check is inside EVERY write transaction.
         this.hooks.boundary?.(phase + '-before-write');
         const value = f(); this.hooks.boundary?.(phase + '-before-commit'); return value;
       }).immediate();
-      // Committed: bound the WAL now. Best effort; the check above is the gate.
+      // Committed: checkpoint now. Best effort and AFTER the growth, so this is
+      // not a peak bound; the check above refuses the next write.
       try { this.walOverBudget(); } catch { /* next write refuses */ }
       this.hooks.boundary?.(phase + '-after-commit'); return ok(result);
     } catch (e) { return v2Failure(e); }
