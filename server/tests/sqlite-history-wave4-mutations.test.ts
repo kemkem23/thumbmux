@@ -505,7 +505,7 @@ test('HS1 capacity: 10,001 real decoder rows fit one fresh default root within 8
     let disk: Record<string, number>, stored: string[] = [];
     try {
       const pragma = (name: string) => Number(Object.values(db.query(`PRAGMA ${name}`).get() as Record<string, number>)[0]);
-      disk = { pageSize: pragma('page_size'), pages: pragma('page_count'), maxPages: pragma('max_page_count'), freelist: pragma('freelist_count') };
+      disk = { pageSize: pragma('page_size'), pages: pragma('page_count'), freelist: pragma('freelist_count') };
       // Every stored row decodes to the canonical bytes the decoder produced and
       // still matches its logical checksum.
       for (const row of db.query("SELECT * FROM fh_v2_timeline WHERE kind='row' ORDER BY n").all() as Record<string, string | number | Uint8Array>[]) {
