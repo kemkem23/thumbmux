@@ -2292,7 +2292,7 @@ test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01
   const f = await h2fixture();
   try {
     const st = await hs1Activate(f);
-    await hs1Step(f, st, 40);
+    await hs1Step(f, st, 80);
     const sealed = await f.commit({ kind: 'seal', segmentId: st.segment }, 'shape-seal');
     const key = H2.v2PaneKey(f.pane);
     const target = hs1Db(f.root, db => db.query("SELECT * FROM fh_v2_timeline WHERE kind='row' ORDER BY n LIMIT 1").get() as Record<string, any>);
@@ -2336,7 +2336,7 @@ test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01
 test('HS1 row shape refuses invalid writes atomically and objects require canonical equality', async () => {
   const f = await h2fixture();
   try {
-    const st = await hs1Activate(f), plan = hs1Plan(f, st, 40);
+    const st = await hs1Activate(f), plan = hs1Plan(f, st, 80);
     if (plan.command.kind !== 'batch') throw Error('batch');
     const malformed = structuredClone(plan.command);
     (malformed.batch.rows[0]!.cells as unknown[]).pop();
