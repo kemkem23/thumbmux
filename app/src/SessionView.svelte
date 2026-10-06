@@ -550,21 +550,37 @@
     // returning a Promise becomes a normal rejection. The cleanup callback is
     // therefore always a later microtask, after `pending` is initialized and
     // stored — avoiding a temporal-dead-zone failure on synchronous throws.
+    const apply = (entries: PromptEntry[] | null, loaded: string[]): void => {
+      if (request === promptRequest && requestedSession === session) {
+        recentPromptEntries = entries;
+        recentPrompts = loaded;
+      }
+    };
     // An array from `promptEntries` (even `[]`) is authoritative; only `null`
-    // or an absent adapter falls back to the legacy string list.
-    const pending = Promise.resolve()
-      .then(() => (entriesAdapter ? entriesAdapter(requestedSession) : null))
-      .then(async (entries) => {
-        if (Array.isArray(entries)) return { entries, prompts: [] as string[] };
-        const prompts = promptAdapter ? await promptAdapter(requestedSession) : [];
-        return { entries: null, prompts };
-      })
-      .then((loaded) => {
-        if (request === promptRequest && requestedSession === session) {
-          recentPromptEntries = loaded.entries;
-          recentPrompts = loaded.prompts;
-        }
-      })
+    // falls back to the legacy string list. Without `promptEntries` the chain
+    // below is the exact pre-existing one — same promise hops, so prefetch
+    // coalescing and first-frame paint timing are unchanged for every host
+    // that does not opt in.
+    const loading = entriesAdapter
+      ? Promise.resolve()
+        .then(() => entriesAdapter(requestedSession))
+        .then((entries) => {
+          if (Array.isArray(entries)) {
+            apply(entries, []);
+            return;
+          }
+          if (!promptAdapter) {
+            apply(null, []);
+            return;
+          }
+          return Promise.resolve()
+            .then(() => promptAdapter(requestedSession))
+            .then((loaded) => apply(null, loaded));
+        })
+      : Promise.resolve()
+        .then(() => promptAdapter?.(requestedSession) ?? [])
+        .then((loaded) => apply(null, loaded));
+    const pending = loading
       .catch(() => {
         // Keep the last successful snapshot available while the source recovers.
       })
