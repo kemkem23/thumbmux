@@ -539,6 +539,11 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
   const budget = /\(fail\) HS1 real decoder rows stay within 8 KiB per row/, legacy = /\(fail\) HS1 legacy TEXT root/;
   const corrupt = /\(fail\) HS1 corrupt, truncated, trailing/, receipt = /\(fail\) HS1 receipts and checkpoints are stored compressed/;
   const mutations: { name: string; kills: RegExp; from: string; to: string; from2?: string; to2?: string }[] = [
+    { name: 'hs1-no-row-shape', kills: /\(fail\) HS1 row shape and canonical equality/,
+      from: 'function v2RowShape(row: CommittedStreamRow): void {',
+      to: 'function v2RowShape(row: CommittedStreamRow): void { return;' },
+    { name: 'hs1-no-canonical-equality', kills: /\(fail\) HS1 row shape and canonical equality/,
+      from: "  fhAssert(streamCanonical(value) === payload, 'v2 storage canonical equality');", to: '' },
     { name: 'hs1-store-canonical', kills: budget,
       from: '  return packed.byteLength < Buffer.byteLength(payload) ? packed : payload;', to: '  return payload;' },
     { name: 'hs1-lossy-codec-drops-cell-origins', kills: budget,
@@ -564,7 +569,7 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
     { name: 'hs1-accept-unknown-format', kills: legacy,
       from: "fhAssert(meta.version === 'newarch-v2' || meta.version === V2_STORAGE_FORMAT, 'unsupported v2 storage');", to: '/* mutant opens any format */' },
     { name: 'hs1-rebuild-receipt-on-read', kills: receipt,
-      from: '    return JSON.parse(payload) as T;',
+      from: '    return v2CanonicalValue(payload) as T;',
       to: "    const value = JSON.parse(payload);\n    return (kind === 'receipt' ? { ...value, generation: this.#cap.generation } : value) as T;" },
   ];
   try {
@@ -586,7 +591,7 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
       expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
       return { exit, output };
     };
-    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b4 pass\b/);
+    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b6 pass\b/);
     for (const m of mutations) {
       expect(original.split(m.from).length).toBe(2);
       let mutant = original.replace(m.from, m.to);
@@ -598,6 +603,6 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
         expect(red.output).toMatch(m.kills);
       } finally { writeFileSync(file, original); }
     }
-    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b4 pass\b/);
+    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b6 pass\b/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);

@@ -1409,9 +1409,13 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
     affected: { after: null, through: frontier }, openedAtWallMs: 100, openedAtMonoMs: 10, clockEpoch: 'test-clock', collecting: false,
     missing: { countKind: 'unknown', missingCount: null }, ruleVersion: '1', configVersion: configVersion, geometry, revision,
     sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null, action: 'gap-and-stop', evidence: null });
-  const row = (n: number, text = 'ซ้ำ'): H2.CommittedStreamRow => ({ id: { pane, segmentId: 'segment-1', rowOrdinal: n },
-    origin: { kind: 'pipe', range: { epoch, start: n, end: n + 1 }, ordinal: n }, cells: [{ text, width: 1, style: [] }],
-    geometry: { ...size }, buffer: 'normal', wrapStatus: 'unwrapped', wrapPad: 0, finalized: true, uncertainFields: [], cellOrigins: [] });
+  const row = (n: number, text = 'ซ้ำ'): H2.CommittedStreamRow => {
+    const origin: H2.RowOrigin = { kind: 'pipe', range: { epoch, start: n, end: n + 1 }, ordinal: n };
+    return { id: { pane, segmentId: 'segment-1', rowOrdinal: n }, origin,
+      cells: Array.from({ length: size.columns }, (_, i) => ({ text: i === 0 ? text : ' ', width: 1 as const, style: [] })),
+      geometry: { ...size }, buffer: 'normal', wrapStatus: 'unwrapped', wrapPad: 0, finalized: true,
+      uncertainFields: [], cellOrigins: Array.from({ length: size.columns }, () => origin) };
+  };
   const batch = (rows: readonly H2.CommittedStreamRow[], revision = 2): H2.V2WriteCommand => {
     const checkpoint = cp(revision, rows.length, rows.at(-1)?.id ?? null);
     return { kind: 'batch', batch: { rows, decisions: [], incidents: [], checkpoint,
