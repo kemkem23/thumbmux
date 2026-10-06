@@ -1570,8 +1570,11 @@ export interface V2WriteRequest { readonly fence: V2WriteFence; readonly command
  * engine can retry with its current generation and get the original receipt.
  * Audit expectedRevision INSIDE its command remains hashed. Capability never
  * enters hashes/serialization. Stage rows never become visible by staging. */
-export function v2WriteDigest(request: { readonly fence: Omit<V2WriteFence, 'digest'>; readonly command: V2WriteCommand }): Digest {
-  return v2Digest('write', { pane: request.fence.pane, operationId: request.fence.operationId, command: request.command });
+export function v2WriteDigest(request: { readonly fence: Omit<V2WriteFence, 'digest'>; readonly command: V2WriteCommand },
+  encode?: (value: unknown) => string): Digest {
+  // `encode` (H-PERF): the encoder of the caller's ONE synchronous call that
+  // already canonicalized `request.command`; omitted = a fresh one, same bytes.
+  return v2Digest('write', { pane: request.fence.pane, operationId: request.fence.operationId, command: request.command }, encode);
 }
 export interface V2HistoryWriter {
   commit(capability: V2WriterCapability, request: V2WriteRequest): Promise<Result<V2Receipt>>;

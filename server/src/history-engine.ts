@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { deflateSync as zlibDeflateSync, inflateSync } from 'node:zlib';
 import { FLAGON_BUDGET as FB, cellToSemanticCell, normalizedRowsDigest, normalizedGapDigest, normalizedCoverageDigest, coverageProjectionDigest, attachCoverage, archiveInventoryMatches, archiveInventoryDigest, segmentContinuityDigest, orderedControlDigest, inputProvenanceDigest, sourceRecordsDigest, sourceSpoolDigest, gapIdentity, validGapUpdate } from './stream-contract';
 import type { FlagOnHistoryPort, SpoolRecord, SpoolAck, RowsAndGapsCommit, RowsAndGapsReceipt, FlagOnRecoveryChunk, RawPosition, OperationFence, PinRequest, SegmentPin, SealedExport, RemoteIndexReceipt, ReclaimReceipt, EvidenceFile, Coverage, CommittedStreamRow } from './stream-contract';
-import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical as scStreamCanonical, streamDigest } from './stream-contract';
+import { STREAM_BUDGET as B, eventKey, validReadOpen, streamCanonical as scStreamCanonical, streamCanonicalEncoder, streamDigest } from './stream-contract';
 import type { AppendFinalized, CancelToken, CheckpointCommit, DurableInputReceipt, DurableReceipt,
   FinalizedRow, GapEpisode, HistoryEngine, HistoryPage, HistoryPageCheckpoint, InputEvent, PaneKey, PageCursor,
   RamReceipt, ReadOpenAck, ReadRequest, ReadView, RecoveryChunk, RepairChunk, RepairReceipt,
@@ -73,11 +73,16 @@ function content(row: RowContent): void {
   if (!Array.isArray(row.cells) || typeof row.softWrap !== 'boolean') throw Error('invalid row');
   safe(row.wrapPad);
   if (!Array.isArray(row.uncertainFields) || row.uncertainFields.some((x: unknown) => typeof x !== 'string')) throw Error('invalid uncertain fields');
+  // H-PERF: a cell OBJECT shared by several cells is checked once per call;
+  // it cannot change inside this synchronous check.
+  const checked = new Set<unknown>();
   for (const c of row.cells) {
+    if (checked.has(c)) continue;
     if (typeof c.text !== 'string' || !c.text.isWellFormed() || ![0, 1, 2].includes(c.width)
       || !Array.isArray(c.style)) throw Error('invalid cell');
     c.style.forEach(safe);
     if (bytes(c) > B.blockPayloadBytes / 2) throw Error('single cell exceeds block');
+    checked.add(c);
   }
 }
 function fail(error: unknown): StreamFailure {
@@ -1816,8 +1821,8 @@ import type { NewarchV2Continuation, NewarchV2ReadState } from '@thumbmux/core';
 // Profiled names of the SC calls H makes (see v2Probe); same arguments, same result.
 const v2Digest: typeof scV2Digest = (kind, payload, encode) =>
   v2Probe ? v2Span('canonical', () => scV2Digest(kind, payload, encode)) : scV2Digest(kind, payload, encode);
-const v2WriteDigest: typeof scV2WriteDigest = request =>
-  v2Probe ? v2Span('canonical', () => scV2WriteDigest(request)) : scV2WriteDigest(request);
+const v2WriteDigest: typeof scV2WriteDigest = (request, encode) =>
+  v2Probe ? v2Span('canonical', () => scV2WriteDigest(request, encode)) : scV2WriteDigest(request, encode);
 const validateV2Checkpoint: typeof scValidateV2Checkpoint = (c, encode) =>
   v2Probe ? v2Span('canonical', () => scValidateV2Checkpoint(c, encode)) : scValidateV2Checkpoint(c, encode);
 /** H-PERF: what one V2 commit did, for tests and the profile run only. An
@@ -1941,10 +1946,13 @@ function v2RowShape(row: CommittedStreamRow): void {
       nonempty(text);
       fhAssert(text.isWellFormed() && Buffer.byteLength(text) <= V2L.maxIdentityBytes, 'identity bound');
     };
-    const pane = (p: PaneKey) => { paneKey(p); key(p.serverIdentity); key(p.paneId); };
+    // H-PERF: a pane's canonical comes from its own validation (paneKey) and
+    // the row's pane is encoded once, so `=== rowPane` is equal(p, row.id.pane).
+    const pane = (p: PaneKey) => { const k = paneKey(p); key(p.serverIdentity); key(p.paneId); return k; };
+    const rowPane = paneKey(row.id.pane);
     const rowId = (id: SegmentRowId) => {
-      pane(id.pane); key(id.segmentId); safe(id.rowOrdinal);
-      fhAssert(equal(id.pane, row.id.pane), 'origin pane');
+      const k = pane(id.pane); key(id.segmentId); safe(id.rowOrdinal);
+      fhAssert(k === rowPane, 'origin pane');
     };
     rowId(row.id); geometry(row.geometry);
     fhAssert(row.geometry.columns <= V2L.maxColumns && row.geometry.rows <= V2L.maxRows, 'geometry');
@@ -1958,16 +1966,23 @@ function v2RowShape(row: CommittedStreamRow): void {
       fhAssert(cell.width !== 2 || row.cells[i + 1]?.width === 0, 'wide cell continuation');
       fhAssert(cell.width !== 0 || (i > 0 && row.cells[i - 1]!.width === 2 && cell.text === ''), 'orphan continuation');
     }
+    // One origin OBJECT is checked once per row (this call, this pane): the same
+    // object cannot change inside this synchronous check, so its verdict holds;
+    // every distinct origin object is still checked in full.
+    const checked = new Set<object>();
     const origin = (o: CommittedStreamRow['origin']) => {
+      if (checked.has(o)) return;
       switch (o.kind) {
         case 'durable': rowId(o.rowId); break;
         case 'capture': key(o.snapshotId); safe(o.rowIndex); break;
-        case 'pipe':
-          pane(o.range.epoch.pane); key(o.range.epoch.attachId); key(o.range.epoch.collectorIncarnation);
+        case 'pipe': {
+          const k = pane(o.range.epoch.pane); key(o.range.epoch.attachId); key(o.range.epoch.collectorIncarnation);
           safe(o.range.start); safe(o.range.end); safe(o.ordinal);
-          fhAssert(o.range.start <= o.range.end && equal(o.range.epoch.pane, row.id.pane), 'origin range/pane'); break;
+          fhAssert(o.range.start <= o.range.end && k === rowPane, 'origin range/pane'); break;
+        }
         default: throw Error('origin kind');
       }
+      checked.add(o);
     };
     origin(row.origin);
     fhAssert(Array.isArray(row.cellOrigins) && row.cellOrigins.length === row.cells.length, 'origin count');
@@ -2070,6 +2085,15 @@ class V2Storage {
   }
   private live(): void { fhAssert(!this.#closed, 'v2 store closed'); }
   private observeRows(rows: number): void { if (rows > 0) this.hooks.observe?.({ kind: 'row-encode', rows }); }
+  /** H-PERF: a canonical encoder for ONE commit call, never kept on the
+   * instance or module. Its memo makes a second encode of the same object
+   * free, which is sound only while that object cannot change: the caller's
+   * command before any hook ran, or H's private snapshot. `rows` counts
+   * the rows of data a call traverses (work counter only). */
+  private encoder(): (value: unknown, rows?: number) => string {
+    const inner = streamCanonicalEncoder();
+    return (value, rows = 0) => { this.observeRows(rows); return v2Probe ? v2Span('canonical', () => inner(value)) : inner(value); };
+  }
   /** Runs one commit with the profile probe on when an observer is attached;
    * its synchronous part (the whole transaction) ends before this returns. */
   private profiled<T>(f: () => T): T {
@@ -2226,10 +2250,23 @@ class V2Storage {
   }
   private async commit(cap: V2WriterCapability, r: V2WriteRequest): Promise<Result<V2Receipt>> {
     const result = this.tx(cap, 'v2-' + r.command.kind, () => {
-      const key = v2PaneKey(r.fence.pane), command = r.command;
-      if (this.hooks.observe) this.observeRows(2 * v2BatchRows(command)); // bytes(command) and v2WriteDigest(r)
-      fhAssert(bytes(command) <= V2L.checkpointBytesPerPane + V2L.pageBytes, 'v2 command bound');
-      fhAssert(v2WriteDigest(r) === r.fence.digest, 'v2 write digest');
+      const key = v2PaneKey(r.fence.pane), caller = r.command, encode = this.encoder();
+      // H-PERF: the caller's command is canonicalized ONCE, before any hook
+      // runs; the bound and H's own digest check read that text, and every
+      // later step reads a private snapshot that equals it, so an object
+      // the caller or a hook edits afterwards never reaches validation or disk.
+      const prepared = encode(caller, v2BatchRows(caller));
+      fhAssert(Buffer.byteLength(prepared) <= V2L.checkpointBytesPerPane + V2L.pageBytes, 'v2 command bound');
+      fhAssert(v2WriteDigest({ fence: r.fence, command: caller }, encode) === r.fence.digest, 'v2 write digest');
+      // A private snapshot: structuredClone keeps shared cells and origins
+      // shared (so it encodes like the caller's graph), and its canonical text
+      // must equal the digested text before anything reads it.
+      const command = structuredClone(caller), snapshot = this.encoder();
+      fhAssert(snapshot(command, v2BatchRows(command)) === prepared, 'v2 write snapshot');
+      // The live checkpoint, read and verified at most once per command inside
+      // this transaction; a local of this call only (B2's checkpoint block keeps its own read).
+      let live: V2LiveCheckpoint | null | undefined;
+      const durableCheckpoint = () => live === undefined ? (live = this.get<V2LiveCheckpoint>('checkpoint', key, 'live')) : live;
       let owner = this.owner(r.fence.pane);
       const previous = this.get<V2Receipt>('receipt', key, r.fence.operationId);
       const disposition = v2WriteDisposition(r.fence, cap.generation, owner?.durableRevision ?? 0, previous);
@@ -2269,7 +2306,7 @@ class V2Storage {
       fhAssert(owner, 'v2 owner required');
       const receipt: V2Receipt = { schema: 'newarch-v2', kind: 'ssot-durable', operationId: r.fence.operationId,
         pane: r.fence.pane, digest: r.fence.digest, commitId, generation: cap.generation, revision,
-        frontier: owner.frontier, checkpointId: this.get<V2LiveCheckpoint>('checkpoint', key, 'live')?.checkpointId ?? null };
+        frontier: owner.frontier, checkpointId: durableCheckpoint()?.checkpointId ?? null };
       let next = { ...owner, durableRevision: revision, generation: cap.generation };
       const resolvedIncidents: string[] = [];
       const addIncident = (incident: NewarchV2Incident) => {
@@ -2291,13 +2328,14 @@ class V2Storage {
           pane: { ...next.pane, state: incident.action === 'gap-and-stop' && next.pane.state !== 'unrecorded' ? 'stopped' : next.pane.state } };
       };
       const setCheckpoint = (cp: V2LiveCheckpoint) => {
-        validateV2Checkpoint(cp);
+        validateV2Checkpoint(cp, snapshot);
         fhAssert(equal(cp.pane, r.fence.pane) && cp.revision === revision && equal(cp.geometry, owner!.pane.geometry)
           && equal(cp.frontier, next.frontier), 'v2 checkpoint fence');
-        const old = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
+        const old = durableCheckpoint();
         fhAssert(!old || equal(old.through.epoch, cp.through.epoch) && cp.through.byteOffset >= old.through.byteOffset
           && cp.replayFloor.byteOffset >= old.replayFloor.byteOffset && cp.checkpointId !== old.checkpointId, 'v2 checkpoint monotonicity');
         this.put('checkpoint', key, 'live', cp);
+        live = undefined; // written: a later read in this command reads the new row
         (receipt as { checkpointId: string | null }).checkpointId = cp.checkpointId;
       };
       switch (command.kind) {
@@ -2319,27 +2357,30 @@ class V2Storage {
         case 'batch': {
           fhAssert(next.pane.state === 'active', 'v2 stopped capture');
           const b = command.batch;
-          if (this.hooks.observe) this.observeRows(v2BatchRows(command)); // bytes(b.rows)
+          // Canonical text of each snapshot row, once: the batch bound, the
+          // segment accounting and append() all use these exact strings.
+          const rowText = b.rows.map(row => snapshot(row));
+          const rowsBytes = rowText.reduce((n, text) => n + Buffer.byteLength(text), 2 + Math.max(0, rowText.length - 1));
           fhAssert(b.rows.length <= V2L.pendingRowsPerPane && b.decisions.length <= V2L.pendingRowsPerPane
-            && b.incidents.length <= V2L.pageEntries && bytes(b.rows) <= V2L.pageBytes, 'v2 batch bound');
+            && b.incidents.length <= V2L.pageEntries && rowsBytes <= V2L.pageBytes, 'v2 batch bound');
           // Record ACK keeps its exact-through branch; a source-prefix must start at
           // the DURABLE checkpoint and end at the new one. Both compare against
           // what S issued, read back here inside this transaction.
-          const durable = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
-          const issued = this.hooks.inputReceipt?.(b.input);
+          const durable = durableCheckpoint();
+          // S is asked about the caller's input object; the snapshot is never handed out.
+          const issued = this.hooks.inputReceipt?.((caller as Extract<V2WriteCommand, { kind: 'batch' }>).batch.input);
           fhAssert(durable && issued?.status === 'ok' && v2BatchInputMatchesIssued(b.input, issued.value, durable, b.checkpoint),
             'v2 durable input authority');
-          for (const row of b.rows) {
+          for (const [i, row] of b.rows.entries()) {
             v2RowShape(row); fhAssert(row.finalized && equal(row.id.pane, r.fence.pane) && equal(row.geometry, { columns: next.pane.geometry.columns, rows: next.pane.geometry.rows }), 'v2 row identity/geometry');
             nonempty(row.id.segmentId); safe(row.id.rowOrdinal);
             fhAssert(!this.get('segment-seal', key, row.id.segmentId), 'v2 sealed segment');
             const metrics = this.get<{ bytes: number; rows: number }>('segment-stats', key, row.id.segmentId)
               ?? this.segmentMetrics(key, row.id.segmentId);
-            this.observeRows(1); // bytes(row)
-            const rowBytes = metrics.bytes + bytes(row) + 1;
+            const rowBytes = metrics.bytes + Buffer.byteLength(rowText[i]!) + 1;
             fhAssert(rowBytes <= FB.archiveChunkBytes / 2 && metrics.rows < 65536, 'v2 segment full; seal and rotate');
             fhAssert(row.id.rowOrdinal === metrics.rows, 'v2 row order');
-            this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row);
+            this.append(key, revision, 'row', streamCanonical(row.id), row.id.segmentId, row, rowText[i]);
             this.put('segment-stats', key, row.id.segmentId, { bytes: rowBytes, rows: metrics.rows + 1 });
             next = { ...next, frontier: row.id };
           }
@@ -2360,7 +2401,7 @@ class V2Storage {
         case 'audit': {
           const a = command.result; fhAssert(bytes(a) <= V2L.checkpointBytesPerPane + V2L.diagnosticEventBytes, 'v2 audit bound');
           if (a.kind !== 'inconclusive') {
-            const cp = this.get<V2LiveCheckpoint>('checkpoint', key, 'live');
+            const cp = durableCheckpoint();
             fhAssert(cp && next.pane.state === 'active' && v2AuditComparable(a.evidence,
               { pane: cp.pane, through: cp.through, revision: owner.durableRevision, geometry: cp.geometry, checkpointId: cp.checkpointId }, this.#config.audit), 'v2 stale/unordered audit');
             if (a.kind === 'repair-pending') {
@@ -2375,7 +2416,7 @@ class V2Storage {
         }
         case 'seal': this.seal(r.fence.pane, command.segmentId, receipt); break;
         case 'materialize-export': this.materialize(r.fence.pane, command.sealCommitId, r.fence.operationId); break;
-        case 'locator': this.locate(r.fence.pane, command.locator, commitId); break;
+        case 'locator': this.locate(r.fence.pane, frozen(command.locator), commitId); break; // the readback hook sees it frozen
         case 'pin':
           nonempty(command.pinId); fhAssert(!this.get('remote-segment', key, command.segmentId), 'v2 segment already remote');
           fhAssert(this.#db.query('SELECT 1 FROM fh_v2_timeline WHERE pane=? AND segment=? LIMIT 1').get(key, command.segmentId), 'v2 unknown segment');
@@ -2402,10 +2443,11 @@ class V2Storage {
     }
     return result;
   }
-  private append(pane: string, revision: number, kind: string, id: string, segment: string, value: unknown): void {
+  /** `text` (H-PERF): the canonical text of `value` the caller already made in this call. */
+  private append(pane: string, revision: number, kind: string, id: string, segment: string, value: unknown, text?: string): void {
     const n = Number((this.#db.query('SELECT COALESCE(MAX(n),0)+1 AS n FROM fh_v2_timeline WHERE pane=?').get(pane) as SqlRow).n);
-    if (kind === 'row') this.observeRows(1);
-    const payload = streamCanonical(value); fhAssert(Buffer.byteLength(payload) <= V2L.pageBytes - 64, 'v2 timeline entry bound');
+    if (text === undefined && kind === 'row') this.observeRows(1);
+    const payload = text ?? streamCanonical(value); fhAssert(Buffer.byteLength(payload) <= V2L.pageBytes - 64, 'v2 timeline entry bound');
     this.#db.query('INSERT INTO fh_v2_timeline VALUES(?,?,?,?,?,?,?,?)').run(pane, n, revision, kind, id, segment, kind === 'row' ? v2Pack(payload) : payload,
       v2Digest('timeline', { pane, n, revision, kind, id, segment, payload }));
   }
