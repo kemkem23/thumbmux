@@ -312,9 +312,9 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string, failed: boolean) => {
-      // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1 storage
-      // cases (seconds each) have their own mutant runner below.
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS1 )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1/HS2 storage
+      // cases (seconds each) have their own mutant runners below.
+      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
       console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));

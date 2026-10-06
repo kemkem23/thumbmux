@@ -1367,7 +1367,9 @@ import { createV2HistoryFactory } from '../src/history-engine';
 import * as H2 from '../src/stream-contract';
 import type { NewarchV2Incident, NewarchV2PaneDescriptor } from '@thumbmux/core';
 function h2value<T>(r: H2.Result<T>): T { if (r.status !== 'ok') throw Error(JSON.stringify(r)); return r.value; }
-async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {}) {
+// HS2: `storage` opens with another config budget and/or a named storage profile.
+type H2Storage = { readonly config?: H2.V2Config; readonly storageProfile?: H2.V2StorageProfile };
+async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {}, storage: H2Storage = {}) {
   const root = mkdtempSync(join(tmpdir(), 'newarch-h2-'));
   // S-owned issued-input stub, separate from the caller: only `issue` (the
   // collector RPC side) fills it, and H reads back the exact object S issued.
@@ -1377,7 +1379,9 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
     : 'record:' + i.commitId + ':' + i.through.byteOffset;
   const issue = <T extends H2.V2BatchInput>(input: T): T => { issued.set(inputKey(input), structuredClone(input)); return input; };
   const factory = createV2HistoryFactory({ inputReceipt: input => ({ status: 'ok', value: issued.get(inputKey(input)) ?? null }), ...hooks });
-  const open = () => factory.openForCapture({ rootId: root, engineId: 'test-capture', config: H2.NEWARCH_V2_DEFAULT_CONFIG });
+  const openWith = (s: H2Storage) => factory.openForCapture({ rootId: root, engineId: 'test-capture', config: s.config ?? H2.NEWARCH_V2_DEFAULT_CONFIG,
+    ...(s.storageProfile ? { storageProfile: s.storageProfile } : {}) });
+  const open = () => openWith(storage);
   let port = h2value(await open());
   const pane = { serverIdentity: 'private-server', paneId: '%1', birthGeneration: 1 };
   const session = { serverIdentity: pane.serverIdentity, sessionId: 'stable-1' };
@@ -1435,7 +1439,7 @@ async function h2fixture(hooks: Parameters<typeof createV2HistoryFactory>[0] = {
     ({ kind: 'batch', batch: { rows, decisions: [], incidents, checkpoint: cp(revision, through, frontier), input } });
   const page = (maxEntries = 256, cursor: H2.NewarchV2HistoryCursor | null = null, direction: 'after' | 'before' = 'after', maxBytes = 2 * 1024 * 1024) =>
     port.reader.page({ schema: 'newarch-v2', pane, cursor, direction, maxEntries, maxBytes });
-  return { root, pane, session, geometry, descriptor, cp, request, commit, ready, reserve, activate, incident, row, batch, page, open,
+  return { root, pane, session, geometry, descriptor, cp, request, commit, ready, reserve, activate, incident, row, batch, page, open, openWith,
     issue, sourcePrefix, recordAck, inputBatch,
     get port() { return port; },
     async reopen() { h2value(await port.writer.close(port.capability)); port = h2value(await open()); return port; },
@@ -2363,3 +2367,201 @@ test('HS1 row shape refuses invalid writes atomically and objects require canoni
     }
   } finally { await f.cleanup(); }
 });
+
+// HS2 (PLAN §2 / §3.1): abandoned scans, durable storage profile, real page
+// size and the WAL allocation. Each named part reports its own outcome.
+const hs2MiB = 1024 * 1024;
+type H2Fixture = Awaited<ReturnType<typeof h2fixture>>;
+let hs2Seed = 7;
+function hs2Hex(bytes: number): string {
+  let out = '';
+  for (let i = 0; i < bytes; i++) { hs2Seed = (Math.imul(hs2Seed, 1103515245) + 12345) >>> 0; out += (hs2Seed >>> 24).toString(16).padStart(2, '0'); }
+  return out;
+}
+/** Row `rowOrdinal` of `segmentId` whose pipe origin is byte `offset`; noisy cells defeat deflate. */
+function hs2Row(f: H2Fixture, segmentId: string, rowOrdinal: number, offset: number, noisy = false): H2.CommittedStreamRow {
+  const row = f.row(offset);
+  return { ...row, id: { ...row.id, segmentId, rowOrdinal },
+    cells: noisy ? row.cells.map(() => ({ text: hs2Hex(16), width: 1 as const, style: [] })) : row.cells };
+}
+function hs2Batch(f: H2Fixture, rows: readonly H2.CommittedStreamRow[], through: number, operationId: string): H2.V2WriteRequest {
+  const revision = (h2value(f.port.reader.owner(f.pane))?.durableRevision ?? 0) + 1;
+  return f.request(f.inputBatch(rows, f.issue(f.recordAck(through)), revision, through), operationId);
+}
+function hs2Locator(f: H2Fixture, sealCommitId: string, exportOperationId: string): H2.V2RemoteLocator {
+  const seal = h2value(f.port.reader.sealed(f.pane, sealCommitId))!, exported = h2value(f.port.reader.export(f.pane, exportOperationId))!;
+  const sources = [...exported.files, exported.manifest], members = sources.map((file, i) => ({ ...file, path: 'member-' + i }));
+  const manifest = { objectKey: 'synthetic/manifest', bytes: 20, sha256: 'a'.repeat(64) };
+  const inventory: H2.ArchiveInventoryR2 = { revision: 2, sealGeneration: seal.sealGeneration, sealCommitId: seal.sealCommitId,
+    sealManifestSha256: exported.manifest.sha256, bundleManifestSha256: manifest.sha256,
+    members: sources.map((file, i) => ({ sourcePath: file.path, relativePath: members[i]!.path, bytes: file.bytes, sha256: file.sha256 })) };
+  const bundle: H2.ArchiveBundle = { version: 1, bundleId: 'remote-hs2', storeUUID: exported.storeUUID, pane: f.pane,
+    segmentId: seal.segmentId, coverage: seal.coverage, schemaVersions: { newarch: 2 }, objects: [manifest], manifest, members,
+    compression: 'tar.zst', encryption: 'none', checkpointIds: seal.checkpointIds, rawRanges: seal.rawRanges };
+  return { pane: f.pane, segmentId: seal.segmentId, sealed: seal, inventory,
+    readerProof: { digest: seal.coverage[0]!.digest, verifiedAtWallMs: 123, first: f.row(0).id, last: f.row(1).id },
+    verified: { kind: 'verified-remote', bundle, verificationId: 'verified-hs2', method: 'download-sha256', verifiedAtMonoMs: 100,
+      clockEpoch: 'test', inventoryDigest: H2.archiveInventoryDigest(inventory), evidence: [exported.manifest], toolVersion: 'test',
+      command: ['simulated-readback'], stdout: exported.manifest, stderr: exported.manifest, exitCode: 0 } };
+}
+const hs2Outcome = (r: H2.Result<unknown>) => r.status === 'ok' ? 'ok' : JSON.stringify(r);
+
+test('HS2 abandoned scans leave the store usable', async () => {
+  const parts: Record<string, string> = {};
+  // (a) reclaim stops inside its pin scan; the raw-pin census runs the same SQL next.
+  const a = await h2fixture({ remoteReadback: () => true });
+  try {
+    await a.activate(); await a.commit(a.batch([a.row(0), a.row(1)]), 'rows');
+    const sealed = await a.commit({ kind: 'seal', segmentId: 'segment-1' }, 'seal');
+    await a.commit({ kind: 'materialize-export', sealCommitId: sealed.commitId }, 'export');
+    const located = await a.commit({ kind: 'locator', locator: hs2Locator(a, sealed.commitId, 'export') }, 'locator');
+    await a.commit({ kind: 'pin', pinId: 'reader-pin', segmentId: 'segment-1' }, 'pin');
+    const reclaim: H2.V2WriteCommand = { kind: 'reclaim', locatorCommitId: located.commitId, segmentId: 'segment-1' };
+    expect(await a.port.writer.commit(a.port.capability, a.request(reclaim, 'reclaim')))
+      .toMatchObject({ status: 'error', message: expect.stringContaining('v2 segment pinned') });
+    const authority = (a.port as typeof a.port & { authority: H2.V2HistoryAuthority }).authority;
+    const census = authority.rawPins(a.pane, h2value(a.port.reader.checkpoint(a.pane))!.through.epoch);
+    parts.pinCensusAfterRefusedReclaim = census.status === 'ok' && census.value.rowPins === 1 ? 'ok' : hs2Outcome(census);
+    await a.commit({ kind: 'release-pin', pinId: 'reader-pin' }, 'release');
+    parts.reclaimAfterRelease = hs2Outcome(await a.port.writer.commit(a.port.capability, a.request(reclaim, 'reclaim')));
+  } finally { await a.cleanup(); }
+  // (b) seal stops on a corrupt row; the next new segment measures itself with the same SQL.
+  const b = await h2fixture();
+  try {
+    await b.activate(); await b.commit(b.batch([b.row(0), b.row(1)]), 'rows');
+    h2value(await b.port.writer.close(b.port.capability));
+    hs1Db(b.root, db => db.query("UPDATE fh_v2_timeline SET checksum=? WHERE kind='row' AND id=?").run('0'.repeat(64), H2.streamCanonical(b.row(0).id)));
+    await b.reload();
+    expect(await b.port.writer.commit(b.port.capability, b.request({ kind: 'seal', segmentId: 'segment-1' }, 'seal')))
+      .toMatchObject({ status: 'error', message: expect.stringContaining('v2 corrupt timeline') });
+    parts.appendAfterRefusedSeal = hs2Outcome(await b.port.writer.commit(b.port.capability, hs2Batch(b, [hs2Row(b, 'segment-2', 0, 2)], 3, 'rows-2')));
+  } finally { await b.cleanup(); }
+  // (c) an export stops at the staging bound; the next export runs the same SQL.
+  const config: H2.V2Config = { ...H2.NEWARCH_V2_DEFAULT_CONFIG, storage: { ...H2.NEWARCH_V2_DEFAULT_CONFIG.storage, stagingCapBytes: 64 * 1024 } };
+  const c = await h2fixture({}, { config });
+  try {
+    await c.activate(); await c.commit(c.batch(Array.from({ length: 8 }, (_, n) => c.row(n))), 'rows');
+    const first = await c.commit({ kind: 'seal', segmentId: 'segment-1' }, 'seal-1');
+    expect(await c.port.writer.commit(c.port.capability, c.request({ kind: 'materialize-export', sealCommitId: first.commitId }, 'export-1')))
+      .toMatchObject({ status: 'error', message: expect.stringContaining('v2 export bound') });
+    h2value(await c.port.writer.commit(c.port.capability, hs2Batch(c, [hs2Row(c, 'segment-2', 0, 8)], 9, 'rows-2')));
+    const second = await c.commit({ kind: 'seal', segmentId: 'segment-2' }, 'seal-2');
+    parts.exportAfterRefusedExport = hs2Outcome(await c.port.writer.commit(c.port.capability,
+      c.request({ kind: 'materialize-export', sealCommitId: second.commitId }, 'export-2')));
+  } finally { await c.cleanup(); }
+  expect(parts).toEqual({ pinCensusAfterRefusedReclaim: 'ok', reclaimAfterRelease: 'ok', appendAfterRefusedSeal: 'ok', exportAfterRefusedExport: 'ok' });
+}, 60_000);
+
+// A small R-shaped profile: 64 MiB root, reserve 16 MiB, every class allocated.
+const hs2SmallStorage: H2.V2StorageBudget = { rootCapBytes: 64 * hs2MiB, emergencyReserveBytes: 16 * hs2MiB,
+  reservePerPaneBytes: 256 * 1024, reserveSharedBytes: 8 * hs2MiB, diagnosticCapBytes: hs2MiB, stagingCapBytes: 4 * hs2MiB };
+const hs2SmallConfig: H2.V2Config = { ...H2.NEWARCH_V2_DEFAULT_CONFIG, storage: hs2SmallStorage };
+const hs2Profile = (walBytes: number): H2.V2StorageProfile => ({ name: 'hs2-test', storage: hs2SmallStorage,
+  allocation: { databaseBytes: 32 * hs2MiB, walBytes, rawBytes: hs2MiB, stagingBytes: 4 * hs2MiB, diagnosticBytes: hs2MiB, otherBytes: hs2MiB } });
+
+test('HS2 storage profile is durable and a mismatched reopen refuses before any write', async () => {
+  const A = hs2Profile(256 * 1024), B = hs2Profile(512 * 1024);
+  const f = await h2fixture({}, { config: hs2SmallConfig, storageProfile: A });
+  const generation = () => hs1Db(f.root, db => Number((db.query('SELECT generation FROM fh_v2_meta WHERE id=1').get() as { generation: number }).generation));
+  const profiles = () => hs1Db(f.root, db => (db.query("SELECT pane,id,payload FROM fh_v2_object WHERE kind='storage-profile'").all() as { pane: string; id: string; payload: string }[])
+    .map(r => ({ pane: r.pane, id: r.id, digest: JSON.parse(r.payload).digest })));
+  const attempt = async (s: H2Storage) => {
+    const r = await f.openWith(s); if (r.status === 'ok') h2value(await r.value.writer.close(r.value.capability)); return r;
+  };
+  try {
+    await f.activate();
+    const born = f.port.capability.generation;
+    h2value(await f.port.writer.close(f.port.capability));
+    expect(profiles()).toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(A) }]);
+    for (const other of [{ config: hs2SmallConfig, storageProfile: B }, { config: hs2SmallConfig }]) {
+      expect(await attempt(other)).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
+      expect(generation()).toBe(born);
+    }
+    // A profile whose budget is not the config's budget never opens anything.
+    expect(await attempt({ storageProfile: A })).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile') });
+    expect(generation()).toBe(born);
+    await f.reload();
+    expect(f.port.capability.generation).toBe(born + 1);
+    expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(1);
+    h2value(await f.port.writer.close(f.port.capability));
+    // A root from before HS2 has no profile row and adopts the one it is opened with.
+    hs1Db(f.root, db => db.query("DELETE FROM fh_v2_object WHERE kind='storage-profile'").run());
+    expect((await attempt({ config: hs2SmallConfig, storageProfile: B })).status).toBe('ok');
+    expect(profiles()).toEqual([{ pane: '*', id: 'root', digest: H2.v2StorageProfileDigest(B) }]);
+    expect(await attempt({ config: hs2SmallConfig, storageProfile: A })).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage profile mismatch') });
+    expect(generation()).toBe(born + 2);
+  } finally { await f.cleanup(); }
+}, 60_000);
+
+test('HS2 page limit follows the real page size', async () => {
+  const storage: H2.V2StorageBudget = { rootCapBytes: 4 * hs2MiB, emergencyReserveBytes: hs2MiB, reservePerPaneBytes: 64 * 1024,
+    reserveSharedBytes: 512 * 1024, diagnosticCapBytes: 64 * 1024, stagingCapBytes: 512 * 1024 };
+  const f = await h2fixture({}, { config: { ...H2.NEWARCH_V2_DEFAULT_CONFIG, maxActivePanes: 1, storage } });
+  try {
+    await f.activate(); h2value(await f.port.writer.close(f.port.capability));
+    hs1Db(f.root, db => db.exec('PRAGMA journal_mode=DELETE; PRAGMA page_size=8192; VACUUM; PRAGMA journal_mode=WAL;'));
+    await f.reload();
+    let through = 0, ordinal = 0, segment = 0, committed = 0, failed: H2.Result<H2.V2Receipt> | null = null;
+    for (let n = 0; n < 400 && !failed; n++) {
+      if (ordinal >= 200) { segment++; ordinal = 0; }
+      const rows = Array.from({ length: 25 }, (_, i) => hs2Row(f, 'page-' + segment, ordinal + i, through + i, true));
+      const before = h2value(f.port.reader.owner(f.pane))!.durableRevision, result = await f.port.writer.commit(f.port.capability, hs2Batch(f, rows, through + rows.length, 'fill-' + n));
+      if (result.status !== 'ok') {
+        failed = result;
+        // The refused batch is not acknowledged and leaves nothing behind.
+        expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(before);
+        expect(h2value(f.port.reader.receipt(f.pane, 'fill-' + n))).toBeNull();
+      } else { through += rows.length; ordinal += rows.length; committed += rows.length; }
+    }
+    expect(failed).toMatchObject({ status: 'error', code: 'io' });
+    h2value(await f.port.writer.close(f.port.capability));
+    const disk = hs1Db(f.root, db => ({ pageSize: Number((db.query('PRAGMA page_size').get() as { page_size: number }).page_size),
+      pages: Number((db.query('PRAGMA page_count').get() as { page_count: number }).page_count),
+      rows: Number((db.query("SELECT COUNT(*) AS n FROM fh_v2_timeline WHERE kind='row'").get() as { n: number }).n) }));
+    const limit = Math.floor(Math.floor((storage.rootCapBytes - storage.emergencyReserveBytes) / 2) / 8192);
+    console.log('HS2_PAGE_LIMIT', JSON.stringify({ bun: Bun.version, ...disk, limit, committed }));
+    expect(disk.pageSize).toBe(8192);
+    expect(disk.pages).toBeLessThanOrEqual(limit);
+    expect(disk.rows).toBe(committed);
+    expect(H2.v2DatabasePageLimit(H2.v2LegacyStorageProfile(storage), 8192)).toBe(limit);
+    await f.reload();
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HS2 WAL stays inside the allocation after every commit', async () => {
+  const walBytes = 256 * 1024;
+  const f = await h2fixture({}, { config: hs2SmallConfig, storageProfile: hs2Profile(walBytes) });
+  const walSize = () => { const wal = join(f.root, 'flag-on-v1.sqlite-wal'); return existsSync(wal) ? statSync(wal).size : 0; };
+  const rows = (from: number) => Array.from({ length: 20 }, (_, i) => hs2Row(f, 'segment-1', from + i, from + i, true));
+  try {
+    await f.activate();
+    let through = 0; const sizes: number[] = [];
+    for (let n = 0; n < 16; n++) {
+      h2value(await f.port.writer.commit(f.port.capability, hs2Batch(f, rows(through), through + 20, 'wal-' + n)));
+      through += 20; sizes.push(walSize());
+    }
+    console.log('HS2_WAL_SIZES', JSON.stringify(sizes));
+    expect(sizes.filter(size => size > walBytes)).toEqual([]);
+    // An outside reader pins the WAL: once it is over budget the next commit
+    // is refused before any mutation, then retries exactly once after release.
+    const reader = new Database(join(f.root, 'flag-on-v1.sqlite'));
+    let refused: H2.Result<H2.V2Receipt> | null = null, request: H2.V2WriteRequest | null = null, before = 0;
+    try {
+      reader.exec('BEGIN'); reader.query('SELECT COUNT(*) AS n FROM fh_v2_timeline').get();
+      for (let n = 0; n < 64 && !refused; n++) {
+        before = h2value(f.port.reader.owner(f.pane))!.durableRevision;
+        request = hs2Batch(f, rows(through), through + 20, 'pinned-' + n);
+        const result = await f.port.writer.commit(f.port.capability, request);
+        if (result.status === 'ok') through += 20; else refused = result;
+      }
+      expect(refused).toMatchObject({ status: 'error', message: expect.stringContaining('v2 storage wal budget') });
+      expect(h2value(f.port.reader.receipt(f.pane, request!.fence.operationId))).toBeNull();
+      expect(h2value(f.port.reader.owner(f.pane))!.durableRevision).toBe(before);
+    } finally { reader.exec('COMMIT'); reader.close(); }
+    const receipt = h2value(await f.port.writer.commit(f.port.capability, request!)); through += 20;
+    expect(h2value(await f.port.writer.commit(f.port.capability, request!))).toEqual(receipt);
+    expect(walSize()).toBeLessThanOrEqual(walBytes);
+    const stored = hs1Db(f.root, db => Number((db.query("SELECT COUNT(*) AS n FROM fh_v2_timeline WHERE kind='row'").get() as { n: number }).n));
+    expect(stored).toBe(through);
+  } finally { await f.cleanup(); }
+}, 120_000);
