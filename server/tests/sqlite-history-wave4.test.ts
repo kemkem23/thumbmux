@@ -2311,7 +2311,7 @@ test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01
       ['buffer', r => r.buffer = 'bad'],
       ['finalized', r => r.finalized = false],
     ];
-    const outcomes: Record<string, string[]> = {};
+    const outcomes: Record<string, string[]> = {}, reasons: string[] = [];
     for (const packed of [false, true]) for (const [name, change] of [...cases, ['canonical', (_: any) => {}] as [string, (r: any) => void]]) {
       const row = JSON.parse(original); change(row);
       const payload = H2.streamCanonical(row) + (name === 'canonical' ? ' ' : '');
@@ -2326,10 +2326,11 @@ test('HS1 row shape and canonical equality reject correctly hashed TEXT and HS01
       hs1Db(f.root, db => db.query("DELETE FROM fh_v2_object WHERE kind='segment-seal' AND pane=? AND id=?").run(key, st.segment));
       const seal = await f.port.writer.commit(f.port.capability, f.request({ kind: 'seal', segmentId: st.segment }, `bad-seal-${packed}-${name}`));
       outcomes[`${packed}:${name}`] = [read.status, exported.status, reopened.status, seal.status];
-      for (const result of [read, exported, reopened, seal]) if (result.status === 'error') expect(JSON.stringify(result)).toMatch(/v2 row|v2 storage canonical/);
+      for (const result of [read, exported, reopened, seal]) if (result.status === 'error') reasons.push(JSON.stringify(result));
     }
     console.log('HS1_SHAPE_OUTCOMES', JSON.stringify(outcomes));
     expect(outcomes).toEqual(Object.fromEntries(Object.keys(outcomes).map(k => [k, ['error', 'error', 'error', 'error']])));
+    for (const reason of reasons) expect(reason).toMatch(/v2 row|v2 storage canonical/);
   } finally { await f.cleanup(); }
 }, 120_000);
 
