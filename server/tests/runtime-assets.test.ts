@@ -445,7 +445,11 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
   }, 90_000);
 
   test("consumer pressure is reported as main-queue and consumer time, not as parse, and loses nothing", async () => {
-    const pane = p2Pane({ consumer: () => p2Sleep(15) });
+    const consumerDelayMs = 15;
+    // Allow 1 ms for timer coarsening and 1 ms for clock/scheduling granularity.
+    // setTimeout delay is not an exact lower bound on performance.now() spans.
+    const consumerTimingToleranceMs = 2;
+    const pane = p2Pane({ consumer: () => p2Sleep(consumerDelayMs) });
     try {
       await pane.worker.start();
       for (let i = 0; i < 40; i++) { expect(p2Feed(pane, p2Encoder.encode(`row ${i}\r\n`))).toBe(true); await p2Sleep(3); }
@@ -454,7 +458,7 @@ describe("NEWARCH P2 pipe-vt stage diagnostics", () => {
       expect(receipt.workerEof && receipt.outputDrained && !receipt.unknownTail).toBe(true);
       p2AssertTraces(pane, "slow consumer");
       const acked = pane.traces.filter((t) => t.matchedFeeds > 0);
-      expect(Math.min(...acked.map((t) => t.consumerMs))).toBeGreaterThanOrEqual(14);
+      expect(Math.min(...acked.map((t) => t.consumerMs))).toBeGreaterThanOrEqual(consumerDelayMs - consumerTimingToleranceMs);
       // Updates queued behind the 15 ms consumer: the wait shows up on main, not in the worker.
       expect(Math.max(...acked.map((t) => t.mainQueueMs))).toBeGreaterThan(10);
       expect(Math.max(...acked.map((t) => t.worker!.parseNs / 1e6))).toBeLessThan(Math.max(...acked.map((t) => t.mainQueueMs)));
