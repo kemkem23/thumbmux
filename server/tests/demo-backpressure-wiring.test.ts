@@ -230,7 +230,7 @@ test('stream I lost J reply retries the same event without duplicate durable row
 },30000);
 
 // The four stream I cases that drive the host StreamSourceTransport /
-// StreamPipeHost moved to tests/integrations/tmux-pipe-process.test.ts
+// StreamPipeHost rigs before T11 live in tests/integrations/tmux-pipe-process.test.ts (TP-A).
 // (public split has no src/integrations).
 test('stream I bootstrap also needs saved cursor when no escape sequence is pending',async()=>{
  const root=await mkdtemp(join(tmpdir(),'stream-i-saved-cursor-evidence-'));
@@ -325,7 +325,7 @@ import { writeFileSync, readFileSync } from 'node:fs';
 // MUTATION runs can copy it.
 // ---------------------------------------------------------------------------
 // The oracle region itself lives in fixtures/t11-oracle.ts so the host flag-on
-// rigs (tests/integrations/tmux-pipe-process.test.ts) judge with the same code.
+// rigs from T11 onward (tests/integrations/tmux-pipe-process-v2.test.ts, TP-B) judge with the same code.
 import { t11JudgeTimeline, t11RawOracle, t11Ev, t11Gap, t11Range, t11OracleSelfTest } from './fixtures/t11-oracle';
 
 import { createHash as t11Hash } from 'node:crypto';
@@ -390,7 +390,7 @@ for (const [mutation, [from, to]] of Object.entries(T11_ORACLE_MUTANTS)) {
 // ---- Cases S and A (05-A catalog v3 / remote index) drive the host
 // StreamArchiveCatalog and moved to tests/integrations/terminal-durable-history-runtime.test.ts;
 // the T-fix flag-on rig (S-01…S-12, R10/R14/R16, B1-03/B2-03/B3-02, OFF-01, V2-01)
-// drives FlagOnPipeHost and moved to tests/integrations/tmux-pipe-process.test.ts.
+// drives FlagOnPipeHost after T11 in tests/integrations/tmux-pipe-process-v2.test.ts (TP-B).
 
 // ---------------------------------------------------------------------------
 // NEWARCH v2 lot T (PLAN-v2 §8 V2-01…19 rows owned by T, §9 sampler contract).
