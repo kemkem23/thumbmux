@@ -26,8 +26,10 @@ import type {
   EmbedGeometryInput,
   FontBounds,
   HubPresentationOptions,
+  PromptEntry,
   SessionActionContext,
   SessionPresentationOptions,
+  SubmissionReceipt,
   SubmissionTransport,
 } from '../src';
 import { createQueryParamNav } from '../src/navigation';
@@ -81,8 +83,10 @@ const REQUIRED_TYPE_EXPORTS = [
   'EmbedGeometryInput',
   'FontBounds',
   'HubPresentationOptions',
+  'PromptEntry',
   'SessionActionContext',
   'SessionPresentationOptions',
+  'SubmissionReceipt',
   'SubmissionTransport',
 ] as const;
 
@@ -95,8 +99,10 @@ type ConfigExports = [
   EmbedGeometryInput,
   FontBounds,
   HubPresentationOptions,
+  PromptEntry,
   SessionActionContext,
   SessionPresentationOptions,
+  SubmissionReceipt,
   SubmissionTransport,
 ];
 void (undefined as unknown as ConfigExports);

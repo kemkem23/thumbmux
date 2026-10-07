@@ -28,7 +28,7 @@
     claimGeometry?: boolean;
   } = $props();
 
-  let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
+  let labels = $derived<Required<AppLabels>>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let configuredTermProps = $derived(adapters.termProps?.(session) ?? {});
   let configuredBg = $derived(
     adapters.theme?.bgFor?.(session) ?? adapters.theme?.defaultBg ?? '#101014',
@@ -47,6 +47,7 @@
   let dockFull = $state(0);
   let kbInset = $state(0);
   let desktopKeysFocused = $state(false);
+  let submissionNotice = $state('');
   let composer = $state({
     text: '',
     mode: 'compose' as 'compose' | 'direct',
@@ -105,8 +106,33 @@
   }
 
   function submitDraft(text: string): void {
-    void sendSubmission(text).catch(() => prefillOnError(composer, text));
+    const submitText = adapters.submitText;
+    if (!submitText) {
+      void sendSubmission(text).catch(() => prefillOnError(composer, text));
+      return;
+    }
+    // Host-owned semantic submit: one call, no step transport. See
+    // `AppAdapters.submitText` for the meaning of each receipt status.
+    if (!text) return;
+    const targetSession = session;
+    submissionNotice = '';
+    void Promise.resolve()
+      .then(() => submitText(targetSession, text))
+      .then(
+        (receipt) => receipt?.status,
+        () => 'uncertain' as const,
+      )
+      .then((status) => {
+        if (status === 'sent') return;
+        prefillOnError(composer, text);
+        if (status !== 'rejected') submissionNotice = labels.submissionUncertain;
+      });
   }
+
+  $effect(() => {
+    void session;
+    submissionNotice = '';
+  });
 
   function openComposer(): void {
     composerOpen = true;
@@ -150,6 +176,17 @@
     {/key}
   </div>
 
+  {#if submissionNotice}
+    <div class="submission-notice" role="status">
+      <span data-testid="submission-notice">{submissionNotice}</span>
+      <button
+        type="button"
+        aria-label={labels.close}
+        onclick={() => { submissionNotice = ''; }}
+      >✕</button>
+    </div>
+  {/if}
+
   <ComposerDock
     bind:this={composerRef}
     bind:open={composerOpen}
@@ -192,6 +229,27 @@
     right: 0;
     bottom: calc(var(--dock-full, 0px) + var(--kb-inset, 0px));
     background: var(--tbg);
+  }
+
+  .submission-notice {
+    position: absolute;
+    left: 8px; right: 8px;
+    bottom: calc(var(--dock-full, 0px) + var(--kb-inset, 0px) + 8px);
+    z-index: 55;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 0 0 12px;
+    border: 1px solid var(--agent);
+    background: var(--hud);
+    color: var(--hud-fg);
+    font: 600 12px var(--font-thai, var(--font-mono));
+    line-height: 1.5;
+  }
+  .submission-notice span { flex: 1; min-width: 0; padding: 8px 0; }
+  .submission-notice button {
+    min-height: 44px; min-width: 44px;
+    background: none; border: 0; color: var(--hud-fg);
+    font: 700 13px var(--font-mono);
+    touch-action: manipulation; cursor: pointer;
   }
 
   .embed-terminal :global(.desktop-keys) {

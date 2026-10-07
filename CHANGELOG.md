@@ -1,7 +1,35 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.21.0-dist`.
+
+## v0.21.0 — 2026-10-07
+
+### Added — exact COMPOSE submit and structured prompt history (WRAPJOINED WJ-A)
+
+Additive; every new member is optional and a host that supplies neither keeps
+v0.20.5 behavior byte for byte.
+
+- **`AppAdapters.submitText(session, text) → Promise<SubmissionReceipt>`** —
+  `SessionView` and `EmbedView` hand a COMPOSE draft to the host as one string
+  (exactly what ComposerDock produced: ends trimmed, inner blank lines and
+  indentation intact) and do not also run the `submitPlan` steps for it.
+  `sent` clears the draft as before; `rejected` restores it; `uncertain` or a
+  rejected promise restores it and shows `labels.submissionUncertain`. No
+  automatic retry. DIRECT input, raw keys, shortcut sends and
+  `SessionActionContext.submit` are unchanged.
+- **`AppAdapters.promptEntries(session) → Promise<PromptEntry[] | null>`** — an
+  array (including `[]`) replaces `prompts`; `null` falls back to `prompts`.
+- **`PromptsPanel` `entries` prop** — exact `ui` rows first, then `screen` rows
+  labelled "from screen — check line breaks before sending"; empty sections
+  have no heading; labels and the uncertain badge are separate elements, so a
+  pick returns `entry.text` byte for byte. The `prompts` prop is unchanged.
+- **Types** `SubmissionReceipt` and `PromptEntry` from `thumbmux/app` (barrel) and `thumbmux/app/config`.
+- **Labels** `promptSourceUi`, `promptSourceScreen`, `promptUncertain`,
+  `submissionUncertain` — optional `AppLabels` keys with English defaults, so a
+  host that declares the full v0.20.5 `AppLabels` set still compiles.
+
+Contract details (id ownership, statuses, `null` vs `[]`): `docs/app.md` §2.5.
 
 ## v0.20.5 — 2026-10-04
 

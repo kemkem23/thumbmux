@@ -1165,6 +1165,257 @@ describe('mountable terminal views', () => {
     ]);
   });
 
+  // ─── WRAPJOINED WJ-A: host-owned semantic submit + structured recall ───────
+  // A multi-line draft with a blank line and an indented line. The host's
+  // `submitText` must receive exactly this string (ComposerDock only trims the
+  // ends, and there is nothing to trim here), and the shell must not ALSO run
+  // the per-step submitPlan transport for the same COMPOSE.
+  const WJ_MULTILINE = 'ข้อแรก\n\n  ข้อสอง คง indent\nข้อสาม';
+
+  function composerDraft(target: HTMLElement): string {
+    const input = target.querySelector<HTMLTextAreaElement>('[data-testid="input-sheet"] textarea');
+    if (!input) throw new Error('ComposerDock textarea missing');
+    return input.value;
+  }
+
+  function submissionNotice(target: HTMLElement): string | null {
+    return target.querySelector('[data-testid="submission-notice"]')?.textContent?.trim() ?? null;
+  }
+
+  for (const [label, component] of [
+    ['SessionView', SessionView],
+    ['EmbedView', EmbedView],
+  ] as const) {
+    test(`WJ-A ${label}: COMPOSE with submitText calls it once with the exact draft and never the step transport`, async () => {
+      jest.useFakeTimers();
+      const sessionName = `sh-${label}-submit-text`;
+      const submitted: Array<[string, string]> = [];
+      const steps: Array<[string, string]> = [];
+      const raw: Array<[string, string]> = [];
+      const { target } = mountView(component, {
+        session: sessionName,
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          sendKeys: (session, keys) => { raw.push([session, keys]); },
+          sendSubmissionKeys: async (session: string, keys: string) => {
+            steps.push([session, keys]);
+          },
+          submitText: async (session: string, text: string) => {
+            submitted.push([session, text]);
+            return { status: 'sent' as const, submissionId: 'host-id-1' };
+          },
+        } satisfies AppAdapters,
+      });
+      await tick();
+
+      await composeAndSend(target, WJ_MULTILINE);
+      for (let i = 0; i < 3; i += 1) {
+        jest.advanceTimersByTime(2_000);
+        await flushPromises();
+      }
+
+      expect({
+        submitText: submitted,
+        sendSubmissionKeysCalls: steps.length,
+        sendKeysCalls: raw.length,
+      }).toEqual({
+        submitText: [[sessionName, WJ_MULTILINE]],
+        sendSubmissionKeysCalls: 0,
+        sendKeysCalls: 0,
+      });
+      // `sent` behaves like the old success path: draft stays cleared, no notice.
+      expect(composerDraft(target)).toBe('');
+      expect(submissionNotice(target)).toBeNull();
+    });
+
+    test(`WJ-A ${label}: an uncertain receipt restores the draft and shows submissionUncertain`, async () => {
+      const sessionName = `sh-${label}-submit-uncertain`;
+      const noticeText = 'WJ notice: delivery unknown';
+      let submitCalls = 0;
+      const { target } = mountView(component, {
+        session: sessionName,
+        adapters: {
+          termProps: () => ({ claimGeometry: false }),
+          sendKeys: () => {},
+          sendSubmissionKeys: async () => {},
+          submitText: async () => {
+            submitCalls += 1;
+            return { status: 'uncertain' as const, submissionId: 'host-id-2' };
+          },
+          labels: { submissionUncertain: noticeText },
+        } satisfies AppAdapters,
+      });
+      await tick();
+
+      await composeAndSend(target, WJ_MULTILINE);
+      await flushPromises();
+      await flushPromises();
+
+      expect({ draft: composerDraft(target), notice: submissionNotice(target) }).toEqual({
+        draft: WJ_MULTILINE,
+        notice: noticeText,
+      });
+      // No automatic retry: the host owns id + retry policy.
+      expect(submitCalls).toBe(1);
+    });
+
+    test(`WJ-A ${label}: rejected restores the draft silently; a rejected promise restores it with the notice`, async () => {
+      const noticeText = 'WJ notice: delivery unknown';
+      for (const outcome of ['rejected', 'throws'] as const) {
+        const sessionName = `sh-${label}-submit-${outcome}`;
+        let submitCalls = 0;
+        let stepCalls = 0;
+        const { target } = mountView(component, {
+          session: sessionName,
+          adapters: {
+            termProps: () => ({ claimGeometry: false }),
+            sendKeys: () => {},
+            sendSubmissionKeys: async () => { stepCalls += 1; },
+            submitText: async () => {
+              submitCalls += 1;
+              if (outcome === 'throws') throw new Error('network down');
+              return { status: 'rejected' as const, reason: 'lifecycle_mismatch' };
+            },
+            labels: { submissionUncertain: noticeText },
+          } satisfies AppAdapters,
+        });
+        await tick();
+
+        await composeAndSend(target, WJ_MULTILINE);
+        await flushPromises();
+        await flushPromises();
+
+        expect({
+          outcome,
+          draft: composerDraft(target),
+          notice: submissionNotice(target),
+          submitCalls,
+          stepCalls,
+        }).toEqual({
+          outcome,
+          draft: WJ_MULTILINE,
+          notice: outcome === 'throws' ? noticeText : null,
+          submitCalls: 1,
+          stepCalls: 0,
+        });
+      }
+    });
+  }
+
+  test('WJ-A guard: without submitText the step transport receives submitPlan(text, {agent}) exactly', async () => {
+    jest.useFakeTimers();
+    const agent = ['co', 'dex'].join('') as SubmitAgent;
+    const fixtures = [
+      WJ_MULTILINE,
+      // Single-line prompts an agent TUI would wrap at a space on screen.
+      'please read the release boundary notes and then summarize every file that changed since the tag',
+      'ช่วยอ่านบันทึกขอบเขตรีลีส แล้วสรุปทุกไฟล์ที่เปลี่ยน ตั้งแต่แท็กล่าสุด ให้ครบทุกบรรทัด',
+    ];
+    for (const [label, component] of [
+      ['session', SessionView],
+      ['embed', EmbedView],
+    ] as const) {
+      for (const [index, draft] of fixtures.entries()) {
+        const sessionName = `sh-${label}-wj-guard-${index}`;
+        const calls: Array<[string, string]> = [];
+        const { target } = mountView(component, {
+          session: sessionName,
+          adapters: {
+            termProps: () => ({ claimGeometry: false }),
+            submitAgent: () => agent,
+            sendKeys: () => {
+              throw new Error('submission leaked to the raw-key transport');
+            },
+            sendSubmissionKeys: async (session: string, keys: string) => {
+              calls.push([session, keys]);
+            },
+          } satisfies AppAdapters,
+        });
+        await tick();
+
+        await composeAndSend(target, draft);
+        for (let i = 0; i < 3; i += 1) {
+          jest.advanceTimersByTime(2_000);
+          await flushPromises();
+        }
+        expect(calls).toEqual(submitPlan(draft, { agent }).map((step) => [sessionName, step.keys]));
+        expect(submissionNotice(target)).toBeNull();
+      }
+    }
+  });
+
+  test('WJ-A promptEntries returning [] is authoritative and does not fall back to prompts', async () => {
+    let legacyCalls = 0;
+    const entry = mountView(SessionView, {
+      session: 'sh-wj-entries-empty',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => {
+          legacyCalls += 1;
+          return ['legacy-only'];
+        },
+        promptEntries: async () => [],
+      } satisfies AppAdapters,
+    });
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    await flushPromises();
+    await flushPromises();
+
+    const shown = Array.from(entry.target.querySelectorAll('[data-testid="prompt-item"]'))
+      .map((row) => row.textContent);
+    expect({ shown, legacyCalls }).toEqual({ shown: [], legacyCalls: 0 });
+    expect(entry.target.querySelectorAll('[data-testid="prompts-panel"]')).toHaveLength(1);
+  });
+
+  test('WJ-A guard: promptEntries returning null keeps the legacy prompts list unlabelled', async () => {
+    const entry = mountView(SessionView, {
+      session: 'sh-wj-entries-null',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => ['legacy-only'],
+        promptEntries: async () => null,
+      } satisfies AppAdapters,
+    });
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    await flushPromises();
+    await flushPromises();
+
+    const shown = Array.from(entry.target.querySelectorAll('[data-testid="prompt-item"]'))
+      .map((row) => row.textContent);
+    expect(shown).toEqual(['legacy-only']);
+    expect(entry.target.querySelectorAll('[data-testid="prompt-source-label"]')).toHaveLength(0);
+  });
+
+  test('WJ-A promptEntries rows render by section and a pick prefills the exact text', async () => {
+    const exact = 'first line\n\n  indented second';
+    const entry = mountView(SessionView, {
+      session: 'sh-wj-entries-rows',
+      adapters: {
+        termProps: () => ({ claimGeometry: false }),
+        prompts: async () => ['legacy-only'],
+        promptEntries: async () => [
+          { text: 'from screen joined', source: 'screen' as const },
+          { text: exact, source: 'ui' as const, state: 'sent' as const, submissionId: 'h-1' },
+        ],
+      } satisfies AppAdapters,
+    });
+    const expand = entry.target.querySelector<HTMLButtonElement>('[data-testid="hud-expand"]');
+    if (!expand) throw new Error('SessionView did not render its HUD toggle');
+    flushSync(() => expand.click());
+    await flushPromises();
+    await flushPromises();
+
+    const rows = Array.from(entry.target.querySelectorAll<HTMLButtonElement>('[data-testid="prompt-item"]'));
+    expect(rows.map((row) => row.textContent)).toEqual([exact, 'from screen joined']);
+    flushSync(() => rows[0]!.click());
+    await tick();
+    expect(composerDraft(entry.target)).toBe(exact);
+  });
+
   test('a stage tap dismisses the host before it opens the composer', async () => {
     let hostOpen = true;
     let dismissCalls = 0;

@@ -1,9 +1,26 @@
 <script lang="ts">
   /** PromptsPanel — recent prompts extracted from the pane (core prompt-scan);
    * tap one to prefill the composer (host calls ComposerDock.openCompose()).
-   * Lives inside TermHud's panel snippet next to NotePanel. */
+   * Lives inside TermHud's panel snippet next to NotePanel.
+   *
+   * `entries` (optional) is the structured form: exact rows sent from the UI
+   * and rows rebuilt from the screen, rendered as two sections. The source and
+   * delivery badges are separate elements, so `onPick` always receives
+   * `entry.text` byte for byte. Without `entries` the legacy `prompts` list
+   * renders exactly as before. */
+
+  /** Structurally identical to `PromptEntry` in `@thumbmux/app/config`;
+   *  declared here because this package cannot import the app layer. */
+  type PanelPromptEntry = {
+    text: string;
+    source: 'ui' | 'screen';
+    state?: 'sent' | 'uncertain';
+    submissionId?: string;
+  };
+
   let {
     prompts = [],
+    entries = undefined,
     loading = false,
     onPick,
     collapsible = false,
@@ -15,6 +32,8 @@
     },
   }: {
     prompts?: string[];
+    /** When set (including `[]`) this replaces `prompts` as the list source. */
+    entries?: readonly PanelPromptEntry[] | null;
     loading?: boolean;
     onPick: (prompt: string) => void;
     /** Render the title as a disclosure control. Default false keeps the
@@ -22,8 +41,25 @@
     collapsible?: boolean;
     /** Start expanded. Ignored unless `collapsible`. */
     initiallyOpen?: boolean;
-    labels?: { title: string; loading: string; none: string };
+    labels?: {
+      title: string;
+      loading: string;
+      none: string;
+      sourceUi?: string;
+      sourceScreen?: string;
+      uncertain?: string;
+    };
   } = $props();
+
+  let structured = $derived(entries != null);
+  let uiEntries = $derived(entries ? entries.filter((entry) => entry.source === 'ui') : []);
+  let screenEntries = $derived(entries ? entries.filter((entry) => entry.source === 'screen') : []);
+  let total = $derived(structured ? uiEntries.length + screenEntries.length : prompts.length);
+  let sourceUiLabel = $derived(labels.sourceUi ?? 'sent from this UI');
+  let sourceScreenLabel = $derived(
+    labels.sourceScreen ?? 'from screen — check line breaks before sending',
+  );
+  let uncertainLabel = $derived(labels.uncertain ?? 'delivery unknown');
 
   // Only meaningful when collapsible; a non-collapsible panel reads `open` as
   // permanently true below, so the initial value cannot affect it.
@@ -76,6 +112,7 @@
   $effect(() => {
     const root = rootEl;
     void prompts;
+    void entries;
     void expanded;
     void rowOpen;
     if (!root) return;
@@ -105,6 +142,32 @@
   });
 </script>
 
+{#snippet promptRow(text: string, i: number, uncertain: boolean)}
+  {@const long = !!overflow[i]}
+  {@const openRow = !!rowOpen[i]}
+  <div class="prompt-row" data-testid="prompt-row">
+    {#if uncertain}
+      <span class="pstate" data-testid="prompt-state">{uncertainLabel}</span>
+    {/if}
+    <button
+      class="prompt"
+      class:clamped={long && !openRow}
+      onclick={() => onPick(text)}
+      data-testid="prompt-item"
+      lang={hasThai(text) ? 'th' : undefined}
+    >{text}</button>
+    {#if long}
+      <button
+        type="button"
+        class="prompt-disclose"
+        aria-expanded={openRow}
+        data-testid="prompt-disclose"
+        onclick={() => { rowOpen = { ...rowOpen, [i]: !openRow }; }}
+      >{openRow ? showLessLabel : showAllLabel}</button>
+    {/if}
+  </div>
+{/snippet}
+
 <div
     class="promptsp"
     data-testid="prompts-panel"
@@ -120,38 +183,36 @@
     >
       <span class="pcaret" aria-hidden="true">{open ? '▾' : '▸'}</span>
       <span>{labels.title}</span>
-      {#if prompts.length > 0}<span class="pcount">({prompts.length})</span>{/if}
+      {#if total > 0}<span class="pcount">({total})</span>{/if}
     </button>
   {:else}
     <div class="ptitle">{labels.title}</div>
   {/if}
   {#if expanded}
-    {#if loading && prompts.length === 0}
+    {#if loading && total === 0}
       <div class="pnone">{labels.loading}</div>
-    {:else if prompts.length === 0}
+    {:else if total === 0}
       <div class="pnone">{labels.none}</div>
+    {:else if structured}
+      {#if uiEntries.length > 0}
+        <section class="psection" data-testid="prompt-section" data-source="ui">
+          <div class="psource" data-testid="prompt-source-label">{sourceUiLabel}</div>
+          {#each uiEntries as entry, j (j)}
+            {@render promptRow(entry.text, j, entry.state === 'uncertain')}
+          {/each}
+        </section>
+      {/if}
+      {#if screenEntries.length > 0}
+        <section class="psection" data-testid="prompt-section" data-source="screen">
+          <div class="psource" data-testid="prompt-source-label">{sourceScreenLabel}</div>
+          {#each screenEntries as entry, j (j)}
+            {@render promptRow(entry.text, uiEntries.length + j, false)}
+          {/each}
+        </section>
+      {/if}
     {:else}
       {#each prompts as p, i (i)}
-        {@const long = !!overflow[i]}
-        {@const openRow = !!rowOpen[i]}
-        <div class="prompt-row" data-testid="prompt-row">
-          <button
-            class="prompt"
-            class:clamped={long && !openRow}
-            onclick={() => onPick(p)}
-            data-testid="prompt-item"
-            lang={hasThai(p) ? 'th' : undefined}
-          >{p}</button>
-          {#if long}
-            <button
-              type="button"
-              class="prompt-disclose"
-              aria-expanded={openRow}
-              data-testid="prompt-disclose"
-              onclick={() => { rowOpen = { ...rowOpen, [i]: !openRow }; }}
-            >{openRow ? showLessLabel : showAllLabel}</button>
-          {/if}
-        </div>
+        {@render promptRow(p, i, false)}
       {/each}
     {/if}
   {/if}
@@ -170,6 +231,13 @@
   .pcaret { opacity: .9; }
   .pcount { opacity: .8; }
   .pnone { font: 600 11px var(--font-thai, var(--font-mono)); color: var(--hud-fg); opacity: .5; }
+  .psection { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .psource { font: 700 9.5px var(--font-thai, var(--font-mono)); color: var(--hud-fg); opacity: .75; letter-spacing: .02em; }
+  .pstate {
+    align-self: flex-start;
+    font: 700 10px var(--font-thai, var(--font-mono)); color: var(--hud-fg);
+    border: 1px dashed var(--hud-line); padding: 1px 6px; letter-spacing: 0;
+  }
   .prompt-row { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .prompt {
     min-height: 44px; padding: 8px 10px; text-align: left; width: 100%; min-width: 0;

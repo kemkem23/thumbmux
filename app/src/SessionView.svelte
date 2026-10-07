@@ -33,6 +33,7 @@
     DEFAULT_APP_LABELS,
     type AppAdapters,
     type AppLabels,
+    type PromptEntry,
     type SessionActionContext,
     type SubmissionTransport,
   } from './config';
@@ -67,7 +68,7 @@
   const prefs = adapters.prefs ?? createLocalPrefs(adapters.theme?.storageKey ?? LOCAL_PREFS_KEY);
 
   const liveSessionsMux = adapters.mux ?? tmuxMux;
-  let labels = $derived<AppLabels>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
+  let labels = $derived<Required<AppLabels>>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
   let localBg = $state(adapters.theme?.defaultBg ?? DARK_BG);
   let storedFontPx = $state(DEFAULT_FONT_PX);
   let shortcuts = $state<Shortcut[]>(DEFAULT_SHORTCUTS.map((shortcut) => ({ ...shortcut })));
@@ -133,6 +134,10 @@
   let note = $state('');
   let noteSaving = $state(false);
   let recentPrompts = $state<string[]>([]);
+  // `null` = no structured answer (no adapter, or the host resolved null), so
+  // the panel renders `recentPrompts` exactly as before.
+  let recentPromptEntries = $state<PromptEntry[] | null>(null);
+  let submissionNotice = $state('');
   let promptsLoading = $state(false);
   let dpadOpen = $state(false);
   let shortcutsOpen = $state(false);
@@ -171,6 +176,8 @@
   // host may rebuild that object when unrelated HUD data changes; the same
   // prompt function must not invalidate a warm snapshot or duplicate a load.
   let promptsAdapter = $derived(adapters.prompts);
+  let promptEntriesAdapter = $derived(adapters.promptEntries);
+  let hasPromptSource = $derived(!!(adapters.prompts || adapters.promptEntries));
   // An initially-open prompt list is the host saying that recall is the first
   // thing the operator needs after expanding the HUD. Treat that as a complete
   // priority choice: warm the data before the click and render the panel first,
@@ -196,7 +203,7 @@
       ?? currentMeta?.state
       ?? (tmuxMux.connected ? labels.hudConnected : labels.hudOffline),
   );
-  let hasHudPanel = $derived(!!(adapters.notes || adapters.prompts || adapters.extraPanel));
+  let hasHudPanel = $derived(!!(adapters.notes || hasPromptSource || adapters.extraPanel));
   let uploadEndpoint = $derived(adapters.upload?.endpoint(session) ?? null);
   let uploadDir = $derived(adapters.upload?.dir ?? 'uploads');
 
@@ -333,6 +340,33 @@
 
   function submitDraft(text: string): void {
     void sendSubmission(text).then((sent) => recoverTransportFailure(sent, text));
+  }
+
+  /** COMPOSE send. With a host `submitText` the whole draft goes through it
+   * exactly once and the step transports are not used; without one this is
+   * the same `submitDraft` every version has used. */
+  function submitComposeDraft(text: string): void {
+    const submitText = adapters.submitText;
+    if (!submitText) {
+      submitDraft(text);
+      return;
+    }
+    if (!text) return;
+    const targetSession = session;
+    submissionNotice = '';
+    void Promise.resolve()
+      .then(() => submitText(targetSession, text))
+      .then(
+        (receipt) => receipt?.status,
+        () => 'uncertain' as const,
+      )
+      .then((status) => {
+        if (status === 'sent') return;
+        prefillOnError(composer, text);
+        // Anything but an explicit refusal may have reached the terminal.
+        // Never retry here: the host owns ids and retry policy.
+        if (status !== 'rejected') submissionNotice = labels.submissionUncertain;
+      });
   }
 
   function prefillComposer(text: string): void {
@@ -498,7 +532,8 @@
     // expand click reruns the effect, clears the in-flight request, and defeats
     // coalescing at exactly the moment it matters.
     const promptAdapter = promptsAdapter;
-    if ((!allowWhileCollapsed && !hudExpanded) || !promptAdapter) {
+    const entriesAdapter = promptEntriesAdapter;
+    if ((!allowWhileCollapsed && !hudExpanded) || (!promptAdapter && !entriesAdapter)) {
       return Promise.resolve();
     }
     const requestedSession = session;
@@ -515,11 +550,37 @@
     // returning a Promise becomes a normal rejection. The cleanup callback is
     // therefore always a later microtask, after `pending` is initialized and
     // stored — avoiding a temporal-dead-zone failure on synchronous throws.
-    const pending = Promise.resolve()
-      .then(() => promptAdapter(requestedSession))
-      .then((loaded) => {
-        if (request === promptRequest && requestedSession === session) recentPrompts = loaded;
-      })
+    const apply = (entries: PromptEntry[] | null, loaded: string[]): void => {
+      if (request === promptRequest && requestedSession === session) {
+        recentPromptEntries = entries;
+        recentPrompts = loaded;
+      }
+    };
+    // An array from `promptEntries` (even `[]`) is authoritative; only `null`
+    // falls back to the legacy string list. Without `promptEntries` the chain
+    // below is the exact pre-existing one — same promise hops, so prefetch
+    // coalescing and first-frame paint timing are unchanged for every host
+    // that does not opt in.
+    const loading = entriesAdapter
+      ? Promise.resolve()
+        .then(() => entriesAdapter(requestedSession))
+        .then((entries) => {
+          if (Array.isArray(entries)) {
+            apply(entries, []);
+            return;
+          }
+          if (!promptAdapter) {
+            apply(null, []);
+            return;
+          }
+          return Promise.resolve()
+            .then(() => promptAdapter(requestedSession))
+            .then((loaded) => apply(null, loaded));
+        })
+      : Promise.resolve()
+        .then(() => promptAdapter?.(requestedSession) ?? [])
+        .then((loaded) => apply(null, loaded));
+    const pending = loading
       .catch(() => {
         // Keep the last successful snapshot available while the source recovers.
       })
@@ -720,15 +781,23 @@
   });
 
   $effect(() => {
+    // A delivery notice belongs to the session it was raised for.
+    void session;
+    submissionNotice = '';
+  });
+
+  $effect(() => {
     const requestedSession = session;
     const shouldPrefetch = promptsTakePriority;
     const promptAdapter = promptsAdapter;
+    const entriesAdapter = promptEntriesAdapter;
     promptRequest += 1;
     promptLoadSession = null;
     promptLoadPromise = null;
     recentPrompts = [];
+    recentPromptEntries = null;
     promptsLoading = false;
-    if (requestedSession && shouldPrefetch && promptAdapter) {
+    if (requestedSession && shouldPrefetch && (promptAdapter || entriesAdapter)) {
       void loadPrompts(true);
     }
   });
@@ -775,6 +844,7 @@
 {#snippet recentPromptsPanel()}
   <PromptsPanel
     prompts={recentPrompts}
+    entries={recentPromptEntries}
     loading={promptsLoading}
     collapsible={promptsCollapsible}
     initiallyOpen={promptsInitiallyOpen}
@@ -786,6 +856,9 @@
       title: labels.promptsTitle,
       loading: labels.promptsLoading,
       none: labels.promptsEmpty,
+      sourceUi: labels.promptSourceUi,
+      sourceScreen: labels.promptSourceScreen,
+      uncertain: labels.promptUncertain,
     }}
   />
 {/snippet}
@@ -811,7 +884,7 @@
 
 {#snippet hudPanel()}
   <div class="hud-panel-stack" class:recall-priority={promptsTakePriority}>
-    {#if adapters.prompts && promptsTakePriority}
+    {#if hasPromptSource && promptsTakePriority}
       {@render recentPromptsPanel()}
       {#if adapters.notes || adapters.extraPanel}
         <div class="hud-meta-column" data-testid="hud-meta-column">
@@ -823,7 +896,7 @@
     {:else}
       {@render extraPanelAt('top')}
       {@render notePanel()}
-      {#if adapters.prompts}
+      {#if hasPromptSource}
         {@render recentPromptsPanel()}
       {/if}
       {@render extraPanelAt('bottom')}
@@ -1003,6 +1076,17 @@
     />
   {/if}
 
+  {#if submissionNotice}
+    <div class="submission-notice" role="status">
+      <span data-testid="submission-notice">{submissionNotice}</span>
+      <button
+        type="button"
+        aria-label={labels.close}
+        onclick={() => { submissionNotice = ''; }}
+      >✕</button>
+    </div>
+  {/if}
+
   <ComposerDock
     bind:this={composerRef}
     bind:open={overlay.composerOpen}
@@ -1011,7 +1095,7 @@
     bind:dockInset
     bind:dockFull
     bind:kbInset
-    onSend={submitDraft}
+    onSend={submitComposeDraft}
     onDirectText={sendKeys}
     onDirectKey={sendKeys}
     onPasteFiles={
@@ -1097,6 +1181,27 @@
     gap: 6px;
     min-width: 0;
     align-items: stretch;
+  }
+
+  .submission-notice {
+    position: absolute;
+    left: 8px; right: 8px;
+    bottom: calc(var(--dock-full, 0px) + var(--kb-inset, 0px) + env(safe-area-inset-bottom) + 8px);
+    z-index: 55;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 0 0 12px;
+    border: 1px solid var(--agent);
+    background: var(--hud);
+    color: var(--hud-fg);
+    font: 600 12px var(--font-thai, var(--font-mono));
+    line-height: 1.5;
+  }
+  .submission-notice span { flex: 1; min-width: 0; padding: 8px 0; }
+  .submission-notice button {
+    min-height: 44px; min-width: 44px;
+    background: none; border: 0; color: var(--hud-fg);
+    font: 700 13px var(--font-mono);
+    touch-action: manipulation; cursor: pointer;
   }
 
   .scroll-controls {

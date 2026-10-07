@@ -2,13 +2,13 @@
   {
     "name": "AppAdapters",
     "kind": "type",
-    "signature": "5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0",
+    "signature": "50d641bf27f09f0ae615e970bf8d7624989b114f622f72c11835cbfc4500198e",
     "tier": "S"
   },
   {
     "name": "AppLabels",
     "kind": "type",
-    "signature": "76ac2b4644c086d5f2bac25ea0aa384979663dc4020f5e6b88815e89e3fab006",
+    "signature": "8f12b3ffaee29a9167d5a076cb845a1a6d1655787e80853bed6122e0c050d1ba",
     "tier": "S"
   },
   {
@@ -32,7 +32,7 @@
   {
     "name": "DEFAULT_APP_LABELS",
     "kind": "value",
-    "signature": "fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0",
+    "signature": "96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5",
     "tier": "S"
   },
   {
@@ -134,7 +134,7 @@
   {
     "name": "EmbedView",
     "kind": "component",
-    "signature": "b51656395a3b996f2c5b5bd70b2a38f8ec431acb4bb69d761f0e1a4a3194b86e",
+    "signature": "572213494862d88db6ea5007e2121c2dfd7864f6ac68141f6ceb36f8e8deabc5",
     "tier": "S"
   },
   {
@@ -158,7 +158,7 @@
   {
     "name": "HubView",
     "kind": "component",
-    "signature": "5924951958271059e63f1f738c90d335e0a624b572f986d6ebf99351190a3646",
+    "signature": "1ec52ee234f6d0360204fe9d6821d307ce835b9d8d983e979e4844c42bd4fbc2",
     "tier": "S"
   },
   {
@@ -171,6 +171,12 @@
     "name": "prefillOnError",
     "kind": "value",
     "signature": "79bbfbc42dfbbf82536e953de34ba8fac1e7c19f1d62bff62628a8e1276424ac",
+    "tier": "S"
+  },
+  {
+    "name": "PromptEntry",
+    "kind": "type",
+    "signature": "9b6616320842f9e1609b0d32f78b8c6ffed2198d31b761da043f0b49d52d05e9",
     "tier": "S"
   },
   {
@@ -200,13 +206,19 @@
   {
     "name": "SessionView",
     "kind": "component",
-    "signature": "be5f48e09dca94255ee8fcaa0497e147287450947c12ec4e68badc09d0631d60",
+    "signature": "1eacff8aa9a25c47c4b3f6d8a1de9ce1c636b55bf8c823b31781c2dcdb1370dc",
     "tier": "S"
   },
   {
     "name": "stepFontPx",
     "kind": "value",
     "signature": "3248bf46e3dc7e62df1d348115384a3654d0f5b063f48866408b4ba67992834c",
+    "tier": "S"
+  },
+  {
+    "name": "SubmissionReceipt",
+    "kind": "type",
+    "signature": "a8d6d88ffd1699ec59a1a305b1026baefefa2507d17d506cbb13d080e19abea5",
     "tier": "S"
   },
   {
@@ -218,7 +230,7 @@
   {
     "name": "ThumbmuxApp",
     "kind": "component",
-    "signature": "9acd4c600929f4c9fa84f5716d124d184be5df10f8335dba720147f9e1385da5",
+    "signature": "5c112b90f02054e06fed35a770bfc078f9820af0c4553058502693f54fd7806d",
     "tier": "S"
   }
 ]

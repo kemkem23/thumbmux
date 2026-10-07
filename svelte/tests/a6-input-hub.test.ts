@@ -452,6 +452,42 @@ describe("TM-24 ComposerDock DIRECT terminal key encoding", () => {
   });
 });
 
+// ─── WJ-A guard: ComposerDock trims only the ends of a COMPOSE draft ─────────
+// WRAPJOINED keeps `text.trim()` (PLAN M5). The exact-submit seam relies on the
+// trim touching only leading/trailing whitespace: inner blank lines and inner
+// indentation must reach onSend untouched, and a one-character draft still sends.
+
+describe("WJ-A ComposerDock COMPOSE trim boundary (guard)", () => {
+  async function sendThroughDock(draft: string): Promise<string[]> {
+    let text = draft;
+    const sent: string[] = [];
+    const { target } = mountComponent(ComposerDock, {
+      open: true,
+      mode: "compose",
+      get text() { return text; },
+      set text(value: string) { text = value; },
+      onSend: (value: string) => sent.push(value),
+      onDirectText: () => {},
+      onDirectKey: () => {},
+    });
+    await tick();
+    const send = target.querySelector<HTMLButtonElement>(".snd");
+    if (!send) throw new Error("ComposerDock SEND button missing");
+    flushSync(() => send.click());
+    await tick();
+    return sent;
+  }
+
+  test("inner blank lines and inner indentation survive; only the ends are trimmed", async () => {
+    const sent = await sendThroughDock("\n  ข้อแรก\n\n  ข้อสอง คง indent\n\tข้อสาม  \n");
+    expect(sent).toEqual(["ข้อแรก\n\n  ข้อสอง คง indent\n\tข้อสาม"]);
+  });
+
+  test("a one-character draft still sends", async () => {
+    expect(await sendThroughDock("a")).toEqual(["a"]);
+  });
+});
+
 // ─── A6-4: DesktopKeys async paste must not outlive the component ───────────
 
 describe("A6-4 DesktopKeys paste generation", () => {
