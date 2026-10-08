@@ -1833,7 +1833,9 @@ export type V2WorkEvent =
   /** A full canonical traversal over `rows` rows of command data. */
   | { readonly kind: 'row-encode'; readonly rows: number }
   /** Exclusive ms of the commit's spans; the caller's outer clock minus their sum is SQL+other. */
-  | { readonly kind: 'commit-profile'; readonly canonicalMs: number; readonly decodeMs: number; readonly packMs: number; readonly commitMs: number };
+  | { readonly kind: 'commit-profile'; readonly canonicalMs: number; readonly decodeMs: number; readonly packMs: number; readonly commitMs: number }
+  /** page() v2: entries canonical-measured for one page call (arrays count their length). */
+  | { readonly kind: 'page-encode'; readonly entries: number };
 /** Rows of a batch command, without trusting its shape (observer counting only). */
 function v2BatchRows(command: unknown): number {
   const c = command as { kind?: unknown; batch?: { rows?: unknown } } | null;
@@ -2510,11 +2512,13 @@ class V2Storage {
       safe(c.n); fhAssert(c.n <= max, 'v2 cursor position'); boundary = c.n;
     }
     const back = r.direction === 'before', entries: V2HistoryPage['entries'][number][] = [];
+    let encoded = 0; const measure = (v: unknown): number => { encoded += Array.isArray(v) ? v.length : 1; return bytes(v); };
     let lo = boundary, hi = boundary, blocked: NewarchV2Continuation | null = null;
     const query = `SELECT * FROM fh_v2_timeline WHERE pane=? AND revision<=? AND n${back ? '<=' : '>'}? ORDER BY n ${back ? 'DESC' : 'ASC'} LIMIT 1`;
     let scan = boundary;
     // Fetch one bounded record at a time. A blocked/byte-limited page must not
     // leave Bun's cached SQLite iterator suspended for the next read.
+    let running = 2;
     for (let count = 0; count < r.maxEntries; count++) {
       const item = this.#db.query(query).get(key, revision, scan) as SqlRow | null;
       if (!item) break;
@@ -2537,9 +2541,9 @@ class V2Storage {
             state: { kind: 'remote-unavailable', bundleId: locator.verified.bundle.bundleId, reason, retryAfterMs: 1000 } }; break;
         }
       }
-      const entry = decoded ?? this.timeline(item), size = bytes(entries) + bytes(entry) + (entries.length ? 1 : 0);
+      const entry = decoded ?? this.timeline(item), eb = measure(entry), size = running + eb + (entries.length ? 1 : 0);
       if (size > r.maxBytes) { fhAssert(entries.length > 0, 'v2 bounded-read entry exceeds maxBytes'); break; }
-      entries.push(entry); if (back) lo = Number(item.n) - 1; else hi = Number(item.n);
+      entries.push(entry); running = size; if (back) lo = Number(item.n) - 1; else hi = Number(item.n);
     }
     if (back) entries.reverse();
     const before: NewarchV2Continuation = back && blocked ? blocked : lo === 0 ? { kind: 'end' } : { kind: 'more', cursor: this.cursor(r.pane, revision, lo) };
@@ -2565,7 +2569,8 @@ class V2Storage {
     }
     if (blocked?.kind === 'blocked') states.push(blocked.state);
     if (!states.length) states.push({ kind: 'exact', auditedRevision: this.get<number>('audited', key, 'latest') });
-    return { schema: 'newarch-v2', pane: r.pane, revision, entries, payloadBytes: bytes(entries), states, before, after };
+    if (encoded) this.hooks.observe?.({ kind: 'page-encode', entries: encoded });
+    return { schema: 'newarch-v2', pane: r.pane, revision, entries, payloadBytes: running, states, before, after };
   }
   private panes(session: NewarchV2SessionKey, cursor: string | null): { panes: NewarchV2PaneDescriptor[]; next: string | null } {
     const key = v2SessionKey(session); let after = '';
