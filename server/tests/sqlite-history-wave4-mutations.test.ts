@@ -739,6 +739,22 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
     { name: 'PERF-ATOMIC', file: H, kills: rollback, assert: assertion('rollback-checkpoint'),
       from: '        live = undefined; // written: a later read in this command reads the new row\n',
       to: "        live = undefined; queueMicrotask(() => { try { this.put('checkpoint', key, 'live', cp); } catch { /* closed */ } });\n" },
+    // page() v2 remeasures the whole entry array: the count goes quadratic and the named budget case dies on page-encode.
+    { name: 'PAGE-quadratic', file: H, kills: /\(fail\) HPERF page budget/, assert: assertion('page-encode'),
+      from: 'size = running + eb',
+      to: 'size = measure(entries) + eb' },
+    // The same remeasure via bytes() is visible in the page() source, so the route guard fires before the count.
+    { name: 'PAGE-quadratic-raw', file: H, kills: /\(fail\) HPERF page budget/, assert: assertion('page-encode-route'),
+      from: 'size = running + eb',
+      to: 'size = bytes(entries) + eb' },
+    // Dropping the comma makes a page of maxBytes M-1 keep the second entry.
+    { name: 'PAGE-no-comma', file: H, kills: /\(fail\) HPERF page bound/, assert: assertion('page-cut-k-1'),
+      from: 'size = running + eb + (entries.length ? 1 : 0);',
+      to: 'size = running + eb;' },
+    // payloadBytes one byte short of the canonical page the reader returned.
+    { name: 'PAGE-payload-stale', file: H, kills: /\(fail\) HPERF page bound/, assert: assertion('page-payload'),
+      from: 'payloadBytes: running,',
+      to: 'payloadBytes: running - 1,' },
   ];
   try {
     cpSync(join(pkg, 'server/src'), join(root, 'server/src'), { recursive: true });
@@ -759,7 +775,7 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
       expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
       return { exit, output };
     };
-    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b7 pass\b/);
+    const clean = await run('clean-before'); expect(clean.exit, clean.output).toBe(0); expect(clean.output).toMatch(/\b9 pass\b/);
     for (const m of mutations) {
       const file = join(root, 'server/src', m.file), original = readFileSync(file, 'utf8');
       expect(original.split(m.from).length).toBe(2);
@@ -774,6 +790,6 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
         expect(red.output).not.toMatch(/\b(?:TypeError|ReferenceError)\b/);
       } finally { writeFileSync(file, original); }
     }
-    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b7 pass\b/);
+    const after = await run('clean-after'); expect(after.exit, after.output).toBe(0); expect(after.output).toMatch(/\b9 pass\b/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 600_000);
