@@ -2628,6 +2628,8 @@ const HPERF_BUDGET = Object.freeze({
   rowEncodesPerRow: 2,
   /** S's issued-input authority is still asked inside every batch. */
   authorityCallsPerBatch: 1,
+  /** page() v2: canonical size measurements per page beyond its returned entries (the one entry the byte cut refuses). */
+  pageMeasuresOverEntries: 1,
 });
 type HperfRun = { f: H2Fixture; events: HperfEvent[]; calls: { authority: number }; issue: H2Fixture['issue'] };
 async function hperfOpen(observe: boolean, hooks: { boundary?: (at: string) => void; duringAuthority?: () => void } = {}): Promise<HperfRun> {
@@ -2845,5 +2847,46 @@ test('HPERF trust: a forged digest, an altered row or checkpoint and a host-mint
     const stale = run.issue({ ...input, commitId: 'hperf-stale', through: { ...input.through, byteOffset: input.through.byteOffset - 1 } });
     await refuse(f.request(withBatch({ input: stale }), 'hperf-trust'), 'v2 durable input authority', 'trust-stale');
     expect((await f.port.writer.commit(f.port.capability, request)).status, 'HPERF-ASSERT trust-original').toBe('ok');
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF page budget: one page measures each entry once', async () => {
+  const run = await hperfOpen(true), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    for (let page = 0; page < 2; page++) {
+      const p = hs1Plan(f, st, 256, run.issue);
+      h2value(await f.port.writer.commit(f.port.capability, f.request(p.command, 'hperf-pagebudget-' + page)));
+      p.apply();
+    }
+    run.events.length = 0;
+    const page = h2value(await f.page(256, null, 'after', 2 * 1024 * 1024));
+    const encoded = run.events.reduce((n, e) => n + (e.kind === 'page-encode' ? (e as { entries?: number }).entries ?? 0 : 0), 0);
+    console.log('HPERF_PAGE_ENCODE', JSON.stringify({ entries: page.entries.length, encoded }));
+    const src = readFileSync(join(import.meta.dir, '../src/history-engine.ts'), 'utf8');
+    const at = src.indexOf('  private page(r: NewarchV2HistoryRequest)'), end = src.indexOf('  private panes(session', at);
+    expect(at > 0 && end > at, 'HPERF-ASSERT page-encode-route').toBe(true);
+    expect(src.slice(at, end), 'HPERF-ASSERT page-encode-route').not.toMatch(/\bbytes\((?:entries|entry)\b/);
+    expect(page.entries.length, 'HPERF-ASSERT page-full').toBeGreaterThanOrEqual(32);
+    expect(encoded, 'HPERF-ASSERT page-encode-seen').toBeGreaterThan(0);
+    expect(encoded, 'HPERF-ASSERT page-encode').toBeLessThanOrEqual(page.entries.length + HPERF_BUDGET.pageMeasuresOverEntries);
+  } finally { await f.cleanup(); }
+}, 120_000);
+
+test('HPERF page bound: the byte cut and payloadBytes are exact', async () => {
+  const run = await hperfOpen(false), { f } = run;
+  try {
+    const st = await hs1Activate(f);
+    for (let page = 0; page < 2; page++) {
+      const p = hs1Plan(f, st, 256, run.issue);
+      h2value(await f.port.writer.commit(f.port.capability, f.request(p.command, 'hperf-pagebudget-' + page)));
+      p.apply();
+    }
+    const full = h2value(await f.page(256, null, 'after', 2 * 1024 * 1024));
+    const M = Buffer.byteLength(H2.streamCanonical(full.entries.slice(0, 2)));
+    const atM = h2value(await f.page(256, null, 'after', M)), below = h2value(await f.page(256, null, 'after', M - 1)), back = h2value(await f.page(256, null, 'before', 2 * 1024 * 1024));
+    expect(atM.entries.length, 'HPERF-ASSERT page-cut-k').toBe(2);
+    expect(below.entries.length, 'HPERF-ASSERT page-cut-k-1').toBe(1);
+    for (const x of [full, atM, below, back]) expect(x.payloadBytes, 'HPERF-ASSERT page-payload').toBe(Buffer.byteLength(H2.streamCanonical(x.entries)));
   } finally { await f.cleanup(); }
 }, 120_000);
