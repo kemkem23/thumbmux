@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MuxClientMessage, SessionListItem } from "../../core/src/protocol";
 import { FileHistoryArchive } from "../src/history-archive";
-import { NewarchV2Display, StreamDisplayEngine } from "../src/display-engine";
+import { StreamDisplayEngine } from "../src/display-engine";
 import type { NewarchGap, NewarchHistoryExtension, NewarchV2HistoryCursor, NewarchV2HistoryRequest, NewarchV2Incident, NewarchV2PaneDescriptor } from "../../core/src/protocol";
 import { STREAM_BUDGET, type CaptureEngine, type CommittedStreamRow, type HistoryEngine, type HistoryPage, type LiveFrame, type ReadView, type StreamIdentity, type V2HistoryPage, type V2HistoryReader, type V2SessionOwnerRecord, type ViewerRoute } from "../src/stream-contract";
 import type { HistoryArchiveLike, TmuxDriver } from "../src/ws-mux";
@@ -14,6 +14,8 @@ import type { HistoryArchiveLike, TmuxDriver } from "../src/ws-mux";
 // written only inside the cage's copy (never the worktree, never HEAD).
 const { TmuxWsMux } = (await import(process.env.D3_MUTANT_WS_MUX ?? "../src/ws-mux")) as typeof import("../src/ws-mux");
 type TmuxWsMux = InstanceType<typeof TmuxWsMux>;
+// DE-ORDER mutation controls do the same for display-engine.
+const { NewarchV2Display } = (await import(process.env.DE_ORDER_MUTANT_DISPLAY ?? "../src/display-engine")) as typeof import("../src/display-engine");
 
 const SESSION = "range-read";
 
@@ -1061,6 +1063,82 @@ test("NEWARCH v2 D: a blocking state reported as the end is refused, and a candi
   }
 });
 
+// --- DE-ORDER (2026-10-09): v2 page order is H's timeline order ---
+// Segment ids are digests (`segment-after` / `birth-segment`), so the next
+// segment may sort below the one it follows. H writes an incident with
+// frontier = the pane's last durable row, so a stop incident ends the page.
+
+const DE_SEG_OLD = "8b69d311" + "a".repeat(56);
+const DE_SEG_NEW = "7e08a874" + "b".repeat(56);
+type DeEntry = V2HistoryPage["entries"][number];
+
+function deRow(segmentId: string, ordinal: number): DeEntry {
+  return { kind: "row", row: v2Row(ordinal, segmentId) };
+}
+
+function deIncident(incidentId: string, reason: NewarchV2Incident["reason"], frontier: [string, number] | null, collecting = false): DeEntry {
+  const at = frontier ? { pane: V2_PANE, segmentId: frontier[0], rowOrdinal: frontier[1] } : null;
+  return { kind: "incident", incident: { ...v2Incident(collecting), incidentId, reason, frontier: at, affected: { after: at, through: null } } };
+}
+
+async function deRead(entries: DeEntry[]) {
+  const incidents = entries.flatMap(entry => entry.kind === "incident" ? [{ kind: "incident" as const, incident: entry.incident }] : []);
+  return new NewarchV2Display(v2Reader({
+    page: async () => ({ status: "ok", value: v2Page({
+      entries, states: incidents.length ? incidents : [{ kind: "exact", auditedRevision: 3 }],
+      before: { kind: "more", cursor: v2Cursor("local") }, after: { kind: "end" },
+    }) }),
+  })).page(v2Request());
+}
+
+test("NEWARCH v2 D DE-ORDER: a page that crosses into a rotated segment whose digest sorts lower is accepted", async () => {
+  expect(DE_SEG_NEW < DE_SEG_OLD).toBe(true);
+  const crossed = await deRead([deRow(DE_SEG_OLD, 335), deRow(DE_SEG_OLD, 336), deRow(DE_SEG_NEW, 0), deRow(DE_SEG_NEW, 1)]);
+  expect(crossed.status === "error" ? crossed.message : "ok").toBe("ok");
+  if (crossed.status === "ok") {
+    expect(crossed.value.entries.map(entry => entry.kind === "row" ? `${entry.row.id.segmentId.slice(0, 8)}:${entry.row.id.rowOrdinal}` : "incident"))
+      .toEqual(["8b69d311:335", "8b69d311:336", "7e08a874:0", "7e08a874:1"]);
+  }
+  const marked = await deRead([deRow(DE_SEG_OLD, 336), deIncident("audit-at-seam", "audit-mismatch", [DE_SEG_OLD, 336], true), deRow(DE_SEG_NEW, 0)]);
+  expect(marked.status === "error" ? marked.message : "ok").toBe("ok");
+});
+
+test("NEWARCH v2 D DE-ORDER: the last page of a stopped pane, stop incident at its frontier, is accepted", async () => {
+  for (const reason of ["identity-change", "unverified-restart", "storage-outage"] as const) {
+    const tail = await deRead([deRow(DE_SEG_OLD, 179), deRow(DE_SEG_OLD, 180), deIncident(`stop-${reason}`, reason, [DE_SEG_OLD, 180])]);
+    expect(`${reason}: ${tail.status === "error" ? tail.message : "ok"}`).toBe(`${reason}: ok`);
+  }
+  // One batch: an annotation and the stop share the frontier of its last row.
+  const batch = await deRead([deRow(DE_SEG_OLD, 180), deIncident("audit", "audit-mismatch", [DE_SEG_OLD, 180], true), deIncident("stop", "identity-change", [DE_SEG_OLD, 180])]);
+  expect(batch.status === "error" ? batch.message : "ok").toBe("ok");
+  // A page that opens on the incident: its frontier bounds the rows after it.
+  const opened = await deRead([deIncident("audit", "audit-mismatch", [DE_SEG_OLD, 180], true), deRow(DE_SEG_OLD, 181)]);
+  expect(opened.status === "error" ? opened.message : "ok").toBe("ok");
+});
+
+test("NEWARCH v2 D DE-ORDER: out-of-order pages are still refused", async () => {
+  const A = DE_SEG_OLD, B = DE_SEG_NEW;
+  const cases: Array<[string, DeEntry[], string]> = [
+    ["row back inside one segment", [deRow(A, 5), deRow(A, 4)], "v2 page order"],
+    ["row repeated", [deRow(A, 5), deRow(A, 5)], "duplicate v2 row"],
+    ["return to a segment already left", [deRow(A, 336), deRow(B, 0), deRow(A, 337)], "v2 page order"],
+    ["incident before its frontier row", [deIncident("i", "identity-change", [A, 180]), deRow(A, 180)], "v2 page order"],
+    ["incident frontier past the next row", [deRow(A, 179), deIncident("i", "identity-change", [A, 181]), deRow(A, 180)], "v2 page order"],
+    ["incident frontier past its own row", [deRow(A, 179), deIncident("i", "audit-mismatch", [A, 181], true), deRow(A, 182)], "v2 page order"],
+    ["incident frontier behind the row before it", [deRow(A, 179), deRow(A, 180), deIncident("i", "identity-change", [A, 179])], "v2 page order"],
+    ["incident frontier in a segment already left", [deRow(A, 336), deRow(B, 0), deIncident("i", "identity-change", [A, 336])], "v2 page order"],
+    ["null frontier after a row", [deRow(A, 0), deIncident("i", "unrecorded-birth", null)], "v2 page order"],
+    ["frontier appears with no row after a null frontier", [deIncident("b", "unrecorded-birth", null), deIncident("i", "audit-mismatch", [A, 3], true)], "v2 page order"],
+    ["incident repeated", [deRow(A, 180), deIncident("i", "audit-mismatch", [A, 180], true), deIncident("i", "audit-mismatch", [A, 180], true)], "duplicate v2 incident"],
+  ];
+  const got: string[] = [];
+  for (const [name, entries] of cases) {
+    const read = await deRead(entries);
+    got.push(`${name}: ${read.status === "error" ? `${read.code} ${read.message}` : "ok"}`);
+  }
+  expect(got).toEqual(cases.map(([name, , message]) => `${name}: integrity ${message}`));
+});
+
 // --- D3 (flag-on, 2026-10-05): v2 cursor request/reply on the mux socket ---
 
 type V2Frame = Record<string, unknown> & { type: string; requestId?: string; status?: string; code?: string };
@@ -1415,3 +1493,41 @@ test.skipIf(process.env.D3_MUTANT_WS_MUX !== undefined)("D3 mutation controls: e
     console.log(lines.join("\n"));
   }
 }, 900_000);
+
+// --- DE-ORDER mutation controls: each mutant must turn its own DE-ORDER case red ---
+
+const DE_ORDER_MUTANTS: ReadonlyArray<{ id: string; from: string; to: string; killer: string }> = [
+  { id: "segment-id-string-order", from: "if (this.left.has(segmentId)) return false;", to: "if (this.left.has(segmentId) || (this.at !== null && segmentId < this.at.segmentId)) return false;", killer: "crosses into a rotated segment" },
+  { id: "incident-before-frontier-row", from: "return frontier.segmentId === this.at.segmentId && frontier.rowOrdinal === this.at.rowOrdinal;", to: "return frontier.segmentId === this.at.segmentId && frontier.rowOrdinal > this.at.rowOrdinal;", killer: "last page of a stopped pane" },
+  { id: "page-order-unchecked", from: 'if (!order.accepts(entry)) return v2Integrity("v2 page order");', to: "order.accepts(entry);", killer: "out-of-order pages are still refused" },
+];
+
+test.skipIf(process.env.DE_ORDER_MUTANT_DISPLAY !== undefined || process.env.D3_MUTANT_WS_MUX !== undefined)("NEWARCH v2 DE-ORDER mutation controls: every display mutant is killed by its own case", () => {
+  const source = new URL("../src/display-engine.ts", import.meta.url).pathname;
+  const mutant = new URL("../src/display-engine.deorder-mutant.ts", import.meta.url).pathname;
+  const original = readFileSync(source, "utf8");
+  const run = (module: string) => spawnSync(process.execPath, ["test", new URL(import.meta.url).pathname, "-t", "DE-ORDER"], {
+    env: { ...process.env, DE_ORDER_MUTANT_DISPLAY: module }, encoding: "utf8", timeout: 120_000,
+  });
+  const lines: string[] = [];
+  try {
+    writeFileSync(mutant, original);
+    const control = run(mutant);
+    lines.push(`DE-ORDER-MUTANT control exit=${control.status}`);
+    expect(control.status).toBe(0);
+    for (const m of DE_ORDER_MUTANTS) {
+      expect(original.split(m.from).length - 1).toBe(1);
+      writeFileSync(mutant, original.replace(m.from, m.to));
+      const result = run(mutant);
+      const out = `${result.stdout}${result.stderr}`;
+      const killed = out.split("\n").filter(line => line.startsWith("(fail)")).map(line => line.replace(/ \[[^\]]*\]$/, ""));
+      lines.push(`DE-ORDER-MUTANT ${m.id} exit=${result.status} killed=${JSON.stringify(killed)}`);
+      expect(result.status).toBe(1);
+      expect(out).not.toContain("SyntaxError");
+      expect(killed.some(line => line.includes(m.killer))).toBe(true);
+    }
+  } finally {
+    rmSync(mutant, { force: true });
+    console.log(lines.join("\n"));
+  }
+}, 600_000);
