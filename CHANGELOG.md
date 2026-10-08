@@ -6,6 +6,7 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
 ## Unreleased
 
 - server: history page() v2 measures page bytes once per entry (linear); payloadBytes and the byte cut are unchanged byte for byte.
+- server: NewarchV2Display checks v2 page order the way H writes it: rotated segments whose digest sorts lower and a stop incident at its frontier row are no longer integrity errors; rows back or repeated inside a segment, a return to a segment already left, a misplaced incident and a repeated incident are still refused.
 
 NEWARCH v2 (merged on the newarch-v2 integration branch; ships with the
 next release, not with 0.20.5). Flag-on is not production-ready.
