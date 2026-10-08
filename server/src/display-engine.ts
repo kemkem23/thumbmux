@@ -794,16 +794,42 @@ export function selectNewarchV2Panes(
   return { kind: "ambiguous", panes: [...panes], next };
 }
 
-function v2EntryOrder(entry: V2HistoryPage["entries"][number]): readonly [string, number, number] {
-  if (entry.kind === "row") return [entry.row.id.segmentId, entry.row.id.rowOrdinal, 1];
-  if (!entry.incident.frontier) return ["", -1, 0];
-  return [entry.incident.frontier.segmentId, entry.incident.frontier.rowOrdinal, 0];
-}
+/**
+ * H's timeline order, checked without ranking segment ids: they are digests,
+ * so a page may move on to any segment it has not already left. Inside one
+ * segment rows strictly ascend. H writes an incident with frontier = the
+ * pane's last durable row, so it stands right after that row; one that opens
+ * the page bounds the rows after it. A null frontier comes before every row.
+ */
+class V2PageOrder {
+  private at: { readonly segmentId: string; readonly rowOrdinal: number } | null = null;
+  private birth = false;
+  private readonly left = new Set<string>();
 
-function v2OrderBefore(left: readonly [string, number, number], right: readonly [string, number, number]): boolean {
-  if (left[0] !== right[0]) return left[0] < right[0];
-  if (left[1] !== right[1]) return left[1] < right[1];
-  return left[2] < right[2];
+  accepts(entry: V2HistoryPage["entries"][number]): boolean {
+    if (entry.kind === "incident") {
+      const frontier = entry.incident.frontier;
+      if (!frontier) {
+        this.birth = true;
+        return this.at === null;
+      }
+      if (!this.at) {
+        if (this.birth) return false;
+        this.at = { segmentId: frontier.segmentId, rowOrdinal: frontier.rowOrdinal };
+        return true;
+      }
+      return frontier.segmentId === this.at.segmentId && frontier.rowOrdinal === this.at.rowOrdinal;
+    }
+    const { segmentId, rowOrdinal } = entry.row.id;
+    if (this.at?.segmentId === segmentId) {
+      if (rowOrdinal <= this.at.rowOrdinal) return false;
+    } else {
+      if (this.left.has(segmentId)) return false;
+      if (this.at) this.left.add(this.at.segmentId);
+    }
+    this.at = { segmentId, rowOrdinal };
+    return true;
+  }
 }
 
 function v2Blocking(state: NewarchV2ReadState): boolean {
@@ -920,8 +946,9 @@ export class NewarchV2Display {
       || page.payloadBytes > request.maxBytes || page.entries.length > request.maxEntries) {
       return v2Integrity("v2 page bound");
     }
-    let previous: readonly [string, number, number] | null = null;
+    const order = new V2PageOrder();
     const seen = new Set<string>();
+    const incidents = new Set<string>();
     for (const entry of page.entries) {
       if (entry.kind === "row") {
         if (!entry.row.finalized) return v2Integrity("v2 candidate row is not durable history");
@@ -936,10 +963,10 @@ export class NewarchV2Display {
           return v2Integrity(error instanceof Error ? error.message : "invalid v2 incident");
         }
         if (!v2PaneEqual(entry.incident.pane, request.pane)) return v2Integrity("v2 incident pane");
+        if (incidents.has(entry.incident.incidentId)) return v2Integrity("duplicate v2 incident");
+        incidents.add(entry.incident.incidentId);
       }
-      const order = v2EntryOrder(entry);
-      if (previous && !v2OrderBefore(previous, order)) return v2Integrity("v2 page order");
-      previous = order;
+      if (!order.accepts(entry)) return v2Integrity("v2 page order");
     }
     for (const continuation of [page.before, page.after]) {
       if (continuation.kind === "end") continue;
