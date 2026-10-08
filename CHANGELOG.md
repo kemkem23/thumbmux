@@ -5,6 +5,8 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
 
 ## Unreleased
 
+- server: history page() v2 measures page bytes once per entry (linear); payloadBytes and the byte cut are unchanged byte for byte.
+
 NEWARCH v2 (merged on the newarch-v2 integration branch; ships with the
 next release, not with 0.20.5). Flag-on is not production-ready.
 
