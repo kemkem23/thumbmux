@@ -800,6 +800,31 @@ function tv2Sampler() {
   };
 }
 
+// ---- E (#6) views of the reserve/rearm path. Until the model has that path these
+// read as undefined and each E-RF case fails at its own E-RF label.
+type TV2EView = { slots?: (TV2K.V2EmergencyIncident | null)[]; scratch?: Set<string> };
+type TV2EEngine = { durability?: (k: TV2Key) => string | null; collectorRearm?: (id: string) => void;
+  rearmWith?: (k: TV2Key, id: string, observation: TV2K.V2ReserveRearmObservation) => Promise<string> };
+const tv2EDisk = (w: TV2World) => w.disk as unknown as TV2EView;
+const tv2EOf = (e: unknown) => e as TV2EEngine;
+const tv2EObservations = (w: TV2World) => (w as unknown as { observations?: TV2K.V2ReserveRearmObservation[] }).observations ?? [];
+/** The model's stand-in for the EvidenceFile S answers for a reserve slot. */
+const TV2_SLOT_FILE: TV2K.EvidenceFile = { path: 'tv2-reserve-slot', bytes: 65536, sha256: '0'.repeat(64) };
+/** One pane turn that may end at a TV2Kill barrier; any other throw fails the case at its label. */
+async function tv2Turn(e: { pump: (k: TV2Key) => Promise<void> }, k: TV2Key, label: string): Promise<void> {
+  try { await e.pump(k); } catch (err) { if (!(err instanceof TV2Kill)) tv2Assert(false, `${label} pump threw ${String(err)}`); }
+}
+const tv2Count = (w: TV2World, k: TV2Key, kind: string) => w.disk.events.filter(x => x.pane === k && x.kind === kind).length;
+/** A pane whose storage fault is journalled (5 rows over a 3-row H), with `reserveCap` slots. */
+async function tv2Journalled(label: string, reserveCap = 1) {
+  const w = tv2World({ capRows: 3, reserveCap }); const e = tv2Open(w, 'e1');
+  const a = await e.birth('a', 'S1') as { paneId: string; key: string };
+  for (const t of tv2Lines(5)) tv2Emit(w, a.paneId, t);
+  await tv2Turn(e, a.key, label);
+  const id = [...w.disk.emergency.keys()][0] ?? '';
+  return { w, e, a, id, p: w.disk.panes.get(a.key)! };
+}
+
 const tv2Scenarios: Record<string, () => Promise<void>> = {
   /** V2-01 Codex F1: A, flag off, B (live and across restart). */
   async 'V2-01 flag off closes the birth gate only: B lands in H once, no legacy write, cap still enforced'() {
@@ -1066,6 +1091,186 @@ const tv2Scenarios: Record<string, () => Promise<void>> = {
     tv2Assert(!run(t => 340 + (t > 25 && t < 45 ? 80 : t >= 45 ? 80 - (t - 45) * 5 : 0)).pass, 'mid growth then drop passed');
     tv2Assert(!run(() => 340, t => [{ pid: 10, startTime: 'a', pss: t > 30 && t < 30.05 ? null : 340, product: true }]).valid, 'missing read counted as valid');
     tv2Assert(run(() => 340, t => [{ pid: 10, startTime: t > 40 ? 'reused' : 'a', pss: t > 40 ? 5 : 340 + t, product: true }]).valid === false, 'PID reuse passed');
+  },
+  /** E-RF-01 (E-prestudy §2): the reserve is full and H cannot write. */
+  async 'E-RF-01 reserve full while H is full: durability FAILED is a readable state; no receipt, no ACK, intake stops'() {
+    const w = tv2World({ capRows: 1, reserveCap: 1 }); const e = tv2Open(w, 'e1');
+    const a = await e.birth('a', 'S1') as { paneId: string; key: string };
+    const b = await e.birth('b', 'S2') as { paneId: string; key: string };
+    for (const t of tv2Lines(3, 1, 'a')) tv2Emit(w, a.paneId, t); await e.pump(a.key);
+    tv2Assert(w.disk.reserveUsed === 1, `E-RF-01 the first storage fault did not take the only slot (${w.disk.reserveUsed})`);
+    for (const t of tv2Lines(3, 1, 'b')) tv2Emit(w, b.paneId, t);
+    let thrown: unknown = null; try { await e.pump(b.key); } catch (err) { thrown = err; }
+    tv2Assert(thrown === null, `E-RF-01 a full reserve threw instead of a durability state: ${String(thrown)}`);
+    const label = tv2EOf(e).durability?.(b.key) ?? null;
+    tv2Assert(label !== null && label.startsWith('storage-unavailable; durability FAILED'), `E-RF-01 durability label ${JSON.stringify(label)}`);
+    const pb = w.disk.panes.get(b.key)!, raw = w.disk.raw.get(b.key)!;
+    tv2Assert(raw.acked === 0 && pb.receipts.size === 0 && pb.rows.length === 0 && w.disk.reserveUsed === 1, 'E-RF-01 receipt, ACK or reserve without durability');
+    tv2Assert(w.tmux.panes.get(b.paneId)!.pipe === null, 'E-RF-01 intake not stopped');
+    await e.pump(b.key); tv2Emit(w, b.paneId, 'E-RF-01 late');
+    tv2Assert(raw.records.length === 3 && raw.acked === 0 && pb.receipts.size === 0, 'E-RF-01 intake resumed without durability');
+  },
+  /** E-RF-02: protocol fault vs storage fault after the first batch. */
+  async 'E-RF-02 a protocol fault spends no reserve; a storage fault after the first batch journals one storage-outage that materializes; nothing past it ACKed'() {
+    const w = tv2World({ capRows: 5, reserveCap: 2 }); const e = tv2Open(w, 'e1');
+    const a = await e.birth('a', 'S1') as { paneId: string; key: string };
+    const b = await e.birth('b', 'S2') as { paneId: string; key: string };
+    tv2Emit(w, a.paneId, '\u0000E-RF-02 bad'); await e.pump(a.key);
+    tv2Assert(w.disk.reserveUsed === 0 && w.disk.emergency.size === 0 && w.disk.panes.get(a.key)!.stopped, 'E-RF-02 protocol fault spent reserve or kept going');
+    for (const t of tv2Lines(3, 1, 'b')) tv2Emit(w, b.paneId, t); await e.pump(b.key);
+    for (const t of tv2Lines(4, 4, 'b')) tv2Emit(w, b.paneId, t); await e.pump(b.key);
+    const pending = [...w.disk.emergency.values()];
+    tv2Assert(pending.length === 1 && pending[0]!.reason === 'storage-outage', `E-RF-02 storage fault journalled as ${pending.map(i => i.reason)}`);
+    const record = tv2EDisk(w).slots?.find(s => s !== null && s.incident.incidentId === pending[0]!.incidentId) ?? null;
+    tv2Assert(record !== null && ['ENOSPC', 'EDQUOT', 'SQLITE_FULL'].includes(record.cause)
+      && TV2K.v2MaterializesPending(TV2K.v2PendingFromEmergency(record, TV2_SLOT_FILE), pending[0]!), 'E-RF-02 the journalled record does not materialize its pending incident');
+    const raw = w.disk.raw.get(b.key)!, pb = w.disk.panes.get(b.key)!;
+    tv2Assert(raw.acked === 3 && pb.rows.length === 3 && raw.trimmed <= pb.checkpoint!.replayFloor, 'E-RF-02 raw past the first batch ACKed or trimmed');
+    tv2Expect(w, []);
+  },
+  /** E-RF-03 (the MAJOR case): H took the incident in g, the host died before rearm. */
+  async 'E-RF-03 H took the incident in g and the host died before rearm: at g+1 the old guard is false, the receipt stays g, one incident, rearmed by a fresh observation'() {
+    const { w, e, a, p } = await tv2Journalled('E-RF-03');
+    w.disk.space.capRows = 100; w.killAt = 'h-before-rearm'; await tv2Turn(e, a.key, 'E-RF-03');
+    if (!e.dead) e.kill();
+    const g = w.disk.generation;
+    const e2 = tv2Open(w, 'e2'); await e2.resume();
+    const receipt = [...p.receipts.values()].find(r => r.operationId.startsWith('storage-')) ?? null;
+    tv2Assert(receipt !== null && receipt.generation === g && w.disk.generation === g + 1, `E-RF-03 storage receipt generation ${receipt?.generation} at ${w.disk.generation}`);
+    const id = [...p.incidents.keys()][0]!;
+    const resolution: TV2K.V2IncidentResolution = { schema: 'newarch-v2', pane: p.desc.pane, incidentId: id, state: 'resolved', receipt, writerGeneration: TV2K.v2WriterGeneration(receipt!.generation) };
+    tv2Assert(!TV2K.v2IncidentResolvedBy(resolution, id, receipt!, TV2K.v2WriterGeneration(w.disk.generation)), 'E-RF-03 the old guard holds at g+1');
+    tv2Assert(p.incidents.size === 1 && tv2Count(w, a.key, 'materialize') === 1, `E-RF-03 materialized twice (${p.incidents.size} incidents, ${tv2Count(w, a.key, 'materialize')} writes)`);
+    tv2Assert(w.disk.reserveUsed === 0 && w.disk.emergency.size === 0 && w.disk.events.some(x => x.kind === 'rearm' && x.writer === 'engine:e2'), 'E-RF-03 reserve not rearmed by a fresh observation at g+1');
+    tv2Assert(p.stopped && w.tmux.panes.get(a.paneId)!.pipe === null, 'E-RF-03 rearm resumed the pane');
+    tv2Expect(w, []);
+  },
+  /** E-RF-04: an observation taken, then the host died before dispatch. */
+  async 'E-RF-04 an observation taken before the host died is refused at g+1; a fresh read sends the rearm'() {
+    const { w, e, a, id } = await tv2Journalled('E-RF-04');
+    w.disk.space.capRows = 100; w.killAt = 'observation-before-dispatch'; await tv2Turn(e, a.key, 'E-RF-04');
+    const stale = tv2EObservations(w).at(-1) ?? null;
+    tv2Assert(e.dead && stale !== null && w.disk.reserveUsed === 1, 'E-RF-04 no host death between observation and dispatch');
+    const e2 = tv2Open(w, 'e2');
+    const replay = tv2EOf(e2).rearmWith;
+    const verdict = replay ? await replay(a.key, id, stale!) : 'missing';
+    tv2Assert(verdict === 'refused' && w.disk.reserveUsed === 1 && !w.disk.events.some(x => x.kind === 'rearm'), `E-RF-04 the stale observation of g was dispatched (${verdict})`);
+    await e2.resume();
+    tv2Assert(w.disk.reserveUsed === 0 && w.disk.events.some(x => x.kind === 'rearm' && x.writer === 'engine:e2'), 'E-RF-04 a fresh observation at g+1 did not rearm');
+    tv2Expect(w, []);
+  },
+  /** E-RF-05: the journal is durable, H is not (killed in between). */
+  async 'E-RF-05 journal durable, H not yet: after reopen the same id, digest and clocks land in H once, nothing after them'() {
+    const { w, e, a, p } = await tv2Journalled('E-RF-05');
+    const journalled = [...w.disk.emergency.values()][0]!;
+    w.disk.space.capRows = 100; w.killAt = 'journal-before-h'; await tv2Turn(e, a.key, 'E-RF-05');
+    tv2Assert(p.rows.length === 0, `E-RF-05 H took ${p.rows.length} rows past the journalled incident`);
+    tv2Assert(e.dead, 'E-RF-05 no host death between journal and H');
+    w.seq += 1_000;
+    const e2 = tv2Open(w, 'e2'); await e2.resume();
+    const held = [...p.incidents.values()];
+    tv2Assert(held.length === 1 && held[0]!.incidentId === journalled.incidentId && TV2K.v2EmergencyIncidentDigest(held[0]!) === TV2K.v2EmergencyIncidentDigest(journalled)
+      && tv2Count(w, a.key, 'materialize') === 1, 'E-RF-05 H holds other bytes than the journal, or holds them twice');
+    tv2Expect(w, []);
+  },
+  /** E-RF-06: the rearm RPC was sent, the host died before S answered. */
+  async 'E-RF-06 rearm sent, host died before the reply: reopen neither reuses the old observation nor writes H again'() {
+    const { w, e, a, p } = await tv2Journalled('E-RF-06');
+    w.disk.space.capRows = 100; w.killAt = 'dispatch-before-reply'; await tv2Turn(e, a.key, 'E-RF-06');
+    tv2Assert(e.dead && p.incidents.size === 1, 'E-RF-06 no host death after the rearm was sent');
+    const used = tv2EObservations(w).length;
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); await e2.resume();
+    tv2Assert(p.incidents.size === 1 && tv2Count(w, a.key, 'materialize') === 1, 'E-RF-06 H written again after the lost reply');
+    tv2Assert(w.disk.reserveUsed === 0 && tv2EObservations(w).slice(used).every(o => o.authorizedGeneration === w.disk.generation),
+      'E-RF-06 reserve not rearmed at g+1, or an observation of g reused');
+    tv2Expect(w, []);
+  },
+  /** E-RF-07: death while S writes the scratch of the slot. */
+  async 'E-RF-07 death in the slot write: host death leaves the collector write whole; collector death keeps the old slot, one scratch, no new epoch'() {
+    {
+      const { w, e, a, p } = await tv2Journalled('E-RF-07 host');
+      w.disk.space.capRows = 100; w.killAt = 'host:scratch-before-rename'; await tv2Turn(e, a.key, 'E-RF-07 host');
+      const slots = tv2EDisk(w).slots ?? null, scratch = tv2EDisk(w).scratch ?? null;
+      tv2Assert(e.dead && slots !== null && slots.every(s => s === null) && scratch !== null && scratch.size === 0, 'E-RF-07 host death undid or tore the collector write');
+      const e2 = tv2Open(w, 'e2'); await e2.resume();
+      tv2Assert(p.incidents.size === 1 && p.stopped && tv2Count(w, a.key, 'materialize') === 1, 'E-RF-07 host restart wrote H again');
+      tv2Expect(w, []);
+    }
+    {
+      const { w, e, a, id, p } = await tv2Journalled('E-RF-07 collector');
+      const epoch = w.collectorEpoch, paneEpoch = p.epoch;
+      w.disk.space.capRows = 100; w.killAt = 'collector:scratch-before-rename'; await tv2Turn(e, a.key, 'E-RF-07 collector');
+      const slots = tv2EDisk(w).slots ?? null, scratch = tv2EDisk(w).scratch ?? null;
+      tv2Assert(!e.dead && !w.collectorUp && slots !== null && slots.some(s => s !== null && s.incident.incidentId === id) && scratch !== null && scratch.size === 1,
+        'E-RF-07 collector death lost the old slot or left other than one scratch');
+      e.kill(); const e2 = tv2Open(w, 'e2'); await e2.resume();
+      tv2Assert(w.disk.reserveUsed === 1 && p.stopped && w.collectorEpoch === epoch && p.epoch === paneEpoch, 'E-RF-07 reserve cleared, pane resumed or epoch changed while the collector is down');
+      w.collectorUp = true; await e2.resume();
+      tv2Assert(w.disk.reserveUsed === 0 && scratch!.size === 0 && p.incidents.size === 1, 'E-RF-07 the restarted collector did not rearm the same slot');
+      tv2Expect(w, []);
+    }
+  },
+  /** E-RF-08: rename done, directory not synced; or synced and the reply lost. */
+  async 'E-RF-08 rename before the directory sync, or the reply lost after it: the slot is the old incident or empty, never torn; a missing id is not a reason to write H again'() {
+    for (const at of ['collector:rename-before-dirsync', 'host:dirsync-before-reply']) {
+      const { w, e, a, p } = await tv2Journalled(`E-RF-08 ${at}`);
+      w.disk.space.capRows = 100; w.killAt = at; await tv2Turn(e, a.key, `E-RF-08 ${at}`);
+      const slots = tv2EDisk(w).slots ?? null;
+      tv2Assert(slots !== null && (at.startsWith('host:') ? e.dead : !w.collectorUp)
+        && slots.every(s => s === null || (typeof s === 'object' && 'incident' in s && TV2K.v2EmergencyIncidentDigest(s.incident) === s.digest)), `E-RF-08 ${at}: torn slot or no death`);
+      w.collectorUp = true; if (!e.dead) e.kill();
+      const e2 = tv2Open(w, 'e2'); await e2.resume(); await e2.resume();
+      tv2Assert(p.incidents.size === 1 && tv2Count(w, a.key, 'materialize') === 1 && w.disk.reserveUsed === 0, `E-RF-08 ${at}: H written again or the reserve left held`);
+      tv2Expect(w, []);
+    }
+  },
+  /** E-RF-09: S answered, the host died before recording it; two reopens. */
+  async 'E-RF-09 the reply arrived but the host died before recording it: two reopens read H and the slot, not a RAM flag'() {
+    const { w, e, a, p } = await tv2Journalled('E-RF-09');
+    w.disk.space.capRows = 100; w.killAt = 'reply-before-record'; await tv2Turn(e, a.key, 'E-RF-09');
+    tv2Assert(e.dead && w.disk.reserveUsed === 0, 'E-RF-09 no host death between the reply and its record');
+    const receipt = [...p.receipts.values()].find(r => r.operationId.startsWith('storage-'))!;
+    const e2 = tv2Open(w, 'e2'); await e2.resume(); e2.kill();
+    const e3 = tv2Open(w, 'e3'); await e3.resume();
+    tv2Assert(p.incidents.size === 1 && tv2Count(w, a.key, 'materialize') === 1 && p.receipts.get(receipt.operationId) === receipt && receipt.generation === 1,
+      'E-RF-09 a reopen wrote H again or changed the receipt');
+    tv2Expect(w, []);
+  },
+  /** E-RF-10: two panes share the one slot over time. */
+  async 'E-RF-10 A rearmed, its slot reused by B: a late rearm of A does not clear B, and B materializes on its own'() {
+    const w = tv2World({ capRows: 3, reserveCap: 1 }); const e = tv2Open(w, 'e1');
+    const a = await e.birth('a', 'S1') as { paneId: string; key: string };
+    const b = await e.birth('b', 'S2') as { paneId: string; key: string };
+    for (const t of tv2Lines(5, 1, 'a')) tv2Emit(w, a.paneId, t); await tv2Turn(e, a.key, 'E-RF-10');
+    const A = [...w.disk.emergency.keys()][0] ?? '';
+    w.disk.space.capRows = 4; await tv2Turn(e, a.key, 'E-RF-10');
+    tv2Assert(w.disk.reserveUsed === 0 && w.disk.panes.get(a.key)!.incidents.has(A), 'E-RF-10 A was not materialized and rearmed');
+    for (const t of tv2Lines(5, 1, 'b')) tv2Emit(w, b.paneId, t); await tv2Turn(e, b.key, 'E-RF-10');
+    const B = [...w.disk.emergency.keys()][0] ?? '';
+    tv2Assert(B !== '' && B !== A && w.disk.reserveUsed === 1, 'E-RF-10 B did not take the freed slot');
+    const late = tv2EOf(e).collectorRearm;
+    tv2Assert(late !== undefined, 'E-RF-10 no collector rearm to deliver late');
+    late!(A);
+    tv2Assert(w.disk.emergency.has(B) && w.disk.reserveUsed === 1, 'E-RF-10 the late rearm of A cleared B');
+    w.disk.space.capRows = 100; await tv2Turn(e, b.key, 'E-RF-10');
+    tv2Assert(w.disk.panes.get(b.key)!.incidents.has(B) && w.disk.reserveUsed === 0, 'E-RF-10 B did not materialize on its own');
+    tv2Expect(w, []);
+  },
+  /** E-RF-11: a second storage fault after a rearm. */
+  async 'E-RF-11 after a rearm a new storage fault journals one new incident; the receipt of g ACKs and trims nothing'() {
+    const { w, e, a } = await tv2Journalled('E-RF-11');
+    w.disk.space.capRows = 100; await tv2Turn(e, a.key, 'E-RF-11');
+    const rawA = w.disk.raw.get(a.key)!;
+    tv2Assert(w.disk.reserveUsed === 0 && rawA.acked === 0 && rawA.trimmed === 0 && rawA.records.length === 5, `E-RF-11 rearm ACKed or trimmed with the receipt of g (acked ${rawA.acked}, trimmed ${rawA.trimmed})`);
+    e.kill(); const e2 = tv2Open(w, 'e2'); await e2.resume();
+    tv2Assert(rawA.acked === 0 && rawA.trimmed === 0, 'E-RF-11 g+1 ACKed or trimmed with the receipt of g');
+    const b = await e2.birth('b', 'S2') as { paneId: string; key: string };
+    w.disk.space.capRows = 3;
+    for (const t of tv2Lines(5, 1, 'b')) tv2Emit(w, b.paneId, t); await tv2Turn(e2, b.key, 'E-RF-11');
+    const pending = [...w.disk.emergency.values()];
+    tv2Assert(pending.length === 1 && TV2K.v2PaneKey(pending[0]!.pane) === b.key && pending[0]!.reason === 'storage-outage' && w.disk.reserveUsed === 1,
+      'E-RF-11 the rearmed reserve did not take one new incident');
+    tv2Expect(w, []);
   },
 };
 // T-V2-HARNESS-END
