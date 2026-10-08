@@ -421,6 +421,8 @@ interface TV2Disk {
   journal: Map<string, { pane: TV2K.PaneKey; attachId: string; sessionId: string; activated: boolean }>;
   raw: Map<TV2Key, { epoch: string; records: string[]; trimmed: number; acked: number; resizes: number }>;
   emergency: Map<string, TV2K.NewarchV2Incident>; reserveUsed: number; reserveCap: number;
+  /** E (#6): S's reserve slots — a journalled record, or empty and physically allocated — and its one scratch name per slot. */
+  slots: (TV2K.V2EmergencyIncident | null)[]; scratch: Set<string>;
   legacy: Map<string, string[]>; files: string[]; timers: number; events: TV2Event[];
   space: { capRows: number };
 }
@@ -433,6 +435,8 @@ interface TV2World {
   emitted: Map<TV2Key, string[]>; collectorEpoch: string; collectorUp: boolean;
   flagBirth: boolean; audit: TV2K.V2AuditConfig; captures: number; seq: number;
   killAt: string | null;
+  /** E (#6): every reserve-rearm observation H handed out (a test reads a stale one back). */
+  observations: TV2K.V2ReserveRearmObservation[];
 }
 class TV2Kill extends Error {}
 const tv2Assert = (ok: unknown, msg: string): void => { if (!ok) throw new Error(`T-V2 ${msg}`); };
@@ -445,10 +449,11 @@ function tv2World(over: Partial<Pick<TV2World, 'flagBirth' | 'audit'>> & { capRo
   return {
     disk: { lock: null, generation: 0, corrupt: false, sessions: new Map(), panes: new Map(), journal: new Map(),
       raw: new Map(), emergency: new Map(), reserveUsed: 0, reserveCap: over.reserveCap ?? 4, legacy: new Map(),
+      slots: Array.from({ length: over.reserveCap ?? 4 }, () => null), scratch: new Set(),
       files: [], timers: 0, events: [], space: { capRows: over.capRows ?? 1_000_000 } },
     tmux: { serverId: 'srv@1', next: 0, windows: 0, panes: new Map() }, emitted: new Map(),
     collectorEpoch: 'collector-1', collectorUp: true, flagBirth: over.flagBirth ?? true,
-    audit: over.audit ?? TV2K.NEWARCH_V2_DEFAULT_CONFIG.audit, captures: 0, seq: 0, killAt: null,
+    audit: over.audit ?? TV2K.NEWARCH_V2_DEFAULT_CONFIG.audit, captures: 0, seq: 0, killAt: null, observations: [],
   };
 }
 function tv2PaneOf(w: TV2World, k: TV2Key): TV2TmuxPane | undefined {
@@ -499,17 +504,32 @@ function tv2Descriptor(w: TV2World, p: TV2TmuxPane, birthOp: string, state: TV2K
     owner: 'capture-engine', birthOperationId: birthOp, geometry: TV2_GEOMETRY, state };
 }
 function tv2Incident(pane: TV2PaneDisk, reason: TV2K.NewarchV2Incident['reason'], op: string, stop: boolean,
-  after: number | null = pane.rows.at(-1)?.ordinal ?? null): TV2K.NewarchV2Incident {
+  after: number | null = pane.rows.at(-1)?.ordinal ?? null, clock = 1): TV2K.NewarchV2Incident {
   const row = (n: number | null) => n === null ? null : { pane: pane.desc.pane, segmentId: 'seg', rowOrdinal: n };
   const incident: TV2K.NewarchV2Incident = { schema: 'newarch-v2', incidentId: TV2K.v2IncidentId(pane.desc.pane, op),
     pane: pane.desc.pane, reason, frontier: row(pane.rows.at(-1)?.ordinal ?? null), affected: { after: row(after), through: null },
-    openedAtWallMs: 1, openedAtMonoMs: 1, clockEpoch: 'tv2', collecting: !stop, missing: { countKind: 'unknown', missingCount: null },
+    openedAtWallMs: clock, openedAtMonoMs: clock, clockEpoch: 'tv2', collecting: !stop, missing: { countKind: 'unknown', missingCount: null },
     ruleVersion: '1', configVersion: TV2_GEOMETRY.configVersion, geometry: TV2_GEOMETRY, revision: pane.revision,
     sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
     action: stop ? 'gap-and-stop' : 'annotate', evidence: null };
   TV2K.validateV2Incident(incident);
   return incident;
 }
+
+/** E (#6): a slot torn by zeroing it in place (only a mutant writes one). */
+const TV2_TORN = Object.freeze({ torn: true }) as unknown as TV2K.V2EmergencyIncident;
+/** S's reserve append: the same id keeps its retained record; otherwise a free slot; none free = exhausted. */
+function tv2ReserveAppend(d: TV2Disk, record: TV2K.V2EmergencyIncident): 'journalled' | 'exhausted' {
+  const id = record.incident.incidentId;
+  if (d.slots.some(s => s !== null && s !== TV2_TORN && s.incident.incidentId === id)) return 'journalled';
+  const free = d.slots.indexOf(null);
+  if (free < 0) return 'exhausted';
+  d.slots[free] = record; d.emergency.set(id, record.incident); d.reserveUsed++;
+  return 'journalled';
+}
+/** The journalled storage incidents of one pane (or every pane). */
+const tv2Held = (d: TV2Disk, k: TV2Key | null = null) => d.slots.filter((s): s is TV2K.V2EmergencyIncident =>
+  s !== null && s !== TV2_TORN && (k === null || TV2K.v2PaneKey(s.incident.pane) === k));
 
 function tv2Engine(w: TV2World, engineId: string) {
   const d = w.disk;
@@ -524,6 +544,14 @@ function tv2Engine(w: TV2World, engineId: string) {
   };
   const live = () => !dead && d.lock?.engineId === engineId && d.lock.alive && d.generation === generation;
   const barrier = (at: string) => { if (w.killAt === at) { w.killAt = null; kill(); throw new TV2Kill(at); } };
+  /** E (#6): host RAM — the H row cap a pane's storage fault was seen at, and the durability label of a pane whose reserve was full. */
+  const held = new Map<TV2Key, number>(); const durability = new Map<TV2Key, string>();
+  /** Inside S's synchronous slot write: `collector:` kills the collector there; `host:` kills only the host, the write goes on. */
+  let hostDying = false;
+  const collectorBarrier = (at: string) => {
+    if (w.killAt === `collector:${at}`) { w.killAt = null; w.collectorUp = false; throw new TV2Kill(at); }
+    if (w.killAt === `host:${at}`) { w.killAt = null; hostDying = true; }
+  };
   /** H transaction: capability + lock + generation checked inside every write. */
   async function write(pane: TV2Key | null, kind: string, apply: () => void, detail = '', writer = `engine:${engineId}`): Promise<void> {
     await tv2Yield();
@@ -542,6 +570,55 @@ function tv2Engine(w: TV2World, engineId: string) {
     const p = tv2PaneOf(w, k); const raw = d.raw.get(k);
     if (p && raw && p.pipe === raw.epoch) p.pipe = null;
   }
+  /** C puts the journalled incident in H: the same bytes (clocks, frontier) under one operation; the pane stops. */
+  async function materialize(k: TV2Key, record: TV2K.V2EmergencyIncident): Promise<void> {
+    const p = d.panes.get(k)!; const id = record.incident.incidentId, op = `storage-${id}`;
+    const incident = record.incident;
+    await write(k, 'materialize', () => {
+      p.incidents.set(id, incident); p.stopped = true; p.revision++;
+      p.receipts.set(op, { schema: 'newarch-v2', kind: 'ssot-durable', operationId: op, pane: p.desc.pane, digest: TV2K.v2Digest('tv2-stop', incident),
+        commitId: `c-${p.revision}`, generation, revision: p.revision, frontier: null, checkpointId: p.checkpoint?.id ?? null });
+    }, id);
+    retire(k);
+  }
+  /** H's reserve-rearm observation at THIS engine's generation (path A): read-only; null without a durable resolution. */
+  function reserveRearm(k: TV2Key, id: string): TV2K.V2ReserveRearmObservation | null {
+    const p = d.panes.get(k), incident = p?.incidents.get(id), receipt = p?.receipts.get(`storage-${id}`);
+    if (!live() || !p || !incident || !receipt) return null;
+    const observation: TV2K.V2ReserveRearmObservation = { schema: 'newarch-v2', purpose: 'reserve-rearm', pane: p.desc.pane, incidentId: id,
+      incidentDigest: TV2K.v2EmergencyIncidentDigest(incident), resolvedReceipt: receipt, authorizedGeneration: TV2K.v2WriterGeneration(generation) };
+    w.observations.push(observation);
+    return observation;
+  }
+  /** S's rearm(id): replace the ONE slot holding id — scratch, rename, directory sync — never zero it in place; no other id is touched. */
+  function collectorRearm(id: string): void {
+    const i = d.slots.findIndex(s => s !== null && s !== TV2_TORN && s.incident.incidentId === id);
+    if (i < 0) return;
+    const scratch = `slot-${i}.rearm`;
+    d.scratch.add(scratch); collectorBarrier('scratch-before-rename');
+    collectorBarrier('scratch-fsync-before-rename');
+    d.slots[i] = null; d.scratch.delete(scratch); d.emergency.delete(id); d.reserveUsed--;
+    collectorBarrier('rename-before-dirsync');
+    collectorBarrier('dirsync-before-reply');
+  }
+  /** BS's rearmReserve: the observation is checked against H's LIVE generation and the receipt H holds, then S is asked once. */
+  async function dispatch(k: TV2Key, id: string, observation: TV2K.V2ReserveRearmObservation | null): Promise<'rearmed' | 'refused'> {
+    const p = d.panes.get(k)!; const incident = p.incidents.get(id), receipt = p.receipts.get(`storage-${id}`);
+    if (!incident || !receipt || !w.collectorUp) return 'refused';
+    if (!TV2K.v2ReserveRearmAllowed(observation, p.desc.pane, id, TV2K.v2EmergencyIncidentDigest(incident), receipt, TV2K.v2WriterGeneration(d.generation))) return 'refused';
+    barrier('dispatch-before-reply');
+    collectorRearm(id);
+    if (hostDying) { hostDying = false; kill(); throw new TV2Kill('host died in the collector write'); }
+    barrier('reply-before-record');
+    // Rearm never ACKs, trims or resumes: the receipt of g authorizes nothing at g+1.
+    await write(k, 'rearm', () => {}, id);
+    return 'rearmed';
+  }
+  async function rearm(k: TV2Key, id: string): Promise<'rearmed' | 'refused'> {
+    const observation = reserveRearm(k, id);
+    barrier('observation-before-dispatch');
+    return dispatch(k, id, observation);
+  }
   function observe(k: TV2Key): TV2K.V2GeometryObservation | null {
     const p = tv2PaneOf(w, k); if (!p || p.program === 'dead') return null;
     const inWindow = [...w.tmux.panes.values()].filter(x => x.window === p.window && x.program !== 'dead').length;
@@ -551,6 +628,17 @@ function tv2Engine(w: TV2World, engineId: string) {
   async function pumpNow(k: TV2Key): Promise<void> {
     const p = d.panes.get(k); const raw = d.raw.get(k);
     if (!p || !raw || p.stopped) return;
+    const pending = tv2Held(d, k);
+    if (pending.length) {
+      // E (#6): a journalled storage incident holds the pane — nothing is replayed — until the disk grew and it is in H.
+      const at = held.get(k);
+      if (at === undefined || d.space.capRows <= at) return;
+      barrier('journal-before-h');
+      await materialize(k, pending[0]!);
+      barrier('h-before-rearm');
+      await rearm(k, pending[0]!.incident.incidentId);
+      return;
+    }
     const seen = observe(k);
     if (!seen || !TV2K.v2GeometryMatches(p.desc, seen) || raw.resizes !== p.resizesSeen) {
       await incident(k, 'geometry-violation', `geometry:${raw.acked}`, true, p.checkpoint ? p.rows.at(-1)?.ordinal ?? null : null);
@@ -562,12 +650,12 @@ function tv2Engine(w: TV2World, engineId: string) {
     if (batch.some(t => t.startsWith('\u0000'))) { await incident(k, 'decoder-anomaly', `protocol:${raw.acked}`, true); return; }
     const op = `batch:${raw.acked}:${end}`;
     if (p.rows.length + batch.length > d.space.capRows) {
-      // SQLITE_FULL: H cannot write. S journals the incident in the engine's reserve, no ACK.
-      const i = tv2Incident(p, 'budget-exhausted', `full:${raw.acked}`, true);
-      if (!d.emergency.has(i.incidentId)) {
-        if (d.reserveUsed >= d.reserveCap) throw new Error('T-V2 reserve exhausted: intake must stop, durability gate fails');
-        d.emergency.set(i.incidentId, i); d.reserveUsed++;
-      }
+      // ENOSPC: H cannot write. The host journals ONE storage-outage incident (clocks and frontier frozen) in S's
+      // reserve before any receipt; no ACK, no trim. A full reserve is a durability FAILED label, not a throw.
+      const i = tv2Incident(p, 'storage-outage', `storage-outage-${op}`, true, undefined, w.seq++);
+      if (tv2ReserveAppend(d, { incident: i, digest: TV2K.v2EmergencyIncidentDigest(i), cause: 'ENOSPC' }) === 'exhausted')
+        durability.set(k, 'storage-unavailable; durability FAILED: emergency reserve exhausted');
+      else held.set(k, d.space.capRows);
       retire(k); return;
     }
     barrier('before-commit');
@@ -643,11 +731,15 @@ function tv2Engine(w: TV2World, engineId: string) {
           pd.incidents.set(i.incidentId, i); d.panes.set(k, pd); j.activated = true;
         }, op);
       }
-      for (const [id, i] of [...d.emergency]) {
-        const k = TV2K.v2PaneKey(i.pane); const p = d.panes.get(k)!;
+      // E (#6): journalled storage incidents BEFORE the continuity proof: into H (same bytes, one operation), then a rearm with a fresh observation.
+      for (const record of tv2Held(d)) {
+        const k = TV2K.v2PaneKey(record.incident.pane); const p = d.panes.get(k)!; const id = record.incident.incidentId;
+        if (p.incidents.has(id)) { barrier('h-before-rearm'); await rearm(k, id); continue; }
         if (p.rows.length >= d.space.capRows) continue;
-        await write(k, 'materialize', () => { p.incidents.set(id, i); p.stopped = true; d.emergency.delete(id); }, i.incidentId);
-        d.reserveUsed--;
+        barrier('journal-before-h');
+        await materialize(k, record);
+        barrier('h-before-rearm');
+        await rearm(k, id);
       }
       for (const [k, p] of d.panes) {
         if (p.stopped) continue;
@@ -673,6 +765,12 @@ function tv2Engine(w: TV2World, engineId: string) {
       }
     },
     incident: (k: TV2Key, reason: TV2K.NewarchV2Incident['reason'], op: string, stop = true) => serial(k, () => incident(k, reason, op, stop)),
+    /** E (#6): the host's durability label of a pane (null = none). */
+    durability: (k: TV2Key): string | null => durability.get(k) ?? null,
+    /** E (#6): BS's rearm with a given observation (a test hands it a stale one). */
+    rearmWith: (k: TV2Key, id: string, observation: TV2K.V2ReserveRearmObservation) => serial(k, () => dispatch(k, id, observation)),
+    /** E (#6): a rearm RPC reaching S late. */
+    collectorRearm: (id: string) => collectorRearm(id),
     /** Auditor: capture-pane visible screen, compare against the DB projection at one revision. */
     async audit(k: TV2Key, between?: () => Promise<void>): Promise<string> {
       if (!w.audit.enabled) return 'disabled';
