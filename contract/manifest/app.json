@@ -2,13 +2,13 @@
   {
     "name": "AppAdapters",
     "kind": "type",
-    "signature": "5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0",
+    "signature": "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b",
     "tier": "S"
   },
   {
     "name": "AppLabels",
     "kind": "type",
-    "signature": "76ac2b4644c086d5f2bac25ea0aa384979663dc4020f5e6b88815e89e3fab006",
+    "signature": "8f12b3ffaee29a9167d5a076cb845a1a6d1655787e80853bed6122e0c050d1ba",
     "tier": "S"
   },
   {
@@ -26,13 +26,13 @@
   {
     "name": "createSessionsStore",
     "kind": "value",
-    "signature": "320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc",
+    "signature": "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034",
     "tier": "S"
   },
   {
     "name": "DEFAULT_APP_LABELS",
     "kind": "value",
-    "signature": "fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0",
+    "signature": "96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5",
     "tier": "S"
   },
   {
@@ -134,7 +134,7 @@
   {
     "name": "EmbedView",
     "kind": "component",
-    "signature": "b51656395a3b996f2c5b5bd70b2a38f8ec431acb4bb69d761f0e1a4a3194b86e",
+    "signature": "aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416",
     "tier": "S"
   },
   {
@@ -158,7 +158,7 @@
   {
     "name": "HubView",
     "kind": "component",
-    "signature": "5924951958271059e63f1f738c90d335e0a624b572f986d6ebf99351190a3646",
+    "signature": "9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e",
     "tier": "S"
   },
   {
@@ -200,7 +200,7 @@
   {
     "name": "SessionView",
     "kind": "component",
-    "signature": "be5f48e09dca94255ee8fcaa0497e147287450947c12ec4e68badc09d0631d60",
+    "signature": "b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675",
     "tier": "S"
   },
   {
@@ -218,7 +218,19 @@
   {
     "name": "ThumbmuxApp",
     "kind": "component",
-    "signature": "9acd4c600929f4c9fa84f5716d124d184be5df10f8335dba720147f9e1385da5",
+    "signature": "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f",
+    "tier": "S"
+  },
+  {
+    "name": "PromptEntry",
+    "kind": "type",
+    "signature": "9b6616320842f9e1609b0d32f78b8c6ffed2198d31b761da043f0b49d52d05e9",
+    "tier": "S"
+  },
+  {
+    "name": "SubmissionReceipt",
+    "kind": "type",
+    "signature": "a8d6d88ffd1699ec59a1a305b1026baefefa2507d17d506cbb13d080e19abea5",
     "tier": "S"
   }
 ]

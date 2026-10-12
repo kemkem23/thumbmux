@@ -332,7 +332,7 @@
   {
     "name": "MuxClientMessage",
     "kind": "type",
-    "signature": "11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08",
+    "signature": "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c",
     "tier": "F"
   },
   {
@@ -410,7 +410,7 @@
   {
     "name": "MuxStrictClientMessage",
     "kind": "type",
-    "signature": "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7",
+    "signature": "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8",
     "tier": "S"
   },
   {
@@ -1527,6 +1527,66 @@
     "name": "supportsNewarchV2",
     "kind": "value",
     "signature": "a1707f746ec10a32d92c4e3626f65e9c347594bcb4762f3938359c3efcc6e3f4",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_V2_WIRE_LIMITS",
+    "kind": "value",
+    "signature": "9494168f71294a320418e03be796c75bb51f46396a7d614145668a89e569e457",
+    "tier": "S"
+  },
+  {
+    "name": "newarchV2CursorFor",
+    "kind": "value",
+    "signature": "6707eeadccea7a01d76a03f9f91d0caabb9f720422cc869f0432ebb065257cc3",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryErrorCode",
+    "kind": "type",
+    "signature": "25eff5ddf5536ab52ae18220a291dfa4df147bcd4cd7dd452ed2c66fbec71a05",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryExpandMessage",
+    "kind": "type",
+    "signature": "1fe069ebf773b317b35bb9daf31ca3e28f281a33483b2dbc9a8f1ab22e3d5e24",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryReply",
+    "kind": "type",
+    "signature": "004f777ae44a703cf7f373fbfd822b6527aefc9f9f5faf7d69ea9f0e65a48997",
+    "tier": "S"
+  },
+  {
+    "name": "newarchV2ReplyMatches",
+    "kind": "value",
+    "signature": "55386507acc491c431a1f8a6eb68119388990759492874e3df00c5380d630bde",
+    "tier": "S"
+  },
+  {
+    "name": "newarchV2SamePane",
+    "kind": "value",
+    "signature": "0d9adb0bb4be8da8df16625143e830a356a05cf3d9960c00c3814f204ed507bc",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2WireCell",
+    "kind": "type",
+    "signature": "baf13c2feb7a3316628407a1c39552533135e104640cc858bbf3f65e4d850c23",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2WireEntry",
+    "kind": "type",
+    "signature": "20a5ef6172de57bf51bc607259ca48eacec6a49bb25a40ed7aae175691d1eea6",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2WireRow",
+    "kind": "type",
+    "signature": "20b94749a59c7ef268fb90857be70984d9cdcbf9feff4c7a2b8c5fbd2f6c8da6",
     "tier": "S"
   }
 ]

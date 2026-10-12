@@ -548,7 +548,7 @@
   {
     "name": "PromptsPanel",
     "kind": "component",
-    "signature": "eeabae3cbcca4ab135572967cb25dd554d6b1c26fd1bcc9657d253b58c0a6e0d",
+    "signature": "5bf24f6434b53337d1bf67321caa790d58b731f36fcb9561c322664620a6528f",
     "tier": "F"
   },
   {
@@ -878,7 +878,7 @@
   {
     "name": "TermView",
     "kind": "component",
-    "signature": "d9c991e93779dafe6fcf53807d20674eaf99e39ef834c1f0fb517540c286c609",
+    "signature": "ff7c3b6bc8649efafec2842757993f8b1c8c0f62b152a36414404e44f22ccd13",
     "tier": "F"
   },
   {
@@ -896,13 +896,13 @@
   {
     "name": "tmuxMux",
     "kind": "value",
-    "signature": "1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1",
+    "signature": "20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919",
     "tier": "F"
   },
   {
     "name": "TmuxMux",
     "kind": "value",
-    "signature": "10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336",
+    "signature": "ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1",
     "tier": "F"
   },
   {

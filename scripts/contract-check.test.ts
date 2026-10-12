@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import ts from "typescript";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { assertReleaseVersion } from "./check-release-version";
 import {
   assertRuntimeDisplayExport,
   checkContract,
@@ -1289,11 +1290,11 @@ test("a baseline root is used when supplied", () => {
   expect(supplied.error).toBeUndefined();
 });
 
-test("skipping the baseline takes a deliberate opt-out", () => {
+test("the old baseline opt-out cannot bypass immutable comparison", () => {
   const skipped = resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE: "skip" });
-  expect(skipped.skipped).toBe(true);
-  expect(skipped.error).toBeUndefined();
-  // Anything other than the exact word is not an opt-out.
+  expect(skipped.skipped).toBe(false);
+  expect(skipped.error).toContain("THUMBMUX_CONTRACT_BASELINE_ROOT");
+  // Neither old spelling bypasses the required immutable baseline.
   expect(resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE: "yes" }).error).toBeTruthy();
 });
 
@@ -1669,5 +1670,232 @@ describe("P runtime barrel and dual consumer guards", () => {
   test("missing immutable baseline remains an error, including the old skip environment", () => {
     expect(resolveBaselineMode({}).error).toBeTruthy();
     expect(resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE: "skip" }).error).toBeTruthy();
+  });
+});
+
+describe("P 0.22 release metadata and WJ manifests", () => {
+  const packageRoot = resolve(import.meta.dir, "..");
+  const releaseManifests = ["package.json", "core/package.json", "server/package.json", "svelte/package.json", "app/package.json"];
+
+  test("the five releases are .22, demo stays private .1, source export layout stays intact", () => {
+    expect(assertReleaseVersion("v0.22.0", packageRoot)).toBe("0.22.0");
+    const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+    expect(pkg.private).toBe(true);
+    expect(pkg.exports["./pipe-history-runtime"]).toEqual({
+      types: "./server/dist/pipe-history-runtime.d.ts", import: "./server/dist/pipe-history-runtime.js",
+    });
+    const demo = JSON.parse(readFileSync(join(packageRoot, "demo/package.json"), "utf8"));
+    expect({ version: demo.version, private: demo.private }).toEqual({ version: "0.1.0", private: true });
+  });
+
+  test("every wrong package version and every wrong internal range is rejected separately", () => {
+    for (const path of releaseManifests) {
+      const root = fixture("0.22.0");
+      for (const manifest of releaseManifests) {
+        mkdirSync(resolve(root, manifest, ".."), { recursive: true });
+        cpSync(join(packageRoot, manifest), join(root, manifest));
+      }
+      const current = JSON.parse(readFileSync(join(root, path), "utf8"));
+      writeFileSync(join(root, path), JSON.stringify({ ...current, version: "0.21.0" }));
+      expect(() => assertReleaseVersion("v0.22.0", root)).toThrow(`${path}: version 0.21.0 != 0.22.0`);
+      writeFileSync(join(root, path), JSON.stringify(current));
+      for (const key of Object.keys(current.dependencies ?? {}).filter((name) => name.startsWith("@thumbmux/"))) {
+        writeFileSync(join(root, path), JSON.stringify({ ...current, dependencies: { ...current.dependencies, [key]: "^0.21.0" } }));
+        expect(() => assertReleaseVersion("v0.22.0", root)).toThrow(`${path}: ${key}`);
+        writeFileSync(join(root, path), JSON.stringify(current));
+      }
+    }
+  });
+
+  test("release lock metadata does not alter the pinned dependency resolution graph", () => {
+    const lock = readFileSync(join(packageRoot, "bun.lock"), "utf8");
+    const packages = lock.slice(lock.indexOf('  "packages":'));
+    expect(createHash("sha256").update(packages).digest("hex"))
+      .toBe("9a7395fbe5654194a127c2e28c2103412c8d3a92ba5fe509aa57b3a1ce5b11f7");
+  });
+
+  test("WJ manifest names retain immutable .21 tiers and match built declarations", () => {
+    const live = deriveGitDistReport(packageRoot, ["app", "svelte"]);
+    const baselineTiers = {"app": {"AppAdapters": "S", "AppLabels": "S", "DEFAULT_APP_LABELS": "S", "EmbedView": "S", "HubView": "S", "PromptEntry": "S", "SessionView": "S", "SubmissionReceipt": "S", "ThumbmuxApp": "S"}, "svelte": {"PromptsPanel": "F"}} as const;
+    const expected = {
+      app: ["AppAdapters", "AppLabels", "DEFAULT_APP_LABELS", "EmbedView", "HubView", "SessionView", "ThumbmuxApp", "SubmissionReceipt", "PromptEntry"],
+      svelte: ["PromptsPanel"],
+    } as const;
+    for (const subpath of ["app", "svelte"] as const) {
+      const manifest = JSON.parse(readFileSync(join(packageRoot, `contract/manifest/${subpath}.json`), "utf8")) as ContractEntry[];
+      for (const name of expected[subpath]) {
+        const entry = manifest.find((value) => value.name === name);
+        const actual = live[subpath].find((value) => value.name === name);
+        expect(entry).toBeDefined();
+        expect(actual).toBeDefined();
+        expect(entry!.kind).toBe(actual!.kind);
+        expect(entry!.signature).toBe(actual!.signature);
+        expect(entry!.tier).toBe((baselineTiers[subpath] as Record<string, string>)[name]);
+      }
+    }
+  });
+});
+
+test("P release checkContract requires a baseline before reading current artifacts", () => {
+  expect(() => checkContract({ packageRoot: fixture("0.22.0") })).toThrow("immutable baseline");
+});
+
+// P amendment: independent literal oracle from immutable .20.5/.21 and
+// emitted .22 declarations; never import or enumerate the checker exception table.
+const P_RELEASE_SIGNATURES = [
+  ["0.20.5", "core", "MuxClientMessage", "type", "11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08", "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c", "11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08", "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c"],
+  ["0.20.5", "core", "MuxStrictClientMessage", "type", "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7", "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8", "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7", "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8"],
+  ["0.20.5", "server", "AppRoutes", "type", "bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33", "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962", "bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33", "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962"],
+  ["0.20.5", "server", "AppRoutesOptions", "type", "c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2", "9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd", "c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2", "9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd"],
+  ["0.20.5", "server", "createAppRoutes", "value", "1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a", "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c", "1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a", "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c"],
+  ["0.20.5", "server", "createTokenGuard", "value", "e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a", "482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0", "e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a", "482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0"],
+  ["0.20.5", "server", "MuxAuthResult", "type", "92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9", "460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d", "92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9", "460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d"],
+  ["0.20.5", "server", "MuxAuthSuccess", "type", "7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40", "10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43", "7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40", "10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43"],
+  ["0.20.5", "server", "TmuxWsMux", "value", "32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8", "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa", "32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8", "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa"],
+  ["0.20.5", "server", "TokenGuard", "type", "1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630", "39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4", "1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630", "39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4"],
+  ["0.20.5", "svelte", "tmuxMux", "value", "1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1", "20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919", "1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1", "20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919"],
+  ["0.20.5", "svelte", "TmuxMux", "value", "10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336", "ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1", "10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336", "ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1"],
+  ["0.20.5", "svelte", "PromptsPanel", "component", "eeabae3cbcca4ab135572967cb25dd554d6b1c26fd1bcc9657d253b58c0a6e0d", "5bf24f6434b53337d1bf67321caa790d58b731f36fcb9561c322664620a6528f", "a01d69dc347c3a26ab42fe661d95bbcd9fc74387a88c9b7dcb204feaa5f39a8e", "62ff18e2aa2b7c89a0e0086e4700a7a2310856060ff16a7aa4e90fb48786bdf5"],
+  ["0.20.5", "app", "AppAdapters", "type", "5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0", "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b", "5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0", "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b"],
+  ["0.20.5", "app", "createSessionsStore", "value", "320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc", "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034", "320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc", "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034"],
+  ["0.20.5", "app", "EmbedView", "component", "b51656395a3b996f2c5b5bd70b2a38f8ec431acb4bb69d761f0e1a4a3194b86e", "aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416", "46f7f6c8a7bef4d8ed33468c252ad22b3180d78ed6896b4db2e2e915c5e7fcb7", "bbe2fe42f25da707fdc00563c796de9e655c85225a355f8a270bd444c25b006d"],
+  ["0.20.5", "app", "HubView", "component", "5924951958271059e63f1f738c90d335e0a624b572f986d6ebf99351190a3646", "9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e", "e98a99dfa1891ebef3e78dd26b6485c7687ccb44808042e23aac9ac9f4e8b702", "3609341b43f82f78978aa132f92e0c01171f01a333ac1434e86c23a130c7d0a9"],
+  ["0.20.5", "app", "SessionView", "component", "be5f48e09dca94255ee8fcaa0497e147287450947c12ec4e68badc09d0631d60", "b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675", "e8a4c3c6399bbee28663b068d9572ece989d78ee7c89b3587fbbec40a33bbb8b", "d8223970b90a41c6fa6650ded1c1a20183fd27ff3f4e2a43aef7d9ca93ff32cd"],
+  ["0.20.5", "app", "ThumbmuxApp", "component", "9acd4c600929f4c9fa84f5716d124d184be5df10f8335dba720147f9e1385da5", "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f", "6f6e2591a5f4154d627d630a21302dbdc22e385dcde546d9291759017c815c18", "24e56e84869abefdab2302613f0265a96b3647ee247dc55fd7b7dc2ef54cc27b"],
+  ["0.20.5", "app", "DEFAULT_APP_LABELS", "value", "fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0", "96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5", "fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0", "96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5"],
+  ["0.21.0", "core", "MuxClientMessage", "type", "11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08", "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c", "11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08", "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c"],
+  ["0.21.0", "core", "MuxStrictClientMessage", "type", "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7", "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8", "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7", "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8"],
+  ["0.21.0", "server", "AppRoutes", "type", "bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33", "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962", "bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33", "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962"],
+  ["0.21.0", "server", "AppRoutesOptions", "type", "c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2", "9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd", "c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2", "9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd"],
+  ["0.21.0", "server", "createAppRoutes", "value", "1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a", "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c", "1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a", "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c"],
+  ["0.21.0", "server", "createTokenGuard", "value", "e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a", "482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0", "e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a", "482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0"],
+  ["0.21.0", "server", "MuxAuthResult", "type", "92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9", "460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d", "92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9", "460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d"],
+  ["0.21.0", "server", "MuxAuthSuccess", "type", "7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40", "10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43", "7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40", "10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43"],
+  ["0.21.0", "server", "TmuxWsMux", "value", "32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8", "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa", "32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8", "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa"],
+  ["0.21.0", "server", "TokenGuard", "type", "1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630", "39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4", "1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630", "39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4"],
+  ["0.21.0", "svelte", "tmuxMux", "value", "1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1", "20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919", "1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1", "20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919"],
+  ["0.21.0", "svelte", "TmuxMux", "value", "10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336", "ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1", "10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336", "ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1"],
+  ["0.21.0", "app", "AppAdapters", "type", "50d641bf27f09f0ae615e970bf8d7624989b114f622f72c11835cbfc4500198e", "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b", "50d641bf27f09f0ae615e970bf8d7624989b114f622f72c11835cbfc4500198e", "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b"],
+  ["0.21.0", "app", "createSessionsStore", "value", "320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc", "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034", "320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc", "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034"],
+  ["0.21.0", "app", "EmbedView", "component", "572213494862d88db6ea5007e2121c2dfd7864f6ac68141f6ceb36f8e8deabc5", "aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416", "9f335097a884f0bfb073318afef04337066a0177c83dc996ab5e8c4131c25655", "bbe2fe42f25da707fdc00563c796de9e655c85225a355f8a270bd444c25b006d"],
+  ["0.21.0", "app", "HubView", "component", "1ec52ee234f6d0360204fe9d6821d307ce835b9d8d983e979e4844c42bd4fbc2", "9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e", "c6ba2b9c0d4e42ae2862eae8b1b66952526128b05e715eb0127d1cc330d66c2d", "3609341b43f82f78978aa132f92e0c01171f01a333ac1434e86c23a130c7d0a9"],
+  ["0.21.0", "app", "SessionView", "component", "1eacff8aa9a25c47c4b3f6d8a1de9ce1c636b55bf8c823b31781c2dcdb1370dc", "b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675", "dedf0f63a9fe2a6025e41e1cc27a1f2f2bd7207cb210674e21a449b1f3c22859", "d8223970b90a41c6fa6650ded1c1a20183fd27ff3f4e2a43aef7d9ca93ff32cd"],
+  ["0.21.0", "app", "ThumbmuxApp", "component", "5c112b90f02054e06fed35a770bfc078f9820af0c4553058502693f54fd7806d", "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f", "50b1fb4a24a6043109873a8c2159dca737cb7e88db3dfeed784e52941dd83b09", "24e56e84869abefdab2302613f0265a96b3647ee247dc55fd7b7dc2ef54cc27b"],
+] as const;
+const P_AMENDED_MANIFEST_ROWS = [
+  ["core", "MuxClientMessage", "type", "F", "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c"],
+  ["core", "MuxStrictClientMessage", "type", "S", "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8"],
+  ["core", "NEWARCH_V2_WIRE_LIMITS", "value", "S", "9494168f71294a320418e03be796c75bb51f46396a7d614145668a89e569e457"],
+  ["core", "newarchV2CursorFor", "value", "S", "6707eeadccea7a01d76a03f9f91d0caabb9f720422cc869f0432ebb065257cc3"],
+  ["core", "NewarchV2HistoryErrorCode", "type", "S", "25eff5ddf5536ab52ae18220a291dfa4df147bcd4cd7dd452ed2c66fbec71a05"],
+  ["core", "NewarchV2HistoryExpandMessage", "type", "S", "1fe069ebf773b317b35bb9daf31ca3e28f281a33483b2dbc9a8f1ab22e3d5e24"],
+  ["core", "NewarchV2HistoryReply", "type", "S", "004f777ae44a703cf7f373fbfd822b6527aefc9f9f5faf7d69ea9f0e65a48997"],
+  ["core", "newarchV2ReplyMatches", "value", "S", "55386507acc491c431a1f8a6eb68119388990759492874e3df00c5380d630bde"],
+  ["core", "newarchV2SamePane", "value", "S", "0d9adb0bb4be8da8df16625143e830a356a05cf3d9960c00c3814f204ed507bc"],
+  ["core", "NewarchV2WireCell", "type", "S", "baf13c2feb7a3316628407a1c39552533135e104640cc858bbf3f65e4d850c23"],
+  ["core", "NewarchV2WireEntry", "type", "S", "20a5ef6172de57bf51bc607259ca48eacec6a49bb25a40ed7aae175691d1eea6"],
+  ["core", "NewarchV2WireRow", "type", "S", "20b94749a59c7ef268fb90857be70984d9cdcbf9feff4c7a2b8c5fbd2f6c8da6"],
+  ["server", "AppRoutes", "type", "S", "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962"],
+  ["server", "AppRoutesOptions", "type", "S", "9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd"],
+  ["server", "createAppRoutes", "value", "S", "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c"],
+  ["server", "createTokenGuard", "value", "F", "482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0"],
+  ["server", "MuxAuthResult", "type", "F", "460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d"],
+  ["server", "MuxAuthSuccess", "type", "F", "10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43"],
+  ["server", "TmuxWsMux", "value", "F", "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa"],
+  ["server", "TmuxWsMuxOptions", "type", "F", "ca02f48f366f176ddd31bbd2774350a4446871359accdbe3a7c04889abb19c2e"],
+  ["server", "TokenGuard", "type", "F", "39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4"],
+  ["svelte", "PromptsPanel", "component", "F", "5bf24f6434b53337d1bf67321caa790d58b731f36fcb9561c322664620a6528f"],
+  ["svelte", "TermView", "component", "F", "ff7c3b6bc8649efafec2842757993f8b1c8c0f62b152a36414404e44f22ccd13"],
+  ["svelte", "tmuxMux", "value", "F", "20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919"],
+  ["svelte", "TmuxMux", "value", "F", "ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1"],
+  ["app", "AppAdapters", "type", "S", "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b"],
+  ["app", "AppLabels", "type", "S", "8f12b3ffaee29a9167d5a076cb845a1a6d1655787e80853bed6122e0c050d1ba"],
+  ["app", "createSessionsStore", "value", "S", "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034"],
+  ["app", "DEFAULT_APP_LABELS", "value", "S", "96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5"],
+  ["app", "EmbedView", "component", "S", "aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416"],
+  ["app", "HubView", "component", "S", "9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e"],
+  ["app", "PromptEntry", "type", "S", "9b6616320842f9e1609b0d32f78b8c6ffed2198d31b761da043f0b49d52d05e9"],
+  ["app", "SessionView", "component", "S", "b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675"],
+  ["app", "SubmissionReceipt", "type", "S", "a8d6d88ffd1699ec59a1a305b1026baefefa2507d17d506cbb13d080e19abea5"],
+  ["app", "ThumbmuxApp", "component", "S", "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f"],
+] as const;
+
+function pReleaseComparison(row: readonly string[], change: {
+  from?: string; to?: string; subpath?: "core" | "server" | "svelte" | "app";
+  name?: string; oldSignature?: string; newSignature?: string;
+  oldCompatibility?: string; newCompatibility?: string; wrongKind?: boolean;
+} = {}) {
+  const [from, subpath, name, kind, oldSignature, newSignature, oldCompatibility, newCompatibility] = row;
+  const previous: ContractEntry = {
+    name: change.name ?? name!, kind: kind as ContractEntry["kind"], tier: "F",
+    signature: change.oldSignature ?? oldSignature!,
+    compatibilitySignature: change.oldCompatibility ?? oldCompatibility!,
+  };
+  const next: ContractEntry = {
+    ...previous, kind: change.wrongKind ? (previous.kind === "type" ? "value" : "type") : previous.kind,
+    signature: change.newSignature ?? newSignature!,
+    compatibilitySignature: change.newCompatibility ?? newCompatibility!,
+  };
+  return evaluateBaseline(change.subpath ?? subpath as "core" | "server" | "svelte" | "app",
+    [previous], [next], [previous], [next], change.from ?? from!, change.to ?? "0.22.0");
+}
+
+describe("P exact .20.5/.21 to .22 artifact signatures", () => {
+  for (const row of P_RELEASE_SIGNATURES) {
+    const [from, subpath, name] = row;
+    test(`${from} ${subpath}/${name}: exact reviewed tuple only`, () => {
+      expect(pReleaseComparison(row).errors).toEqual([]);
+      const mutations = [
+        { from: "0.20.4" }, { from: "0.22.0" }, { to: "0.22.1" }, { to: "0.23.0" },
+        { name: `${name}Unreviewed` },
+        { subpath: subpath === "core" ? "server" as const : "core" as const },
+        { oldSignature: "1".repeat(64) }, { newSignature: "2".repeat(64) },
+        { oldCompatibility: "3".repeat(64) }, { newCompatibility: "4".repeat(64) },
+        { wrongKind: true },
+      ];
+      for (const mutation of mutations) {
+        const errors = pReleaseComparison(row, mutation).errors;
+        expect(errors.some((error) => error.code === "baseline-signature-change"
+          && error.name === ("name" in mutation ? mutation.name : name)
+          && error.subpath === ("subpath" in mutation ? mutation.subpath : subpath))).toBe(true);
+      }
+      expect(() => pReleaseComparison(row, { from: "0.23.0" }))
+        .toThrow("contract version moved backwards: 0.23.0 → 0.22.0");
+    });
+  }
+
+  test("every individually authorized manifest row has its declared kind, tier and artifact digest", () => {
+    const root = resolve(import.meta.dir, "..");
+    const live = deriveGitDistReport(root);
+    for (const [subpath, name, kind, tier, signature] of P_AMENDED_MANIFEST_ROWS) {
+      const entries = JSON.parse(readFileSync(join(root, `contract/manifest/${subpath}.json`), "utf8")) as ContractEntry[];
+      expect(entries.find((entry) => entry.name === name)).toEqual({ name, kind, tier, signature });
+      expect(live[subpath].find((entry) => entry.name === name)).toMatchObject({ name, kind, signature });
+    }
+    // Helpers that implement the shared wire validation remain internal.
+    const internal = ["newarchV2EntryPane", "newarchV2Utf8Bytes", "newarchV2CursorInBounds", "newarchV2RequestInBounds"];
+    for (const name of internal) expect(live.core.some((entry) => entry.name === name)).toBe(false);
+  });
+
+  test("old exhaustive auth operation handling exposes the documented new-union breaking edge", () => {
+    const root = fixture();
+    const baseline = join(root, "auth.d.ts");
+    // Verbatim MuxAuthSuccess.operation from immutable .20.5 and .21 token-guard.d.ts.
+    writeFileSync(baseline, `export interface MuxAuthSuccess {
+      operation: "ping" | "client_info" | "sessions_subscribe" | "sessions_unsubscribe" | "subscribe" | "unsubscribe" | "history_expand" | "resync" | "keys" | "resize";
+    }`);
+    const consumer = `import type { MuxAuthSuccess } from "thumbmux/server";
+      declare function exhausted(value: never): void;
+      function handle(operation: MuxAuthSuccess["operation"]) {
+        switch (operation) {
+          case "ping": case "client_info": case "sessions_subscribe": case "sessions_unsubscribe":
+          case "subscribe": case "unsubscribe": case "history_expand": case "resync": case "keys": case "resize": return;
+          default: exhausted(operation);
+        }
+      }`;
+    expect(pCompileConsumer(consumer, { "thumbmux/server": baseline })).toEqual([]);
+    const errors = pCompileConsumer(consumer, { "thumbmux/server": resolve(import.meta.dir, "../git-dist/server/index.d.ts") });
+    expect(errors.map((error) => error.code)).toEqual([2345]);
+    expect(errors[0]!.text).toContain("history_expand_v2");
   });
 });
