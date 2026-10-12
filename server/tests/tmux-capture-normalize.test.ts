@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { normalizeTmuxCaptureCells, TmuxCaptureDecoder, TMUX_STYLE_BITS } from '../src/tmux-capture-normalize';
 
@@ -118,9 +119,9 @@ describe('NEWARCH L2-C observed snapshot cells', () => {
 });
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 test('FIX1 real private tmux OSC8, underline variants, overline and Thai spacing', async () => {
   const root = mkdtempSync(join(tmpdir(), 'l2c-decoder-'));
   const socket = join(root, 'x.sock');
@@ -2352,17 +2353,35 @@ test('B1c decoder reads only consumed bytes plus one boundary byte and detaches 
 // root (`bun run typecheck` → ops/testing/typecheck-gate.ts, "PASS — no file
 // gained errors"), run outside the unit suite.
 test('B1c strict contract types compile',()=>{
-  const root=fileURLToPath(new URL('../../',import.meta.url));
-  const compiler=createRequire(new URL('../../package.json',import.meta.url)).resolve('typescript/bin/tsc');
+  const root=realpathSync(fileURLToPath(new URL('../../',import.meta.url)));
+  const contained=(path:string)=>{
+    const resolved=realpathSync(path),rel=relative(root,resolved);
+    if(isAbsolute(rel)||rel==='..'||rel.startsWith('../'))throw Error(`B1c dependency outside package: ${resolved}`);
+    return resolved;
+  };
+  const compiler=contained(createRequire(new URL('../../package.json',import.meta.url)).resolve('typescript/bin/tsc'));
+  // A source-file CLI does not read server's tsconfig. Select its declared
+  // ambient dependency explicitly, without depending on ancestor @types.
+  const serverRequire=createRequire(new URL('../package.json',import.meta.url));
+  const bunTypesEntry=contained(serverRequire.resolve('@types/bun/index.d.ts'));
+  const bunTypeRoot=contained(dirname(dirname(bunTypesEntry)));
+  expect(contained(join(bunTypeRoot,'bun/index.d.ts'))).toBe(bunTypesEntry);
+  const compilerPackageJson=contained(join(dirname(dirname(compiler)),'package.json'));
+  const bunTypesPackageJson=contained(join(dirname(bunTypesEntry),'package.json'));
+  const compilerVersion=(JSON.parse(readFileSync(compilerPackageJson,'utf8')) as {version:string}).version;
+  const bunTypesVersion=(JSON.parse(readFileSync(bunTypesPackageJson,'utf8')) as {version:string}).version;
+  const compilerSha256=createHash('sha256').update(readFileSync(compiler)).digest('hex');
+  const bunTypesSha256=createHash('sha256').update(readFileSync(bunTypesEntry)).digest('hex');
   // The cage snapshots tracked sources, so regenerate the core package's
   // declaration output in its disposable COW tree before resolving exports.
   const commands=[[process.execPath,compiler,'-p','core/tsconfig.build.json'],
     [process.execPath,compiler,'--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
-    '--target','ESNext','--module','Preserve','--moduleResolution','bundler','--allowImportingTsExtensions',
+    '--target','ESNext','--module','Preserve','--moduleResolution','bundler','--allowImportingTsExtensions','--types','bun','--typeRoots',bunTypeRoot,
     'server/tests/fixtures/newarch-contract-fixture.ts']];
   for(const command of commands){
     const run=spawnSync(command[0]!,command.slice(1),{cwd:root,encoding:'utf8',timeout:120000});
     console.log('B1C_GATE',JSON.stringify({cwd:root,compiler,fixture:join(root,'server/tests/fixtures/newarch-contract-fixture.ts'),
+      bunTypesEntry,bunTypeRoot,compilerPackageJson,bunTypesPackageJson,compilerVersion,bunTypesVersion,compilerSha256,bunTypesSha256,
       command,exit:run.status,error:run.error?.message??null,signal:run.signal,stdout:run.stdout,stderr:run.stderr}));
     expect(run.error).toBeUndefined();expect(run.signal).toBeNull();
     expect(run.status).toBe(0);
