@@ -1511,7 +1511,13 @@ describe("P .21 WJ consumer contract", () => {
 
   test("removing the public receipt fails by its export name, not by missing setup", () => {
     const file = pWjExcerpt();
-    writeFileSync(file, P_WJ_0210_DECLARATIONS.replace("export interface SubmissionReceipt", "interface SubmissionReceipt"));
+    // An explicit export declaration disables ambient implicit exports, so
+    // removing this modifier really makes SubmissionReceipt module-private.
+    writeFileSync(
+      file,
+      P_WJ_0210_DECLARATIONS.replace("export interface SubmissionReceipt", "interface SubmissionReceipt")
+        + "\nexport {};\n",
+    );
     const diagnostics = pCompileConsumer(P_WJ_CONSUMER, { "thumbmux/app": file });
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]).toMatchObject({ code: 2459 });
