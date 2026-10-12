@@ -30,6 +30,7 @@ import { HistoryWatchdog } from './history-watchdog';
 import type { CapturedRow, HistoryCell, HistoryRow, RowMatch } from './history-row-matcher';
 import { CACHE_BYTE_MODEL, TmuxCaptureDecoder, TMUX_OBSERVED_FIELDS, type DecoderCacheStats } from './tmux-capture-normalize';
 import { createProjectionStore as createProjectionStoreValue } from './sqlite-history/projection-store';
+import { NewarchV2Display as NewarchV2DisplayValue } from './display-engine';
 import { pipeVtAssets as pipeVtAssetsValue, verifyPipeVtAssets as verifyPipeVtAssetsValue } from './pipe-vt-worker';
 import {
   isProjectionRefusal,
@@ -1612,6 +1613,9 @@ export class ProjectionLiveWindow {
 // can leave a dangling symbol for a barrel re-export (see index.ts).
 /** The projection store (L1/I2) this runtime writes to. */
 export const createProjectionStore = createProjectionStoreValue;
+/** Read-only NEWARCH display constructor; importing this barrel starts no runtime. */
+export const NewarchV2Display = NewarchV2DisplayValue;
+export type NewarchV2Display = NewarchV2DisplayValue;
 /** VT worker assets beside this module (dist or source) and their pinned-hash check. */
 export const pipeVtAssets = pipeVtAssetsValue;
 export const verifyPipeVtAssets = verifyPipeVtAssetsValue;

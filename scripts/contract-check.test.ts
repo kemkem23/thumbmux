@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import ts from "typescript";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
+  assertRuntimeDisplayExport,
   checkContract,
   deriveGitDistReport,
   evaluateBaseline,
@@ -1532,5 +1534,140 @@ describe("P .21 WJ consumer contract", () => {
     expect(diagnostics.map(({ code }) => code)).toEqual([2322, 2322]);
     expect(diagnostics[0]!.text).toContain("maybe");
     expect(diagnostics[1]!.text).toContain("number");
+  });
+});
+
+// P .20.5 geometry excerpt: the class header and methods are verbatim from
+// 62f092bd8c54cac4b47e04b52189ce52751b8579/git-dist/server/ws-mux.d.ts.
+// WsLike/session-row supporting declarations are minimal fixture scaffolding;
+// no claim is made that this is the entire legacy server package.
+const P_GEOMETRY_0205 = "export type WsLike = { send(data: string): unknown };\nexport interface SessionListRow { name: string }\nexport interface SessionListItem extends SessionListRow {}\nexport declare class TmuxWsMux<WS extends WsLike = WsLike, SessionRow extends SessionListRow = SessionListItem> {\n    handleResize(session: string, cols: number, rows: number, ws?: WS, client?: unknown): void;\n    applyGeometry(session: string, cols: number, rows: number, ws?: WS): void;\n}\n";
+const P_GEOMETRY_EXCERPT_SHA256 = "256b7392f1521511801c2b3aadbe1746ef6dbf7f361612d327825f18659ca3cb";
+
+const P_GEOMETRY_CALLER = `
+import { TmuxWsMux } from "thumbmux/server";
+declare const mux: TmuxWsMux;
+mux.handleResize("session", 78, 120);
+mux.applyGeometry("session", 78, 120);
+const resize: (session: string, cols: number, rows: number) => void = mux.handleResize.bind(mux);
+const geometry: (session: string, cols: number, rows: number) => void = mux.applyGeometry.bind(mux);
+class Inherited extends TmuxWsMux {}
+void [resize, geometry, Inherited];
+`;
+const P_GEOMETRY_OVERRIDE = `
+import { TmuxWsMux } from "thumbmux/server";
+class LegacyOverride extends TmuxWsMux {
+  override handleResize(_session: string, _cols: number, _rows: number): void {}
+  override applyGeometry(_session: string, _cols: number, _rows: number): void {}
+}
+`;
+
+function pArtifactFixture(): string {
+  const root = fixture("0.22.0");
+  const packageRoot = resolve(import.meta.dir, "..");
+  cpSync(join(packageRoot, "git-dist"), join(root, "git-dist"), { recursive: true });
+  const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+  // Match the release map transformation, using the actual public map as input.
+  const exports = JSON.parse(JSON.stringify(pkg.exports).replace(/\.\/([^/" ]+)\/dist\//g, "./git-dist/$1/"));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "thumbmux", type: "module", version: "0.22.0", exports }));
+  return root;
+}
+
+function pRuntimeImport(root: string) {
+  // Runs only under the reviewed runner. Every host effect is made fatal in
+  // this fresh process before importing the public runtime subpath.
+  const script = `
+    import { mock } from "bun:test";
+    import * as child from "node:child_process";
+    import * as fs from "node:fs";
+    const forbidden = () => { throw Error("P import attempted host IO/timer/database"); };
+    mock.module("bun:sqlite", () => ({ Database: class { constructor() { forbidden(); } } }));
+    mock.module("node:child_process", () => ({ ...child, spawn: forbidden, spawnSync: forbidden, exec: forbidden, execSync: forbidden, execFile: forbidden, execFileSync: forbidden, fork: forbidden }));
+    mock.module("node:fs", () => ({ ...fs, openSync: forbidden, writeFileSync: forbidden, mkdirSync: forbidden, rmSync: forbidden }));
+    globalThis.setTimeout = forbidden;
+    globalThis.setInterval = forbidden;
+    const runtime = await import("thumbmux/pipe-history-runtime");
+    if (typeof runtime.NewarchV2Display !== "function") throw Error("NewarchV2Display missing constructor");
+    const display = Reflect.construct(runtime.NewarchV2Display, [{}]);
+    if (!(display instanceof runtime.NewarchV2Display)) throw Error("NewarchV2Display is not constructible");
+    console.log("P NewarchV2Display inert constructor");
+  `;
+  return spawnSync(process.execPath, ["--eval", script], { cwd: root, encoding: "utf8" });
+}
+
+describe("P runtime barrel and dual consumer guards", () => {
+  test("public built runtime provides a constructible value and matching type", () => {
+    const root = pArtifactFixture();
+    expect(() => assertRuntimeDisplayExport(root)).not.toThrow();
+    const runtime = pRuntimeImport(root);
+    expect({ error: runtime.error?.message, status: runtime.status, stderr: runtime.stderr })
+      .toEqual({ error: undefined, status: 0, stderr: "" });
+    expect(runtime.stdout.trim()).toBe("P NewarchV2Display inert constructor");
+    expect(pCompileConsumer(`
+      import { NewarchV2Display } from "thumbmux/pipe-history-runtime";
+      declare const reader: ConstructorParameters<typeof NewarchV2Display>[0];
+      const display: NewarchV2Display = new NewarchV2Display(reader);
+      declare const session: Parameters<NewarchV2Display["select"]>[0];
+      display.select(session);
+    `, { "thumbmux/pipe-history-runtime": join(root, "git-dist/server/pipe-history-runtime.d.ts") }))
+      .toEqual([]);
+  });
+
+  test("missing runtime value is rejected by the actual export name", () => {
+    const root = pArtifactFixture();
+    writeFileSync(join(root, "git-dist/server/pipe-history-runtime.js"), "export const Other = 1;\n");
+    expect(() => assertRuntimeDisplayExport(root)).toThrow("NewarchV2Display");
+    const runtime = pRuntimeImport(root);
+    expect(runtime.status).toBe(1);
+    expect(runtime.stderr).toContain("NewarchV2Display missing constructor");
+    expect(runtime.stderr).not.toContain("Cannot find");
+  });
+
+  test("a callable-only declaration is not a constructor/type barrel", () => {
+    const root = pArtifactFixture();
+    writeFileSync(join(root, "git-dist/server/pipe-history-runtime.d.ts"), "export declare const NewarchV2Display: () => void;\nexport type NewarchV2Display = number;\n");
+    expect(() => assertRuntimeDisplayExport(root)).toThrow("NewarchV2Display");
+  });
+
+  test("a wrong instance alias is rejected even when the value is constructible", () => {
+    const root = pArtifactFixture();
+    writeFileSync(join(root, "git-dist/server/pipe-history-runtime.d.ts"), "declare class Display { select(): string; }\nexport declare const NewarchV2Display: typeof Display;\nexport type NewarchV2Display = number;\n");
+    expect(() => assertRuntimeDisplayExport(root)).toThrow("NewarchV2Display");
+  });
+
+  test("discarded result, void callbacks and inherited subclass compile against both surfaces", () => {
+    expect(createHash("sha256").update(P_GEOMETRY_0205).digest("hex"))
+      .toBe(P_GEOMETRY_EXCERPT_SHA256);
+    const root = fixture("0.20.5");
+    const baseline = join(root, "geometry.d.ts");
+    writeFileSync(baseline, P_GEOMETRY_0205);
+    for (const file of [baseline, resolve(import.meta.dir, "../git-dist/server/index.d.ts")]) {
+      expect(pCompileConsumer(P_GEOMETRY_CALLER, { "thumbmux/server": file })).toEqual([]);
+    }
+    expect(pCompileConsumer(P_GEOMETRY_OVERRIDE, { "thumbmux/server": baseline })).toEqual([]);
+    const errors = pCompileConsumer(P_GEOMETRY_OVERRIDE, {
+      "thumbmux/server": resolve(import.meta.dir, "../git-dist/server/index.d.ts"),
+    });
+    expect(errors.map(({ code }) => code)).toEqual([2416, 2416]);
+    expect(errors[0]!.text).toContain("handleResize");
+    expect(errors[1]!.text).toContain("applyGeometry");
+  });
+
+  test(".21 WJ host also consumes the NEWARCH public constructor", () => {
+    const source = P_WJ_CONSUMER + `
+      import { NewarchV2Display } from "thumbmux/pipe-history-runtime";
+      declare const display: NewarchV2Display;
+      const ctor: typeof NewarchV2Display = NewarchV2Display;
+      void [display, ctor];
+    `;
+    expect(pCompileConsumer(source, {
+      "thumbmux/app": resolve(import.meta.dir, "../git-dist/app/index.d.ts"),
+      "thumbmux/pipe-history-runtime": resolve(import.meta.dir, "../git-dist/server/pipe-history-runtime.d.ts"),
+    })).toEqual([]);
+  });
+
+  test("missing immutable baseline remains an error, including the old skip environment", () => {
+    expect(resolveBaselineMode({}).error).toBeTruthy();
+    expect(resolveBaselineMode({ THUMBMUX_CONTRACT_BASELINE: "skip" }).error).toBeTruthy();
   });
 });

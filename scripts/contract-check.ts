@@ -1778,6 +1778,57 @@ export function evaluateBaseline(
   return { errors, warnings, summaries };
 }
 
+/** Narrow artifact guard for the optional runtime subpath. This does not turn
+ * the runtime's other exports into a new frozen manifest. Reading declarations
+ * and JS here is static; inertness is proved separately by the runner. */
+export function assertRuntimeDisplayExport(packageRoot = PACKAGE_ROOT): void {
+  const name = "NewarchV2Display";
+  const fail = (detail: string): never => { throw new Error(`runtime ${name}: ${detail}`); };
+  const pkg = JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf8")) as {
+    exports?: Record<string, { types?: string; import?: string }>;
+  };
+  const subpath = pkg.exports?.["./pipe-history-runtime"];
+  const artifactPath = (target: string | undefined, extension: string): string => {
+    if (typeof target !== "string") return fail(`public subpath lacks ${extension} target`);
+    const aggregate = target.replace(/^\.\/([^/]+)\/dist\//, "./git-dist/$1/");
+    if (aggregate !== `./git-dist/server/pipe-history-runtime.${extension}`) {
+      return fail(`unexpected public target ${target}`);
+    }
+    return resolve(packageRoot, aggregate);
+  };
+  for (const [path, javascript] of [
+    [artifactPath(subpath?.types, "d.ts"), false],
+    [artifactPath(subpath?.import, "js"), true],
+  ] as const) {
+    const program = ts.createProgram([path], { ...compilerOptions(), allowJs: javascript });
+    const source = program.getSourceFile(path);
+    if (!source) return fail(`missing built artifact ${path}`);
+    const checker = program.getTypeChecker();
+    const module = checker.getSymbolAtLocation(source);
+    const exported = module && checker.getExportsOfModule(module).find((symbol) => symbol.name === name);
+    if (!exported) return fail(`missing ${javascript ? "JS value" : "declaration"} export`);
+    const symbol = resolveAlias(checker, exported);
+    const location = symbol.valueDeclaration ?? symbol.declarations?.[0];
+    if (!location || !(symbol.flags & ts.SymbolFlags.Value)) return fail("export is not a value");
+    const value = checker.getTypeOfSymbolAtLocation(symbol, location);
+    const constructors = checker.getSignaturesOfType(value, ts.SignatureKind.Construct);
+    if (!constructors.length) return fail(`export is not constructible in ${path}`);
+    if (!javascript) {
+      if (!(symbol.flags & ts.SymbolFlags.Type)) return fail("missing instance type export");
+      const declared = checker.getDeclaredTypeOfSymbol(symbol);
+      if (declared.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return fail("unresolved instance type");
+      for (const ctor of constructors) {
+        const instance = checker.getReturnTypeOfSignature(ctor);
+        if (instance.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)
+          || !checker.isTypeAssignableTo(instance, declared)
+          || !checker.isTypeAssignableTo(declared, instance)) {
+          return fail("constructor result and exported instance type disagree");
+        }
+      }
+    }
+  }
+}
+
 /** Run the checked-in surface gate against a built package root. */
 export function checkContract(options: ContractCheckOptions = {}): ContractCheckResult {
   const packageRoot = resolve(options.packageRoot ?? PACKAGE_ROOT);
@@ -1791,6 +1842,7 @@ export function checkContract(options: ContractCheckOptions = {}): ContractCheck
   const parity = options.validateExportParity === false
     ? undefined
     : assertGitDistExportParity(packageRoot, packageRoot);
+  if (options.validateExportParity !== false) assertRuntimeDisplayExport(packageRoot);
   const live = deriveGitDistReport(packageRoot, subpackages, parity);
   const manifests: Record<PublicSubpackage, ContractEntry[]> = {
     core: [],
