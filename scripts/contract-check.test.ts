@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import ts from "typescript";
+import { createHash } from "node:crypto";
 import {
   checkContract,
   deriveGitDistReport,
@@ -1433,4 +1435,102 @@ describe("0.20.5 reviewed NEWARCH v2 TmuxWsMux graph", () => {
         .toEqual(expect.arrayContaining([expect.objectContaining({ code: "baseline-protected-removal" })]));
     });
   }
+});
+
+// P: verbatim declaration excerpts from v0.21.0-dist, immutable commit
+// f057decc360b007907dfafdf56ec1efb9f7079fa, git-dist/app/config.d.ts.
+// AppAdapters includes only the two WJ members under test; other interfaces
+// are complete. This is an offline excerpt fixture, not a whole-package copy.
+const P_WJ_0210_DECLARATIONS = "export interface SubmissionReceipt {\n    status: 'sent' | 'rejected' | 'uncertain';\n    submissionId?: string;\n    reason?: string;\n}\nexport interface PromptEntry {\n    text: string;\n    source: 'ui' | 'screen';\n    state?: 'sent' | 'uncertain';\n    submissionId?: string;\n}\nexport interface AppLabels {\n    hubTitle: string;\n    hubCount: (count: number) => string;\n    gridNew: string;\n    gridEmpty: string;\n    gridLoading: string;\n    gridAll: string;\n    gridSearchLabel: string;\n    gridSearchPlaceholder: string;\n    gridGroup: string;\n    gridUngrouped: string;\n    launchTitle: string;\n    launchHint: string;\n    launchContext: string;\n    launchPermission: string;\n    launchModel: string;\n    launchAction: string;\n    launchBusy: string;\n    /** Takes the message so a host can replace the whole line, not just a\n     * prefix. Mirrors `uploadFailed`, which already worked this way. */\n    launchFailed: (message: string) => string;\n    hudBack: string;\n    hudChip: string;\n    hudConnected: string;\n    hudOffline: string;\n    terminalAria: (session: string) => string;\n    fabAria: string;\n    actionType: string;\n    actionUpload: string;\n    actionUploading: string;\n    actionDpad: string;\n    actionCopy: string;\n    actionShortcuts: string;\n    actionTheme: string;\n    actionFontUp: string;\n    actionFontDown: string;\n    scrollNewContent: string;\n    scrollBottom: string;\n    uploadFailed: (message: string) => string;\n    noteEmpty: string;\n    noteEdit: string;\n    noteSave: string;\n    noteCancel: string;\n    promptsTitle: string;\n    promptsLoading: string;\n    promptsEmpty: string;\n    /** Heading over exact rows sent from the UI (`PromptEntry.source: 'ui'`). */\n    promptSourceUi?: string;\n    /** Heading over rows rebuilt from the terminal screen. */\n    promptSourceScreen?: string;\n    /** Badge on a `ui` row whose delivery is unknown. */\n    promptUncertain?: string;\n    /** Shown after `submitText` reports `uncertain` (or rejects) and the draft\n     * has been put back. */\n    submissionUncertain?: string;\n    shortcutsTitle: string;\n    shortcutAdd: string;\n    shortcutLabel: string;\n    shortcutSend: string;\n    shortcutDelete: string;\n    shortcutUp: string;\n    shortcutDown: string;\n    themeTitle: string;\n    themeBackground: string;\n    themeDark: string;\n    themeLight: string;\n    themeDefault: string;\n    themeCustom: string;\n    composerCompose: string;\n    composerDirect: string;\n    composerHintCompose: string;\n    composerHintDirect: string;\n    composerPlaceholder: string;\n    composerSend: string;\n    composerDirectAria: string;\n    close: string;\n}\nexport interface AppAdapters {\n    submitText?: (session: string, text: string) => Promise<SubmissionReceipt>;\n    promptEntries?: (session: string) => Promise<PromptEntry[] | null>;\n}\n";
+const P_WJ_0210_EXCERPT_SHA256 = "3f7d84b0e3968e7f60c91b2a161ae0d9b5f8de9c1e6bf711da9da4e9a3ea9325";
+
+const P_WJ_CONSUMER = String.raw`
+import type { AppAdapters, AppLabels, PromptEntry, SubmissionReceipt } from "thumbmux/app";
+const receipt: SubmissionReceipt = { status: "uncertain", submissionId: "h-1" };
+const entries: PromptEntry[] = [{ text: "first\n\n  second", source: "ui", state: "sent" }];
+const optedIn: AppAdapters = {
+  submitText: async (_session, _text) => receipt,
+  promptEntries: async () => entries,
+};
+const absent: AppAdapters = {};
+const unavailable: AppAdapters = { promptEntries: async () => null };
+type NewLabels = "promptSourceUi" | "promptSourceScreen" | "promptUncertain" | "submissionUncertain";
+declare const legacyLabels: Omit<AppLabels, NewLabels>;
+const stillValid: AppLabels = legacyLabels;
+void [optedIn, absent, unavailable, stillValid];
+`;
+
+function pCompileConsumer(source: string, entries: Record<string, string>) {
+  // Virtual consumer only: built declarations are read from disk. No product
+  // module is imported or executed and no compiler subprocess/network is used.
+  const entry = resolve(import.meta.dir, "p-consumer.fixture.ts");
+  const options: ts.CompilerOptions = {
+    strict: true, noEmit: true, skipLibCheck: true, types: [],
+    target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    paths: Object.fromEntries(Object.entries(entries).map(([key, value]) => [key, [value]])),
+  };
+  const host = ts.createCompilerHost(options);
+  const originalRead = host.readFile.bind(host);
+  const originalExists = host.fileExists.bind(host);
+  const originalSource = host.getSourceFile.bind(host);
+  host.readFile = (file) => file === entry ? source : originalRead(file);
+  host.fileExists = (file) => file === entry || originalExists(file);
+  host.getSourceFile = (file, languageVersion, onError, shouldCreate) => file === entry
+    ? ts.createSourceFile(file, source, languageVersion, true)
+    : originalSource(file, languageVersion, onError, shouldCreate);
+  const program = ts.createProgram([entry], options, host);
+  return ts.getPreEmitDiagnostics(program).map((diagnostic) => ({
+    code: diagnostic.code,
+    text: ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+  }));
+}
+
+function pWjExcerpt(): string {
+  const root = fixture("0.21.0");
+  const file = join(root, "wj.d.ts");
+  writeFileSync(file, P_WJ_0210_DECLARATIONS);
+  return file;
+}
+
+describe("P .21 WJ consumer contract", () => {
+  test("pinned offline .21 excerpts compile the host's WJ and legacy-label shapes", () => {
+    expect(createHash("sha256").update(P_WJ_0210_DECLARATIONS).digest("hex"))
+      .toBe(P_WJ_0210_EXCERPT_SHA256);
+    expect(pCompileConsumer(P_WJ_CONSUMER, { "thumbmux/app": pWjExcerpt() })).toEqual([]);
+  });
+
+  test("current built public app barrel retains WJ types and optional adapters/labels", () => {
+    expect(pCompileConsumer(P_WJ_CONSUMER, {
+      "thumbmux/app": resolve(import.meta.dir, "../git-dist/app/index.d.ts"),
+    })).toEqual([]);
+  });
+
+  test("removing the public receipt fails by its export name, not by missing setup", () => {
+    const file = pWjExcerpt();
+    writeFileSync(file, P_WJ_0210_DECLARATIONS.replace("export interface SubmissionReceipt", "interface SubmissionReceipt"));
+    const diagnostics = pCompileConsumer(P_WJ_CONSUMER, { "thumbmux/app": file });
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatchObject({ code: 2459 });
+    expect(diagnostics[0]!.text).toContain("SubmissionReceipt");
+  });
+
+  test("making the new adapter required breaks the absent-adapter host", () => {
+    const file = pWjExcerpt();
+    writeFileSync(file, P_WJ_0210_DECLARATIONS.replace("submitText?:", "submitText:"));
+    const diagnostics = pCompileConsumer(P_WJ_CONSUMER, { "thumbmux/app": file });
+    expect(diagnostics.map(({ code }) => code)).toEqual([2741, 2741]);
+    expect(diagnostics.every(({ text }) => text.includes("submitText"))).toBe(true);
+  });
+
+  test("receipt state and prompt payload types reject unrelated strings", () => {
+    const diagnostics = pCompileConsumer(`
+      import type { SubmissionReceipt, PromptEntry } from "thumbmux/app";
+      const receipt: SubmissionReceipt = { status: "maybe" };
+      const prompt: PromptEntry = { text: 42, source: "ui" };
+    `, { "thumbmux/app": pWjExcerpt() });
+    expect(diagnostics.map(({ code }) => code)).toEqual([2322, 2322]);
+    expect(diagnostics[0]!.text).toContain("maybe");
+    expect(diagnostics[1]!.text).toContain("number");
+  });
 });

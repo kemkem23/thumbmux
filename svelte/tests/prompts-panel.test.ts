@@ -342,3 +342,74 @@ describe("collapsible disclosure", () => {
     expect(target.querySelector(".pnone")).not.toBeNull();
   });
 });
+
+describe("WJ-A structured prompt entries", () => {
+  const SCREEN_LABEL = "from screen — check line breaks before sending";
+
+  function sectionOf(row: Element): string | null {
+    return row.closest('[data-testid="prompt-section"]')?.getAttribute("data-source") ?? null;
+  }
+
+  test("ui entries come first, the screen label marks only the screen row, and pick returns exact text", async () => {
+    const picked: string[] = [];
+    const { target } = mountPromptsPanel({
+      entries: [
+        { text: "a\n\n  b", source: "ui", state: "sent" },
+        { text: "x y z", source: "screen" },
+      ],
+      onPick: (prompt) => picked.push(prompt),
+    });
+    await tick();
+
+    const rows = Array.from(
+      target.querySelectorAll<HTMLButtonElement>('[data-testid="prompt-item"]'),
+    );
+    const screenLabels = Array.from(
+      target.querySelectorAll('[data-testid="prompt-source-label"]'),
+    ).filter((label) => label.textContent?.trim() === SCREEN_LABEL);
+    expect({
+      rows: rows.map((row) => row.textContent),
+      sections: rows.map(sectionOf),
+      screenLabels: screenLabels.length,
+      screenLabelSection: screenLabels.map(sectionOf),
+    }).toEqual({
+      rows: ["a\n\n  b", "x y z"],
+      sections: ["ui", "screen"],
+      screenLabels: 1,
+      screenLabelSection: ["screen"],
+    });
+
+    flushSync(() => rows[0]!.click());
+    flushSync(() => rows[1]!.click());
+    await tick();
+    expect(picked).toEqual(["a\n\n  b", "x y z"]);
+  });
+
+  test("an empty section renders no heading and an uncertain badge stays out of the payload", async () => {
+    const picked: string[] = [];
+    const { target } = mountPromptsPanel({
+      entries: [{ text: "  keep\tthis  ", source: "ui", state: "uncertain" }],
+      onPick: (prompt) => picked.push(prompt),
+    });
+    await tick();
+
+    const sections = Array.from(target.querySelectorAll('[data-testid="prompt-section"]'))
+      .map((section) => section.getAttribute("data-source"));
+    expect(sections).toEqual(["ui"]);
+    expect(target.querySelectorAll('[data-testid="prompt-state"]')).toHaveLength(1);
+
+    const row = target.querySelector<HTMLButtonElement>('[data-testid="prompt-item"]')!;
+    expect(row.textContent).toBe("  keep\tthis  ");
+    flushSync(() => row.click());
+    await tick();
+    expect(picked).toEqual(["  keep\tthis  "]);
+  });
+
+  test("an empty entries array shows the empty state, not the legacy prompts", async () => {
+    const { target } = mountPromptsPanel({ entries: [], prompts: ["legacy-only"] });
+    await tick();
+    expect(target.querySelectorAll('[data-testid="prompt-item"]')).toHaveLength(0);
+    expect(target.querySelectorAll('[data-testid="prompt-section"]')).toHaveLength(0);
+    expect(target.querySelector(".pnone")?.textContent).toBe("no prompts found yet");
+  });
+});

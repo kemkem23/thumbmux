@@ -26,6 +26,41 @@ export type SubmissionTransport = (
   keys: string,
 ) => void | Promise<void>;
 
+/** Outcome of one host-owned semantic submission (`AppAdapters.submitText`).
+ *
+ * - `sent`: the host delivered the whole text; the shell behaves exactly as a
+ *   successful step-by-step submission (the draft stays cleared).
+ * - `rejected`: the host refused before any byte reached the terminal; the
+ *   shell restores the draft so the user can edit or resend.
+ * - `uncertain`: delivery may or may not have happened (for example the
+ *   transport failed after it started). The shell restores the draft, shows
+ *   `AppLabels.submissionUncertain`, and never retries on its own.
+ *
+ * `submissionId` belongs to the host; the shell neither creates nor reads it. */
+export interface SubmissionReceipt {
+  status: 'sent' | 'rejected' | 'uncertain';
+  submissionId?: string;
+  reason?: string;
+}
+
+/** One recent-prompt row from a host that can tell exact text apart from a
+ * screen scrape (`AppAdapters.promptEntries`).
+ *
+ * - `source: 'ui'`: the exact text a COMPOSE submission sent through the host.
+ *   `state` is `'sent'` or `'uncertain'` (delivery unknown).
+ * - `source: 'screen'`: text reconstructed from the terminal screen; an agent's
+ *   own line wrapping may have joined or split lines, so it is labelled for the
+ *   user to check before resending.
+ *
+ * There is deliberately no timestamp: rows arrive already ordered newest first
+ * within each source. `submissionId` is the host's own id, passed through. */
+export interface PromptEntry {
+  text: string;
+  source: 'ui' | 'screen';
+  state?: 'sent' | 'uncertain';
+  submissionId?: string;
+}
+
 /** Optional presentation choices for the hub's grid and launcher. Omitted
  * members retain the presentation components' stock defaults. Hub launcher
  * color mode remains on `AppAdapters.theme.mode`, alongside the shell's other
@@ -177,6 +212,18 @@ export interface AppAdapters {
    * delay. Absent, submissions retain the existing `sendKeys` transport and
    * timer sequence. */
   sendSubmissionKeys?: SubmissionTransport;
+  /** Deliver one COMPOSE draft as a single host-owned semantic submission.
+   *
+   * When present, `SessionView` and `EmbedView` call this exactly once per
+   * COMPOSE send with the string ComposerDock produced (ends trimmed, inner
+   * blank lines and indentation intact) and do **not** also run the
+   * `submitPlan` steps through `sendSubmissionKeys` / `sendKeys` for that send.
+   * See `SubmissionReceipt` for how each status is handled; a rejected promise
+   * is treated as `uncertain`. The host owns submission ids and any retry.
+   *
+   * DIRECT input, raw keys, shortcut sends, and `SessionActionContext.submit`
+   * keep the step path. Absent, COMPOSE behaves exactly as before. */
+  submitText?: (session: string, text: string) => Promise<SubmissionReceipt>;
   submitAgent?: (session: string) => SubmitAgent;
   routes?: {
     openSession(name: string): void;
@@ -205,6 +252,12 @@ export interface AppAdapters {
     save(session: string, text: string): Promise<void>;
   };
   prompts?: (session: string) => Promise<string[]>;
+  /** Structured recent prompts. An array (including `[]`) is authoritative:
+   * the shell renders it in two sections — exact `ui` rows first, then
+   * labelled `screen` rows — and does not call `prompts`. Resolving `null`
+   * means the host's server cannot answer yet; the shell then falls back to
+   * `prompts` and renders it exactly as before, without source labels. */
+  promptEntries?: (session: string) => Promise<PromptEntry[] | null>;
   /** Summarize completed, high-confidence Claude Bash blocks which TermView
    * has determined are visible. The host owns the model, durable cache, and
    * transport; this UI package never calls a model itself. Returning only a
@@ -377,6 +430,15 @@ export interface AppLabels {
   promptsTitle: string;
   promptsLoading: string;
   promptsEmpty: string;
+  /** Heading over exact rows sent from the UI (`PromptEntry.source: 'ui'`). */
+  promptSourceUi?: string;
+  /** Heading over rows rebuilt from the terminal screen. */
+  promptSourceScreen?: string;
+  /** Badge on a `ui` row whose delivery is unknown. */
+  promptUncertain?: string;
+  /** Shown after `submitText` reports `uncertain` (or rejects) and the draft
+   * has been put back. */
+  submissionUncertain?: string;
 
   shortcutsTitle: string;
   shortcutAdd: string;
@@ -455,6 +517,10 @@ export const DEFAULT_APP_LABELS = Object.freeze({
   promptsTitle: 'RECENT PROMPTS — tap to edit/resend',
   promptsLoading: 'scanning…',
   promptsEmpty: 'no prompts found yet',
+  promptSourceUi: 'sent from this UI',
+  promptSourceScreen: 'from screen — check line breaks before sending',
+  promptUncertain: 'delivery unknown',
+  submissionUncertain: 'Not sure it was sent — your draft is back. Check the terminal before resending.',
 
   shortcutsTitle: 'SHORTCUTS',
   shortcutAdd: '+ add',
@@ -480,4 +546,4 @@ export const DEFAULT_APP_LABELS = Object.freeze({
   composerDirectAria: 'Send keys directly to the terminal',
 
   close: 'Close',
-} satisfies AppLabels);
+} satisfies Required<AppLabels>);
