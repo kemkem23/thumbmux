@@ -20,12 +20,16 @@
     fontPx = undefined,
     minRows = 14,
     claimGeometry = false,
+    /** Birth geometry of a NEWARCH pane. When set the font fits these columns
+     * (`fontPx` / `?font=` stays the ceiling) and nothing is ever resized. */
+    fixedGeometry = null,
   }: {
     session: string;
     adapters: AppAdapters;
     fontPx?: number;
     minRows?: number;
     claimGeometry?: boolean;
+    fixedGeometry?: { columns: number; rows: number } | null;
   } = $props();
 
   let labels = $derived<Required<AppLabels>>({ ...DEFAULT_APP_LABELS, ...adapters.labels });
@@ -166,7 +170,8 @@
           {palette}
           fontPx={effectiveFontPx}
           {minRows}
-          {claimGeometry}
+          claimGeometry={fixedGeometry ? false : claimGeometry}
+          {fixedGeometry}
           altScreenMouse={configuredTermProps.altScreenMouse ?? false}
           bottomInsetPx={dockFull + kbInset}
           onKeys={sendKeys}

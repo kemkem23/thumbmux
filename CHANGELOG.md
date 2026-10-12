@@ -1,35 +1,94 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.21.0-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
 
-## v0.21.0 — 2026-10-07
+## v0.22.0 — unreleased
 
-### Added — exact COMPOSE submit and structured prompt history (WRAPJOINED WJ-A)
+This candidate combines the NEWARCH v2 additions below with the WJ consumer
+surface already released in v0.21.0. It does not enable stream-first operation.
+Root/UI consumer pins remain v0.21.0-dist until PUB and R-PIN finish the release.
 
-Additive; every new member is optional and a host that supplies neither keeps
-v0.20.5 behavior byte for byte.
+- app: preserve public `SubmissionReceipt` / `PromptEntry`, optional
+  `submitText` / `promptEntries`, and the four optional labels. Semantic COMPOSE
+  submission is sent once; uncertain delivery restores the draft and shows a
+  notice without retrying. The absent-adapter submit/load/settle path is kept.
+- svelte: preserve structured prompt sections, authoritative empty entries and
+  exact pick payloads; source headings and delivery badges are not sent back.
+- server: expose `NewarchV2Display` as both constructor and instance type from
+  `thumbmux/pipe-history-runtime`, using aliases for the Bun barrel workaround.
+- contract: compare separately against immutable .20.5 and .21 declarations.
+  The return-type edge below affects both baselines: void-returning overrides
+  must be adapted. Representative consumer and artifact assertions are written
+  but await review and runner execution; build/typecheck are not that proof.
+- validation debt: T, RF01, monitoring/integration and public CI remain open.
+  History continuity, fresh flag-off behavior, existing-owner compatibility and
+  exact-runtime receipts remain gates before ON; this release work grants no ON.
 
-- **`AppAdapters.submitText(session, text) → Promise<SubmissionReceipt>`** —
-  `SessionView` and `EmbedView` hand a COMPOSE draft to the host as one string
-  (exactly what ComposerDock produced: ends trimmed, inner blank lines and
-  indentation intact) and do not also run the `submitPlan` steps for it.
-  `sent` clears the draft as before; `rejected` restores it; `uncertain` or a
-  rejected promise restores it and shows `labels.submissionUncertain`. No
-  automatic retry. DIRECT input, raw keys, shortcut sends and
-  `SessionActionContext.submit` are unchanged.
-- **`AppAdapters.promptEntries(session) → Promise<PromptEntry[] | null>`** — an
-  array (including `[]`) replaces `prompts`; `null` falls back to `prompts`.
-- **`PromptsPanel` `entries` prop** — exact `ui` rows first, then `screen` rows
-  labelled "from screen — check line breaks before sending"; empty sections
-  have no heading; labels and the uncertain badge are separate elements, so a
-  pick returns `entry.text` byte for byte. The `prompts` prop is unchanged.
-- **Types** `SubmissionReceipt` and `PromptEntry` from `thumbmux/app` (barrel) and `thumbmux/app/config`.
-- **Labels** `promptSourceUi`, `promptSourceScreen`, `promptUncertain`,
-  `submissionUncertain` — optional `AppLabels` keys with English defaults, so a
-  host that declares the full v0.20.5 `AppLabels` set still compiles.
 
-Contract details (id ownership, statuses, `null` vs `[]`): `docs/app.md` §2.5.
+- server: history page() v2 measures page bytes once per entry (linear); payloadBytes and the byte cut are unchanged byte for byte.
+- server: NewarchV2Display checks v2 page order the way H writes it: rotated segments whose digest sorts lower and a stop incident at its frontier row are no longer integrity errors; rows back or repeated inside a segment, a return to a segment already left, a misplaced incident and a repeated incident are still refused.
+
+NEWARCH v2 is included in this candidate, not in 0.20.5 or 0.21.0.
+Flag-on is not production-ready.
+
+### Compatibility — 0.x breaking edges
+
+The 0.22 minor deliberately accepts these exact declaration changes from both
+0.20.5 and 0.21.0. It does not promise source compatibility for every consumer:
+
+- `MuxClientMessage` / `MuxStrictClientMessage` gain `history_expand_v2`.
+  `MuxAuthSuccess.operation`, and therefore `MuxAuthResult`, `TokenGuard` and
+  `createTokenGuard`, also gain it. Exhaustive switches and closed operation
+  maps must handle the new member. Old request shapes remain accepted.
+- `TmuxWsMux` changes the return of `handleResize` / `applyGeometry` from `void`
+  to `NewarchV2GeometryReply | null`. Overrides declared `: void` must change
+  (return `null` on the legacy path). `AppRoutes`, `AppRoutesOptions` and
+  `createAppRoutes` inherit the mux graph change; their own declarations are
+  unchanged. Optional owner/history hooks do not require existing hosts to
+  supply them. Discarded-return callers and void callbacks have pending
+  baseline/current compilation fixtures, not an executed compatibility claim.
+- `TmuxMux` / `tmuxMux` add `newarchV2Pane`, `requestHistoryV2` and
+  `cancelHistoryV2`, with private request state. Existing methods retain their
+  declarations. Subclasses with colliding method names can break; mixing
+  nominal class instances from different releases is not supported. The graph
+  reaches `createSessionsStore`, `AppAdapters` and the app component props.
+- `TermView` adds optional NEWARCH props. WJ `AppLabels` adds four optional
+  keys; `DEFAULT_APP_LABELS` supplies them. `PromptsPanel`, `SubmissionReceipt`
+  and `PromptEntry` preserve the already released .21 declarations. No existing
+  frozen names or stability tiers are removed or weakened.
+
+The ten newly registered core wire names are `NEWARCH_V2_WIRE_LIMITS`,
+`newarchV2SamePane`, `newarchV2CursorFor`, `newarchV2ReplyMatches`,
+`NewarchV2HistoryExpandMessage`, `NewarchV2HistoryReply`,
+`NewarchV2HistoryErrorCode`, `NewarchV2WireCell`, `NewarchV2WireRow` and
+`NewarchV2WireEntry` (tier S). They are shared client/server protocol contracts;
+local entry, UTF-8 and bounds helpers remain unexported.
+
+### Added — NEWARCH v2 surface (tier S, opt-in; not in 0.20.5)
+
+- `@thumbmux/core` exports the NEWARCH v2 protocol types and helpers
+  (`NEWARCH_V2_SCHEMA`, `NEWARCH_V2_CAPABILITIES`, `supportsNewarchV2`,
+  `NewarchV2PaneDescriptor`, `NewarchV2PaneSelection`, `NewarchV2GeometryReply`,
+  `NewarchV2HistoryCursor`, `NewarchV2Incident` and related names). They are
+  stability tier S: covered by the contract check, not frozen like tier F.
+- `TmuxWsMuxOptions.newarchV2?` (optional) lets the host name the owner of a
+  session. When set, session-list rows carry the owner's selection, and an
+  owned pane keeps its birth geometry: `handleResize` / `applyGeometry` do not
+  resize it and return the fixed geometry. Without the option nothing changes.
+- **Compatibility note:** `TmuxWsMux.handleResize` and `applyGeometry` now
+  return `NewarchV2GeometryReply | null` (was `void`). Callers that ignore the
+  result, store the method in a `void`-returning slot, or subclass without
+  overriding have baseline/current compilation fixtures awaiting the runner. A
+  subclass that overrides either method with a `: void` return type no longer
+  type-checks and must return `null`.
+- `TermView` gains optional `fixedGeometry`, `fitWidth` and `v2StatusText`
+  props: a fixed-size pane is scaled to the viewport instead of resized, and an
+  incident sentence can be shown without a live pane. `SessionView` does not
+  claim geometry for a pane whose owner is fixed or could not be resolved.
+- The history window keeps flag-on edges pageable while a read is pending,
+  gapped or remote, and shows flag-on states as notes beside the rows, never as
+  terminal text.
 
 ## v0.20.5 — 2026-10-04
 

@@ -2,7 +2,7 @@
  * I supplies shared worker J transport and sealed source tap/spool adapters.
  * Runtime acceptance is not established; see lot C REPORT.md. */
 import {
-  STREAM_BUDGET as B, streamDigest, streamCanonical,
+  STREAM_BUDGET as B, streamDigest, streamCanonical, streamCanonicalEncoder,
   type AppendFinalized, type CancelToken, type CaptureEngine, type DurableInputReceipt,
   type DurableReceipt, type FinalizedRow, type FrameDelta, type GapEpisode,
   type HistoryEngine, type InputEvent, type LiveFrame, type PaneKey,
@@ -21,8 +21,11 @@ const sameIdentity = (a: StreamIdentity, b: StreamIdentity): boolean => samePane
 const size = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
 function immutable<T>(value: T): T {
   const copy = structuredClone(value);
+  const seen=new WeakSet<object>();
   function freeze(v: unknown): void {
-    if (v && typeof v === 'object') { for (const child of Object.values(v)) freeze(child); Object.freeze(v); }
+    if (v && typeof v === 'object' && !seen.has(v)) {
+      seen.add(v); for (const child of Object.values(v)) freeze(child); Object.freeze(v);
+    }
   }
   freeze(copy); return copy;
 }
@@ -887,7 +890,12 @@ export class TargetedCaptureRepair {
           start++;
         }
       }
-      if (hits[0]!.length!==1 || hits[1]!.length!==1) { yield error('unresolved-gap','expired repair anchor'); return; }
+      if (hits[0]!.length!==1 || hits[1]!.length!==1) {
+        // A view shorter than the horizon already returned every retained row.
+        // Opening a wider capture cannot add rows, so a quiet source stops here.
+        yield error('unresolved-gap', view.rowCount < horizon ? 'quiet source has no further rows' : 'expired repair anchor');
+        return;
+      }
       const from=hits[0]![0]!+before.length, end=hits[1]![0]!;
       if (end<from || !(await scope.wait(view.verify(signal)))) { yield error('unresolved-gap','unfenced repair seam'); return; }
       // No rows are published while planning; IDs start exactly at the gap fence.
@@ -1012,4 +1020,456 @@ export class CaptureCadence {
     }
     await Promise.all(tasks);
   }
+}
+
+// Q22: byte-zero decoder and pure rule evaluator. No history/legacy port, timer,
+// capture command or writer capability is available in this implementation.
+import { charCellWidth } from '@thumbmux/core';
+import {
+  NEWARCH_V2_LIMITS as V2L, NEWARCH_V2_PREFIX_LIMITS, NEWARCH_V2_DEFAULT_CONFIG,
+  v2Digest,
+  v2IncidentId, validateV2Checkpoint, validateV2Config, semanticStyleToSgr, sgrToSemanticStyle,
+  type V2Config, type V2LiveCheckpoint, type V2RuleDefinition, type V2RuleInput,
+  type V2DecodePrefix, type V2PrefixStop, type V2RuleResult, type V2RuleStamp, type RawPosition, type CommittedStreamRow,
+  type NewarchV2PaneDescriptor, type NewarchV2Incident, type VtBuffer,
+} from './stream-contract';
+import { v2ApplySgr } from './tmux-capture-normalize';
+
+type Writable<T> = { -readonly [P in keyof T]: T[P] extends readonly (infer U)[] ? Writable<U>[]
+  : T[P] extends object ? Writable<T[P]> : T[P] };
+// Only objects recursively detached and frozen here may be shared. Merely
+// Object.isFrozen(input) is insufficient: its children could remain mutable.
+const ownedImmutable = new WeakSet<object>();
+function v2Immutable<T>(value: T): T {
+  const copies = new WeakMap<object, object>();
+  function copy(v: any): any {
+    if (!v || typeof v !== 'object' || ownedImmutable.has(v)) return v;
+    const prior = copies.get(v); if (prior) return prior;
+    const out: any = Array.isArray(v) ? [] : {};
+    copies.set(v, out);
+    for (const key of Object.keys(v)) out[key] = copy(v[key]);
+    Object.freeze(out); ownedImmutable.add(out); return out;
+  }
+  return copy(value);
+}
+const V2_CODEC = 'q22-vt-1';
+const v2Equal = (a: unknown, b: unknown) => streamCanonical(a) === streamCanonical(b);
+const v2Blank = (columns: number, style: readonly number[] = []): Writable<RowContent> => {
+  const cell = v2Immutable({text:' ',width:1 as const,style});
+  return {cells: Array(columns).fill(cell),softWrap:false,wrapPad:0,uncertainFields:[]};
+};
+function v2Buffer(columns: number, rows: number): Writable<VtBuffer> {
+  const blank = v2Immutable(v2Blank(columns));
+  return {rows:Array(rows).fill(blank),cursor:{x:0,y:0,visible:true},
+    savedCursor:{x:0,y:0,visible:true},savedAttributes:[],savedModes:{},wrapPending:false};
+}
+export function v2BirthCheckpoint(pane: NewarchV2PaneDescriptor, through: RawPosition,
+  config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): V2LiveCheckpoint {
+  validateV2Config(config);
+  if (through.byteOffset !== 0 || !samePane(pane.pane,through.epoch.pane) || pane.owner !== 'capture-engine'
+    || !['reserved','active'].includes(pane.state)) throw Error('v2 requires byte-zero owned birth');
+  const {columns,rows}=pane.geometry;
+  const state: VtState = {codecVersion:V2_CODEC,geometry:{columns,rows},normal:v2Buffer(columns,rows),
+    alternate:v2Buffer(columns,rows),active:'normal',modes:{autowrap:true,origin:false,insert:false},
+    margins:{top:0,bottom:rows-1,left:0,right:columns-1},tabStops:Array.from({length:Math.floor((columns-1)/8)},(_,i)=>(i+1)*8),
+    pendingUtf8:[],pendingEscape:[],attributes:[],wrapPending:false,extensionState:''};
+  const rule={ruleId:'ordered-scroll',version:'1',configVersion:config.configVersion};
+  const cp: V2LiveCheckpoint={schema:'newarch-v2',checkpointId:v2Digest('genesis',{pane:pane.pane,through}),
+    pane:pane.pane,geometry:pane.geometry,through,replayFloor:through,revision:1,frontier:null,rule,state,
+    stateDigest:v2Digest('vt-state',state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+  validateV2Checkpoint(cp); return v2Immutable(cp);
+}
+/** Clocks are explicit: replay uses the original observation, never Date.now(). */
+export interface V2DecisionContext {
+  readonly wallMs: number; readonly clockEpoch: string;
+  /** H owner.durableRevision read under the sole writer's pane queue. Incident,
+   * seal and audit commits can advance it while the live checkpoint stays old. */
+  readonly durableRevision?: number;
+  /** I plans this from H's open segment/capacity before writing. Retain exactly
+   * this target and decision on an unknown commit outcome / lost receipt. */
+  readonly rowTarget?: {readonly segmentId:string; readonly nextRowOrdinal:number};
+}
+export function v2DecisionIncident(input: V2RuleInput, stamp: V2RuleStamp, context: V2DecisionContext,
+  reason: NewarchV2Incident['reason'], detail: string): NewarchV2Incident {
+  const cp=input.checkpoint,revision=context.durableRevision??input.checkpoint.revision;
+  return {schema:'newarch-v2',incidentId:v2IncidentId(cp.pane,v2Digest('decoder-cause',{
+    checkpoint:cp.checkpointId,offset:input.raw.start,reason,detail})),pane:cp.pane,reason,
+    frontier:cp.frontier,affected:{after:cp.frontier,through:null},openedAtWallMs:context.wallMs,
+    openedAtMonoMs:input.observedAtMonoMs,clockEpoch:context.clockEpoch,collecting:false,
+    missing:{countKind:'unknown',missingCount:null},ruleVersion:`${stamp.ruleId}@${stamp.version}`,
+    configVersion:stamp.configVersion,geometry:cp.geometry,revision:counter(revision)&&revision>=cp.revision?revision:cp.revision,
+    sourceEpoch:{attachId:cp.through.epoch.attachId,collectorIncarnation:cp.through.epoch.collectorIncarnation},
+    sourceOffset:cp.through.byteOffset,expectedDigest:null,actualDigest:null,action:'gap-and-stop',
+    evidence:{digest:v2Digest('decoder-diagnostic',detail),bytes:0,redacted:true}};
+}
+export function v2RuleTable(config: V2Config = NEWARCH_V2_DEFAULT_CONFIG): readonly V2RuleDefinition[] {
+  validateV2Config(config);
+  const definitions: V2RuleDefinition[]=([
+    ['ordered-scroll',10,'accept'],['bounded-tail',20,'defer'],['explicit-gap',30,'gap'],
+  ] as const).map(([ruleId,priority,action])=>({stamp:{ruleId,version:'1',configVersion:config.configVersion},priority,
+    preconditions:action==='gap'?[]:['identity','fixed-geometry','contiguous-bytes','known-vt','ordered-evidence'],
+    maxInputBytes:V2L.pendingBytesPerPane,maxInputRows:V2L.pendingRowsPerPane,action}));
+  for(const requested of config.rules) if(!definitions.some(d=>d.stamp.ruleId===requested.ruleId && d.stamp.version===requested.version))
+    throw Error('v2 rule is not compiled into allowlist');
+  // A selection must retain a safe terminal action; no eval or fallback to legacy.
+  if(!config.rules.some(r=>r.ruleId==='explicit-gap')) throw Error('v2 explicit-gap required');
+  return v2Immutable(definitions.filter(d=>config.rules.some(r=>r.ruleId===d.stamp.ruleId)));
+}
+
+/** One bounded transaction over a detached state. A failure discards EVERY
+ * candidate, including scrolls preceding an unsupported control in this input. */
+class V2RowBoundary extends Error {
+  constructor(readonly byteOffset:number) { super('bounded row prefix'); }
+}
+function v2Decode(state: VtState, bytes: readonly number[], maxBytes=bytes.length, maxScrollRows=Infinity,
+  acceptScroll?: (row:RowContent, offset:number, index:number)=>boolean):
+  {state:VtState;scrolls:RowContent[];offsets:number[];rowBoundary:number|null} {
+  if(state.codecVersion!==V2_CODEC || state.bufferEncoding || state.extensionState) throw Error('unsupported VT codec');
+  state=v2Immutable(state);
+  const cloneBuffer=(b:VtBuffer)=>({...b,rows:[...b.rows],cursor:{...b.cursor},savedCursor:{...b.savedCursor},
+    savedAttributes:[...b.savedAttributes],savedModes:{...b.savedModes}});
+  const s={...state,normal:cloneBuffer(state.normal),alternate:cloneBuffer(state.alternate),
+    geometry:{...state.geometry},modes:{...state.modes},margins:{...state.margins},tabStops:[...state.tabStops],
+    attributes:[...state.attributes],pendingUtf8:[...state.pendingUtf8],pendingEscape:[...state.pendingEscape]} as Writable<VtState>;
+  const {columns,rows}=s.geometry;
+  let writableRows=new WeakSet<object>();
+  let beforeByte:Writable<VtState>|null=null;
+  for(const b of [s.normal,s.alternate]) {
+    if(b.rows.length!==rows || b.rows.some(r=>r.cells.length!==columns || r.uncertainFields.length)
+      || !counter(b.cursor.x)||b.cursor.x>=columns||!counter(b.cursor.y)||b.cursor.y>=rows)
+      throw Error('invalid VT buffer');
+  }
+  const out:RowContent[]=[],offsets:number[]=[];
+  let offset=0;
+  const active=()=>s[s.active];
+  const cursor=()=>active().cursor;
+  const row=()=>{
+    const b=active(),y=cursor().y,r=b.rows[y]!;
+    if(writableRows.has(r))return r;
+    const copy={...r,cells:[...r.cells],uncertainFields:[...r.uncertainFields]};
+    writableRows.add(copy);b.rows[y]=copy;return copy;
+  };
+  const eraseStyle=()=>semanticStyleToSgr({...sgrToSemanticStyle(s.attributes),attrs:0,fg:-1});
+  const blank=()=>v2Blank(columns,eraseStyle());
+  const cancelWrap=()=>{active().wrapPending=false;s.wrapPending=false;};
+  const save=()=>{const b=active();b.savedCursor={...b.cursor};b.savedAttributes=[...s.attributes];b.savedModes={...s.modes};};
+  const restore=()=>{const b=active();b.cursor={...b.savedCursor};s.attributes=[...b.savedAttributes];s.modes={...b.savedModes};cancelWrap();};
+  const scroll=(n:number,down=false)=>{
+    const b=active(),{top,bottom}=s.margins;
+    const count=Math.min(n,bottom-top+1);
+    if(!down && s.active==='normal' && top===0 && bottom===rows-1 && out.length+count>maxScrollRows)
+      throw new V2RowBoundary(offset-1);
+    if(!down && s.active==='normal' && top===0 && bottom===rows-1 && acceptScroll) {
+      for(let k=0;k<count;k++)if(!acceptScroll(b.rows[top+k]!,offset,out.length+k))
+        throw new V2RowBoundary(offset-1);
+    }
+    for(let k=0;k<count;k++) {
+      if(down){b.rows.splice(bottom,1);b.rows.splice(top,0,blank());}
+      else {
+        const removed=b.rows.splice(top,1)[0]!; b.rows.splice(bottom,0,blank());
+        if(s.active==='normal' && top===0 && bottom===rows-1){out.push(removed);offsets.push(offset);
+          if(out.length>V2L.pendingRowsPerPane || maxScrollRows===Infinity && size(out)>V2L.pendingBytesPerPane)
+            throw Error('decoded row budget');}
+      }
+    }
+  };
+  const lf=()=>{cancelWrap();if(cursor().y===s.margins.bottom)scroll(1);else cursor().y=Math.min(rows-1,cursor().y+1);};
+  const clearCell=(r:Writable<RowContent>,x:number)=>{
+    if(r.cells[x]?.width===0 && x>0)r.cells[x-1]={text:' ',width:1,style:eraseStyle()};
+    if(r.cells[x]?.width===2 && x+1<columns)r.cells[x+1]={text:' ',width:1,style:eraseStyle()};
+    r.cells[x]={text:' ',width:1,style:eraseStyle()};
+  };
+  const erase=(r:Writable<RowContent>,from:number,to:number)=>{for(let x=from;x<=to;x++)clearCell(r,x);r.softWrap=false;r.wrapPad=0;};
+  const print=(text:string)=>{
+    const cp=text.codePointAt(0)!;
+    // Ambiguous cluster shaping is explicitly withheld, never silently shifted.
+    if(cp===0x200d || cp>=0x1f3fb && cp<=0x1f3ff || cp>=0x1f1e6 && cp<=0x1f1ff)throw Error('ambiguous emoji shaping');
+    const width=charCellWidth(cp);
+    if(width>columns)throw Error('glyph wider than pane');
+    if(width===0 || cp===0xfe0f) {
+      let x=active().wrapPending ? cursor().x : cursor().x-1;
+      if(row().cells[x]?.width===0)x--;
+      const r=row(),cell=r.cells[x];if(!cell)throw Error('orphan combining character');
+      const previous={...cell,style:[...cell.style]};r.cells[x]=previous;
+      if(Buffer.byteLength(previous.text)+Buffer.byteLength(text)>4096)throw Error('grapheme budget');
+      previous.text+=text;
+      if(cp===0xfe0f && previous.width===1){
+        if(x+1>=columns)throw Error('VS16 at right boundary');
+        clearCell(row(),x+1);previous.width=2;row().cells[x+1]={text:'',width:0,style:[...previous.style]};
+        cursor().x=Math.min(columns-1,x+2);active().wrapPending=x+2>=columns;
+      }
+      return;
+    }
+    if(active().wrapPending && s.modes.autowrap){row().softWrap=true;lf();cursor().x=0;}
+    if(width===2 && cursor().x===columns-1){
+      if(!s.modes.autowrap)throw Error('wide glyph without wrap');
+      row().softWrap=true;row().wrapPad=1;lf();cursor().x=0;
+    }
+    cancelWrap();const x=cursor().x,r=row();
+    if(s.modes.insert){if(r.cells.some(c=>c.width!==1))throw Error('insert across wide glyph');r.cells.splice(x,0,...Array.from({length:width},()=>({text:' ',width:1 as const,style:[...s.attributes]})));r.cells.length=columns;}
+    clearCell(r,x);if(width===2)clearCell(r,x+1);
+    r.cells[x]={text,width,style:[...s.attributes]};
+    if(width===2)r.cells[x+1]={text:'',width:0,style:[...s.attributes]};
+    if(x+width>=columns){cursor().x=columns-1;active().wrapPending=Boolean(s.modes.autowrap);}
+    else cursor().x+=width;
+  };
+  const csi=(sequence:string)=>{
+    const m=/^\x1b\[(\??)([0-9;:]*)([A-Za-z@`])$/.exec(sequence);if(!m)throw Error('unsupported CSI');
+    const [,privateMode,body,final]=m;
+    const args=body!.split(';').map(x=>x===''?0:Number(x)),n=args[0]||1;
+    if(args.some(x=>!Number.isSafeInteger(x)||x<0||x>65535) && final!=='m')throw Error('CSI parameter');
+    if(final==='m' && !privateMode){s.attributes=v2ApplySgr(s.attributes,body!);return;}
+    if(final==='h'||final==='l'){
+      const on=final==='h';
+      for(const mode of args){
+        if(privateMode && mode===25){s.normal.cursor.visible=s.alternate.cursor.visible=on;}
+        else if(privateMode && mode===7)s.modes.autowrap=on;
+        else if(privateMode && [1,12,1000,1002,1003,1004,1005,1006,1015,2004,2026].includes(mode))s.modes[`private-${mode}`]=on;
+        else if(privateMode && mode===6){s.modes.origin=on;cursor().x=0;cursor().y=on?s.margins.top:0;cancelWrap();}
+        else if(privateMode && [47,1047,1049].includes(mode)){
+          if(on && s.active==='normal'){if(mode===1049)save();s.alternate=v2Buffer(columns,rows);s.alternate.cursor.visible=s.normal.cursor.visible;s.active='alternate';}
+          else if(!on && s.active==='alternate'){s.active='normal';if(mode===1049)restore();}
+        } else if(!privateMode && mode===4)s.modes.insert=on;
+        else throw Error('unsupported terminal mode');
+      }return;
+    }
+    if(privateMode)throw Error('unsupported private CSI');
+    const yMin=s.modes.origin?s.margins.top:0,yMax=s.modes.origin?s.margins.bottom:rows-1;
+    if(final==='A')cursor().y=Math.max(yMin,cursor().y-n);
+    else if(final==='B'||final==='e')cursor().y=Math.min(yMax,cursor().y+n);
+    else if(final==='C'||final==='a')cursor().x=Math.min(columns-1,cursor().x+n);
+    else if(final==='D')cursor().x=Math.max(0,cursor().x-n);
+    else if(final==='G'||final==='`')cursor().x=Math.min(columns-1,n-1);
+    else if(final==='d')cursor().y=Math.min(yMax,yMin+n-1);
+    else if(final==='H'||final==='f'){cursor().y=Math.min(yMax,yMin+n-1);cursor().x=Math.min(columns-1,(args[1]||1)-1);}
+    else if(final==='E'||final==='F'){cursor().y=Math.max(yMin,Math.min(yMax,cursor().y+(final==='E'?n:-n)));cursor().x=0;}
+    else if(final==='K'){if(args[0]!>2)throw Error('erase mode');erase(row(),args[0]===0?cursor().x:0,args[0]===1?cursor().x:columns-1);}
+    else if(final==='J'){
+      if(args[0]!>2)throw Error('erase history unsupported');
+      if(args[0]===0){erase(row(),cursor().x,columns-1);for(let y=cursor().y+1;y<rows;y++)active().rows[y]=blank();}
+      else if(args[0]===1){for(let y=0;y<cursor().y;y++)active().rows[y]=blank();erase(row(),0,cursor().x);}
+      else active().rows=Array.from({length:rows},blank);
+    } else if(final==='@'||final==='P'){
+      const r=row(),count=Math.min(n,columns-cursor().x);
+      if(r.cells.some(c=>c.width!==1))throw Error('edit across wide glyph');
+      const blanks=blank().cells.slice(0,count);
+      if(final==='@'){r.cells.splice(cursor().x,0,...blanks);r.cells.length=columns;}
+      else {r.cells.splice(cursor().x,count);r.cells.push(...blanks);}
+    } else if(final==='L'||final==='M'){
+      if(cursor().y>=s.margins.top&&cursor().y<=s.margins.bottom){
+        for(let k=0;k<Math.min(n,s.margins.bottom-cursor().y+1);k++){
+          if(final==='L'){active().rows.splice(s.margins.bottom,1);active().rows.splice(cursor().y,0,blank());}
+          else {active().rows.splice(cursor().y,1);active().rows.splice(s.margins.bottom,0,blank());}
+        }
+      }
+    } else if(final==='n'||final==='c'){ return; /* terminal query, no visible mutation */ }
+    else if(final==='S')scroll(n);
+    else if(final==='T')scroll(n,true);
+    else if(final==='r'){
+      const top=n-1,bottom=(args[1]||rows)-1;if(top>=bottom || bottom>=rows)throw Error('invalid margins');
+      s.margins.top=top;s.margins.bottom=bottom;cursor().x=0;cursor().y=s.modes.origin?top:0;
+    } else if(final==='s')save();
+    else if(final==='u')restore();
+    else if(final==='X')erase(row(),cursor().x,Math.min(columns-1,cursor().x+n-1));
+    else if(final==='g'){if(args[0]===0)s.tabStops=s.tabStops.filter(x=>x!==cursor().x);else if(args[0]===3)s.tabStops=[];else throw Error('tab mode');}
+    else throw Error('unsupported CSI action');
+    cancelWrap();
+  };
+  try { for(let i=0;i<Math.min(bytes.length,maxBytes);i++){
+    const byte=bytes[i]!;offset=i+1;
+    if(!Number.isInteger(byte)||byte<0||byte>255)throw Error('invalid byte');
+    // Only a scrolling byte can hit a boundary. Snapshot its small metadata
+    // and row vectors; subsequent cell edits use copy-on-write.
+    if(maxScrollRows!==Infinity && (byte===10||byte===11||byte===12||s.pendingEscape.length>0||active().wrapPending||cursor().x===columns-1)) {
+      beforeByte={...s,normal:cloneBuffer(s.normal),alternate:cloneBuffer(s.alternate),
+        modes:{...s.modes},margins:{...s.margins},tabStops:[...s.tabStops],attributes:[...s.attributes],
+        pendingUtf8:[...s.pendingUtf8],pendingEscape:[...s.pendingEscape]} as Writable<VtState>;
+      writableRows=new WeakSet<object>();
+    }
+    if(s.pendingEscape.length){
+      s.pendingEscape.push(byte);if(s.pendingEscape.length>4096)throw Error('escape budget');
+      const p=s.pendingEscape;
+      if(p.length===2 && byte===0x5b)continue;
+      if(p.length===2 && byte===0x5d)continue;
+      if(p[1]===0x5b){if(byte<0x40||byte>0x7e)continue;csi(String.fromCharCode(...p));}
+      else if(p[1]===0x5d){
+        if(byte!==7 && !(byte===0x5c&&p.at(-2)===0x1b))continue;
+        const osc=String.fromCharCode(...p);
+        if(!/^\x1b\](0|1|2);/.test(osc))throw Error('unsupported OSC semantics');
+      } else if(p.length===2){
+        if(byte===0x37)save();else if(byte===0x38)restore();else if(byte===0x44)lf();
+        else if(byte===0x45){lf();cursor().x=0;}else if(byte===0x4d){if(cursor().y===s.margins.top)scroll(1,true);else cursor().y=Math.max(0,cursor().y-1);}
+        else if(byte===0x63){
+          const fresh=v2Buffer(columns,rows);s.normal=fresh;s.alternate=v2Buffer(columns,rows);s.active='normal';
+          s.attributes=[];s.modes={autowrap:true,origin:false,insert:false};s.margins={top:0,bottom:rows-1,left:0,right:columns-1};
+          s.tabStops=Array.from({length:Math.floor((columns-1)/8)},(_,i)=>(i+1)*8);
+        }
+        else if(byte===0x48){if(!s.tabStops.includes(cursor().x))s.tabStops.push(cursor().x);s.tabStops.sort((a,b)=>a-b);}
+        else throw Error('unsupported escape');
+      }
+      s.pendingEscape=[];continue;
+    }
+    if(s.pendingUtf8.length || byte>=0x80){
+      s.pendingUtf8.push(byte);const first=s.pendingUtf8[0]!;
+      const needed=first>=0xc2&&first<=0xdf?2:first>=0xe0&&first<=0xef?3:first>=0xf0&&first<=0xf4?4:0;
+      if(!needed || s.pendingUtf8.slice(1).some(b=>(b&0xc0)!==0x80))throw Error('invalid UTF-8');
+      if(s.pendingUtf8.length<needed)continue;
+      print(new TextDecoder('utf-8',{fatal:true}).decode(Uint8Array.from(s.pendingUtf8)));s.pendingUtf8=[];continue;
+    }
+    if(byte===0x1b){s.pendingEscape=[byte];continue;}
+    if(byte===13){cursor().x=0;cancelWrap();}
+    else if(byte===10||byte===11||byte===12)lf();
+    else if(byte===8){cursor().x=Math.max(0,cursor().x-1);cancelWrap();}
+    else if(byte===9){cursor().x=s.tabStops.find(x=>x>cursor().x)??columns-1;cancelWrap();}
+    else if(byte===0||byte===7){} else if(byte<32||byte===127)throw Error('unsupported control');
+    else print(String.fromCharCode(byte));
+  }} catch(cause) {
+    if(cause instanceof V2RowBoundary){
+      if(!beforeByte)throw Error('missing byte boundary snapshot');
+      beforeByte.wrapPending=beforeByte[beforeByte.active].wrapPending;
+      return {state:beforeByte,scrolls:out,offsets,rowBoundary:cause.byteOffset};
+    }
+    throw cause;
+  }
+  s.wrapPending=active().wrapPending;
+  return {state:s,scrolls:out,offsets,rowBoundary:null};
+}
+
+export type V2PrefixEvaluation = V2DecodePrefix | Extract<V2RuleResult,{kind:'gap'}>;
+
+/** Decode a bounded prefix once. A scrolling byte is transactional: either
+ * all its rows fit or its pre-byte snapshot becomes the checkpoint. The caller
+ * retains the unconsumed suffix; the decoder never scans it in advance. */
+export function evaluateV2Prefix(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
+  context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2PrefixEvaluation {
+  const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
+  const gap=(reason:NewarchV2Incident['reason'],detail:string):Extract<V2RuleResult,{kind:'gap'}>=>{
+    // Evidence belongs to a gap, not each successful prefix of the same offer.
+    const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,
+      bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
+      checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
+    const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
+    return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
+  };
+  const cp=input.checkpoint,raw=input.raw,L=NEWARCH_V2_PREFIX_LIMITS;
+  try {
+    // One encoder for the input check, the per-row size probe, both digests
+    // and the output check. A later call still builds its own.
+    const encode = streamCanonicalEncoder();
+    validateV2Checkpoint(cp, encode);
+    const durableRevision=context.durableRevision??cp.revision;
+    if(!counter(durableRevision)||durableRevision<cp.revision)return gap('decoder-anomaly','durable revision regression');
+    if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
+      ||!samePane(cp.pane,raw.epoch.pane))return gap('identity-change','pane identity');
+    if(!v2Equal(cp.geometry,input.pane.geometry))return gap('geometry-violation','fixed geometry');
+    if(!v2Equal(cp.through.epoch,raw.epoch))return gap('collector-epoch-changed','epoch');
+    if(!counter(raw.start)||!counter(raw.end)||raw.start!==cp.through.byteOffset||raw.end-raw.start!==input.bytes.length)
+      return gap('decoder-anomaly','raw continuity');
+    if(!counter(input.observedAtMonoMs)||input.pendingSinceMonoMs!==null&&(!counter(input.pendingSinceMonoMs)
+      ||input.pendingSinceMonoMs>input.observedAtMonoMs))return gap('decoder-anomaly','clock');
+    const rule=stamp('ordered-scroll');if(!rule)return gap('decoder-anomaly','accept disabled');
+    const segmentId=context.rowTarget?.segmentId??cp.frontier?.segmentId??v2Digest('birth-segment',cp.pane);
+    const sameSegment=cp.frontier?.segmentId===segmentId;
+    const base=context.rowTarget?.nextRowOrdinal??(sameSegment?cp.frontier!.rowOrdinal+1:0);
+    if(typeof segmentId!=='string'||!segmentId||!segmentId.isWellFormed()
+      ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
+      ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
+    const rawCap=Math.min(input.bytes.length,L.maxRawBytes);
+    const materializeOne=(r:RowContent,offset:number,index:number):CommittedStreamRow=>{
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+offset},ordinal:base+index};
+      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+index},origin,cells:r.cells,geometry:cp.state.geometry,
+        buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
+        uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
+    };
+    const probeRows:CommittedStreamRow[]=[],serializedEnds:number[]=[2];
+    let serializedBoundary=false,probeSerializedBytes=2;
+    const decoded=v2Decode(cp.state,input.bytes,rawCap,L.maxRows,(r,offset,index)=>{
+      const row=materializeOne(r,offset,index);
+      const originBytes=Buffer.byteLength(encode(row.origin)),cells=row.cellOrigins.length;
+      const rowBytes=Buffer.byteLength(encode({...row,cellOrigins:[]}))
+        +cells*originBytes+Math.max(0,cells-1);
+      const candidate=probeSerializedBytes+(index===0?0:1)+rowBytes;
+      if(candidate>L.maxSerializedBytes){serializedBoundary=true;return false;}
+      probeRows.push(row);probeSerializedBytes=candidate;serializedEnds.push(candidate);return true;
+    });
+    const consumed=decoded.rowBoundary??rawCap;
+    const stop:V2PrefixStop=decoded.rowBoundary!==null?(serializedBoundary?'serialized-bytes':'rows')
+      :input.bytes.length>rawCap?'raw-bytes':'complete';
+    if(input.bytes.length>0 && consumed===0)return gap('budget-exhausted','zero-progress prefix');
+    // A CSI may propose multiple rows in one byte; none are certified if that
+    // byte exceeds the budget. Keep exactly the scrolls actually committed.
+    const rows=probeRows.slice(0,decoded.scrolls.length);
+    const serializedBytes=serializedEnds[rows.length]!;
+    if(rows.length>L.maxRows||serializedBytes>L.maxSerializedBytes)throw Error('materialized prefix budget');
+    const through={epoch:raw.epoch,byteOffset:raw.start+consumed},revision=durableRevision+1;
+    const checkpoint:V2LiveCheckpoint={...cp,
+      checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision},encode),through,replayFloor:through,revision,
+      frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,stateDigest:v2Digest('vt-state',decoded.state,encode),
+      pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+    validateV2Checkpoint(checkpoint, encode);
+    const offered={epoch:raw.epoch,start:raw.start,end:raw.end},consumedRange={epoch:raw.epoch,start:raw.start,end:through.byteOffset};
+    const prefix:V2DecodePrefix={schema:'newarch-v2',pane:cp.pane,offered,consumed:consumedRange,rows,
+      serializedBytes,checkpoint,stop,suffix:through.byteOffset===raw.end?null:{epoch:raw.epoch,start:through.byteOffset,end:raw.end}};
+    return v2Immutable(prefix);
+  }catch(cause){return gap('decoder-anomaly',String(cause));}
+}
+
+/** Call again with the SAME checkpoint and accumulated raw after defer. A
+ * coordinator must not ACK/trim defer, and must call at its original deadline. */
+export function evaluateV2Rules(input: V2RuleInput, config: V2Config = NEWARCH_V2_DEFAULT_CONFIG,
+  context: V2DecisionContext = {wallMs:0,clockEpoch:'replay'}): V2RuleResult {
+  const table=v2RuleTable(config), stamp=(id:string)=>table.find(d=>d.stamp.ruleId===id)?.stamp;
+  const evidence={raw:input.raw,digest:v2Digest('rule-input',{raw:input.raw,bytes:input.bytes.length<=V2L.pendingBytesPerPane?input.bytes:[],inputBytes:input.bytes.length}),
+    checkpointId:input.checkpoint.checkpointId,caseId:'V2-13',anomalyId:null as string|null};
+  const gap=(reason:NewarchV2Incident['reason'],detail:string):V2RuleResult=>{
+    const rule=stamp('explicit-gap')!,incident=v2DecisionIncident(input,rule,context,reason,detail);
+    return {kind:'gap',stamp:rule,evidence:{...evidence,anomalyId:incident.incidentId},incident};
+  };
+  const cp=input.checkpoint,raw=input.raw;
+  try {
+    validateV2Checkpoint(cp);
+    const durableRevision=context.durableRevision??cp.revision;
+    if(!counter(durableRevision)||durableRevision<cp.revision)
+      return gap('decoder-anomaly','durable revision regression');
+    if(input.pane.owner!=='capture-engine'||input.pane.state!=='active'||!samePane(input.pane.pane,cp.pane)
+      ||!samePane(cp.pane,raw.epoch.pane))return gap('identity-change','pane identity');
+    if(!v2Equal(cp.geometry,input.pane.geometry))return gap('geometry-violation','fixed geometry');
+    if(!v2Equal(cp.through.epoch,raw.epoch))return gap('collector-epoch-changed','epoch');
+    if(!counter(raw.start)||!counter(raw.end)||raw.start!==cp.through.byteOffset||raw.end-raw.start!==input.bytes.length)
+      return gap('decoder-anomaly','raw continuity');
+    if(!counter(input.observedAtMonoMs)||input.pendingSinceMonoMs!==null&&(!counter(input.pendingSinceMonoMs)||input.pendingSinceMonoMs>input.observedAtMonoMs))
+      return gap('decoder-anomaly','clock');
+    if(input.bytes.length>V2L.pendingBytesPerPane)return gap('budget-exhausted','input bytes');
+    if(input.bytes.some(b=>!Number.isInteger(b)||b<0||b>255))return gap('decoder-anomaly','invalid byte');
+    const decoded=v2Decode(cp.state,input.bytes);
+    if(decoded.state.pendingUtf8.length||decoded.state.pendingEscape.length){
+      const deadline=(input.pendingSinceMonoMs??input.observedAtMonoMs)+V2L.pendingDeadlineMs;
+      if(!stamp('bounded-tail')||input.observedAtMonoMs>=deadline)return gap('decoder-anomaly','pending deadline');
+      return {kind:'defer',stamp:stamp('bounded-tail')!,evidence,pendingRows:decoded.scrolls.length,
+        pendingBytes:input.bytes.length,deadlineMonoMs:deadline};
+    }
+    if(input.pendingSinceMonoMs!==null&&input.observedAtMonoMs>=input.pendingSinceMonoMs+V2L.pendingDeadlineMs)
+      return gap('decoder-anomaly','pending deadline');
+    const rule=stamp('ordered-scroll');if(!rule)return gap('decoder-anomaly','accept disabled');
+    const segmentId=context.rowTarget?.segmentId??cp.frontier?.segmentId??v2Digest('birth-segment',cp.pane);
+    const sameSegment=cp.frontier?.segmentId===segmentId;
+    const base=context.rowTarget?.nextRowOrdinal??(sameSegment?cp.frontier!.rowOrdinal+1:0);
+    if(typeof segmentId!=='string'||!segmentId||!segmentId.isWellFormed()
+      ||Buffer.byteLength(segmentId)>V2L.maxIdentityBytes||!counter(base)
+      ||base!==(sameSegment?cp.frontier!.rowOrdinal+1:0))return gap('decoder-anomaly','row target fence');
+    const rows:CommittedStreamRow[]=decoded.scrolls.map((r,i)=>{
+      const origin={kind:'pipe' as const,range:{epoch:raw.epoch,start:0,end:raw.start+decoded.offsets[i]!},ordinal:base+i};
+      return {id:{pane:cp.pane,segmentId,rowOrdinal:base+i},origin,cells:r.cells,geometry:cp.state.geometry,
+        buffer:'normal',wrapStatus:r.softWrap?'wrapped':'unwrapped',wrapPad:r.wrapPad,finalized:true,
+        uncertainFields:r.uncertainFields,cellOrigins:r.cells.map(()=>origin)};
+    });
+    if(Buffer.byteLength(streamCanonical(rows))>V2L.pageBytes)
+      return gap('budget-exhausted','committed row bytes');
+    const through={epoch:raw.epoch,byteOffset:raw.end},revision=durableRevision+1;
+    const checkpoint:V2LiveCheckpoint={...cp,checkpointId:v2Digest('live-checkpoint',{pane:cp.pane,through,rule,revision}),through,
+      replayFloor:through,revision,frontier:rows.at(-1)?.id??cp.frontier,rule,state:decoded.state,
+      stateDigest:v2Digest('vt-state',decoded.state),pending:{rows:[],bytes:0,deadlineMonoMs:null}};
+    validateV2Checkpoint(checkpoint);
+    return {kind:'accept',stamp:rule,evidence,rows,checkpoint};
+  }catch(cause){return gap('decoder-anomaly',String(cause));}
 }

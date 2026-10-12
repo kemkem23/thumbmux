@@ -146,6 +146,7 @@ export interface MuxAuthSuccess {
     | "subscribe"
     | "unsubscribe"
     | "history_expand"
+    | "history_expand_v2"
     | "resync"
     | "keys"
     | "resize";
@@ -978,6 +979,7 @@ export function createTokenGuard(options: TokenGuardOptions): TokenGuard {
       case "subscribe":
       case "unsubscribe":
       case "history_expand":
+      case "history_expand_v2":
       case "resync": {
         const session = raw.session;
         if (!isNonEmptySession(session)) return fail403("forbidden_operation");

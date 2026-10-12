@@ -666,3 +666,42 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
     expect(r.missing+r.extra+r.wrong).toBe(0);
   }
 },240000);
+
+// NEWARCH native-growth: the disk worker is its own JS VM. Bun did not collect
+// the batches cloned into it at the host's commit rate, so its heap grew with
+// age (+30-45 MiB/h at 21 panes) where the host's heapUsed never sees it.
+test('newarch native-growth: the disk worker heap stays bounded across commits',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'na-worker-heap-'));
+ try {
+   const s=createProjectionStore({historyRoot:join(root,'h'),mode:'create'});
+   try {
+     const keys=Array.from({length:21},(_,i)=>({serverIdentity:'worker-heap',paneId:`%${i}`,birthGeneration:1}));
+     const cell=(grapheme:string):ProjectionCell=>({grapheme,width:1,continuation:false,fg:null,bg:null,style:0});
+     const cols=120,rows=40;
+     let seq=0;
+     const phase=async(ms:number)=>{
+       const start=performance.now();
+       while(performance.now()-start<ms) {
+         seq++;
+         const screen=Array.from({length:rows},(_,r)=>[...`${seq}:${r}`.padEnd(cols,' ')].map(cell));
+         await Promise.all(keys.map(k=>{
+           const text=`${k.paneId} row ${seq}`.padEnd(cols,' ');
+           return Promise.all([
+             s.appendScroll({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:seq,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}}),
+             s.replaceScreen({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:seq,cols,rows,kind:'normal',cells:screen,cursor:{row:0,col:0,visible:true}}),
+           ]);
+         }));
+         await Bun.sleep(10);
+       }
+       return s.diskWorkerHeap();
+     };
+     // Two equal phases: the heap of the second must not have grown with the commits in between.
+     const early=await phase(12000),late=await phase(12000);
+     console.log('NATIVE_GROWTH_WORKER_HEAP',JSON.stringify({early,late}));
+     expect(early).not.toBeNull();expect(late).not.toBeNull();
+     expect(late!.commits-early!.commits).toBeGreaterThan(200);
+     expect(late!.heap).toBeLessThan(3*1024*1024);
+     expect(late!.heap-early!.heap).toBeLessThan(1024*1024);
+   } finally { await s.close(); }
+ } finally { rmSync(root,{recursive:true,force:true}); }
+},60000);

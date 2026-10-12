@@ -30,6 +30,7 @@ import { HistoryWatchdog } from './history-watchdog';
 import type { CapturedRow, HistoryCell, HistoryRow, RowMatch } from './history-row-matcher';
 import { CACHE_BYTE_MODEL, TmuxCaptureDecoder, TMUX_OBSERVED_FIELDS, type DecoderCacheStats } from './tmux-capture-normalize';
 import { createProjectionStore as createProjectionStoreValue } from './sqlite-history/projection-store';
+import { NewarchV2Display as NewarchV2DisplayValue } from './display-engine';
 import { pipeVtAssets as pipeVtAssetsValue, verifyPipeVtAssets as verifyPipeVtAssetsValue } from './pipe-vt-worker';
 import {
   isProjectionRefusal,
@@ -821,8 +822,9 @@ export class PipeHistoryPane {
     this.compactReceipts();
   }
 
+  /** Drop settled stamps as they settle: a 4096 floor held ~2.3 h of stamps per pane at 0.5 chunks/s. */
   private compactReceipts(): void {
-    if (this.receiveHead > 4096 && this.receiveHead * 2 > this.receiveTimes.length) {
+    if (this.receiveHead > 64 && this.receiveHead * 2 > this.receiveTimes.length) {
       this.receiveTimes.splice(0, this.receiveHead);
       this.receiveHead = 0;
     }
@@ -1611,6 +1613,9 @@ export class ProjectionLiveWindow {
 // can leave a dangling symbol for a barrel re-export (see index.ts).
 /** The projection store (L1/I2) this runtime writes to. */
 export const createProjectionStore = createProjectionStoreValue;
+/** Read-only NEWARCH display constructor; importing this barrel starts no runtime. */
+export const NewarchV2Display = NewarchV2DisplayValue;
+export type NewarchV2Display = NewarchV2DisplayValue;
 /** VT worker assets beside this module (dist or source) and their pinned-hash check. */
 export const pipeVtAssets = pipeVtAssetsValue;
 export const verifyPipeVtAssets = verifyPipeVtAssetsValue;

@@ -307,6 +307,9 @@ describe('a write that was acknowledged survives an abnormal end', () => {
       committed: number;
       thrown: string | null;
       sqlDuringFaultedIngest: string[];
+      inTransactionDuringFaultedIngest: boolean[];
+      inTransactionAtFault: boolean | null;
+      inTransactionAfterFault: boolean | null;
     }>('fault-during-transaction', { file, owners, firstBatch, secondBatch, tag: 'fault' });
 
     expect(faulted.committed).toBe(firstBatch.length);
@@ -314,12 +317,22 @@ describe('a write that was acknowledged survives an abnormal end', () => {
 
     // The fault has to land *mid*-transaction for the claim to mean anything:
     // inside BEGIN, after every upsert of the doomed batch was applied, and
-    // before the statement that would have completed it. SQLite's own ROLLBACK
-    // is then the last thing the driver sees.
+    // before the statement that would have completed it. Whether the driver
+    // routes BEGIN/ROLLBACK through the patched methods differs by Bun release
+    // (1.3 does, 1.4 does not), so "inside BEGIN" is asked of SQLite itself
+    // through `db.inTransaction` rather than read off the statement log.
     const steps = faulted.sqlDuringFaultedIngest;
-    expect(steps[0]).toBe('BEGIN');
-    expect(steps.at(-1)).toBe('ROLLBACK');
-    expect(steps.filter((s) => s.includes('INSERT INTO prompts'))).toHaveLength(secondBatch.length);
+    const inTxn = faulted.inTransactionDuringFaultedIngest;
+    expect(inTxn).toHaveLength(steps.length);
+    const control = /^\s*(BEGIN|COMMIT|ROLLBACK|END|SAVEPOINT|RELEASE)\b/i;
+    const work = steps.flatMap((sql, i) => (control.test(sql) ? [] : [{ sql, inTxn: inTxn[i] }]));
+    expect(work.filter((s) => s.sql.includes('INSERT INTO prompts'))).toHaveLength(secondBatch.length);
+    expect(work.at(-1)?.sql).toMatch(/DELETE\s+FROM\s+prompts/i);
+    expect(work.filter((s) => !s.inTxn)).toEqual([]);
+    expect(faulted.inTransactionAtFault).toBe(true);
+    // ... and the driver rolled it back rather than leaving it open or
+    // committing it: the connection is out of the transaction afterwards.
+    expect(faulted.inTransactionAfterFault).toBe(false);
     expect(steps.filter((s) => s.includes('COMMIT'))).toHaveLength(0);
 
     const report = await runChildJson<ReopenReport>('reopen-report', { file, owners, tag: 'fault-read' });

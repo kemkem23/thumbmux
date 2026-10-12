@@ -238,7 +238,7 @@ export type MuxResyncRequest = { type: "resync"; session: string };
  * validates required fields per op. Prefer {@link MuxStrictClientMessage} for
  * new typed clients.
  */
-export type MuxClientMessage = MuxResyncRequest | {
+export type MuxClientMessage = MuxResyncRequest | NewarchV2HistoryExpandMessage | {
   type:
     | "ping"
     | "client_info"
@@ -272,6 +272,8 @@ export type MuxClientMessage = MuxResyncRequest | {
  */
 export type MuxStrictClientMessage =
   | MuxResyncRequest
+  /** NEWARCH v2 history read (Q22 flag-on K-r1, additive); legacy `history_expand` is unchanged. */
+  | NewarchV2HistoryExpandMessage
   | { type: "ping"; client?: unknown }
   | { type: "client_info"; client?: unknown }
   | { type: "subscribe" | "unsubscribe"; session: string; tail?: number; delta?: boolean; client?: unknown }
@@ -580,3 +582,311 @@ export type MuxClientInfo = {
     devicePixelRatio?: number;
   };
 };
+
+/** Opt-in flag-on extension; legacy frame/page payloads keep their v1 meaning.
+ * Negotiate every required capability before sending this envelope. Unknown
+ * versions are unsupported, never an empty page. Counts/offsets are safe uints.
+ */
+export const NEWARCH_HISTORY_EXTENSION_VERSION = 1 as const;
+export const NEWARCH_FLAGON_CAPABILITIES = [
+  'stitch-v1', 'capture-v1', 'spool-v1', 'receipt-v1', 'bundle-v1',
+  'catalog-v3', 'history-states-v1',
+] as const;
+export type NewarchFlagOnCapability = typeof NEWARCH_FLAGON_CAPABILITIES[number];
+export interface NewarchCapabilities {
+  readonly extensionVersion: 1;
+  readonly supported: readonly NewarchFlagOnCapability[];
+  readonly required: readonly NewarchFlagOnCapability[];
+}
+export interface NewarchPaneKey {
+  readonly serverIdentity: string; readonly paneId: string; readonly birthGeneration: number;
+}
+/** Segment coordinates are NOT legacy global lineId or capture rowIndex. */
+export interface NewarchRowId {
+  readonly pane: NewarchPaneKey; readonly segmentId: string; readonly rowOrdinal: number;
+}
+export interface NewarchRowRange {
+  readonly pane: NewarchPaneKey; readonly segmentId: string;
+  readonly start: number; readonly end: number;
+}
+export type NewarchMissingCount =
+  | { readonly countKind: 'unknown'; readonly missingCount: null }
+  | { readonly countKind: 'exact' | 'estimate'; readonly missingCount: number };
+export type NewarchGap = NewarchMissingCount & {
+  readonly version: 1; readonly episodeId: string; readonly parentEpisodeId: string | null;
+  readonly pane: NewarchPaneKey; readonly leftRowId: NewarchRowId | null;
+  readonly rightSegmentId: string | null;
+  readonly reason: 'pipe-eof' | 'collector-exit' | 'ambiguous-overlap' | 'unproven-overlap'
+    | 'unknown-vt-state' | 'interrupted-capture' | 'storage-outage' | 'corruption'
+    | 'identity-change' | 'geometry-change' | 'ownership-lost' | 'visible-divergence';
+  readonly withheldRows: number; readonly lowerBound: number;
+  readonly openedAt: number; readonly closedAt: number | null;
+  readonly clockEpoch: string; readonly quality: 'degraded' | 'resolved';
+};
+/** Opaque serialized token. Only H/A mint/validate it; D must not do arithmetic. */
+export interface NewarchHistoryCursor { readonly version: 1; readonly token: string }
+export type NewarchHistoryState =
+  | { readonly kind: 'exact' }
+  | { readonly kind: 'gap'; readonly gap: NewarchGap }
+  | { readonly kind: 'pending'; readonly operationId: string; readonly retryAfterMs: number }
+  | { readonly kind: 'remote-required'; readonly range: NewarchRowRange; readonly bundleId: string }
+  | { readonly kind: 'remote-unavailable'; readonly range: NewarchRowRange; readonly bundleId: string; readonly retryAfterMs: number; readonly reason: 'offline' | 'missing' | 'corrupt' }
+  | { readonly kind: 'degraded'; readonly episodeId: string; readonly uncertainFields: readonly string[] }
+  | { readonly kind: 'pressure'; readonly level: 'archive' | 'critical' | 'emergency'; readonly collecting: boolean; readonly sinceMonoMs: number };
+/** Status is separate from terminal text: copy/search must never include labels.
+ * Only end proves EOF. blocked always retains a continuation and readable prefix.
+ */
+export type NewarchHistoryContinuation =
+  | { readonly kind: 'end' }
+  | { readonly kind: 'more'; readonly cursor: NewarchHistoryCursor }
+  | { readonly kind: 'blocked'; readonly cursor: NewarchHistoryCursor;
+      readonly state: Exclude<NewarchHistoryState, { readonly kind: 'exact' }> };
+export interface NewarchHistoryExtension {
+  readonly version: 1; readonly capabilities: NewarchCapabilities;
+  readonly states: readonly NewarchHistoryState[];
+  readonly before: NewarchHistoryContinuation; readonly after: NewarchHistoryContinuation;
+}
+
+/** Repair capabilities are a separate tagged envelope. Do not advertise them
+ * in the v1 list: an old consumer must reject r2, not reinterpret old bytes. */
+export const NEWARCH_REPAIR_CAPABILITIES = [
+  'cell-sgr-r2', 'digest-provenance-r2', 'attach-receipt-set-r2', 'timeline-replay-r2',
+  'spool-retention-r2', 'archive-inventory-r2', 'same-pipe-return-r2', 'incident-r2',
+] as const;
+export type NewarchRepairCapability = typeof NEWARCH_REPAIR_CAPABILITIES[number];
+export interface NewarchRepairCapabilities {
+  readonly revision: 2; readonly supported: readonly NewarchRepairCapability[];
+  readonly required: readonly NewarchRepairCapability[];
+}
+/** Unknown revision/capability is unsupported. Both peers' requirements count. */
+export function supportsNewarchRepair(local: NewarchRepairCapabilities, peer: {
+  readonly revision: number; readonly supported: readonly string[]; readonly required: readonly string[];
+}): boolean {
+  const known: readonly string[] = NEWARCH_REPAIR_CAPABILITIES;
+  return local.revision === 2 && peer.revision === 2
+    && [...local.supported, ...local.required, ...peer.required].every(c => known.includes(c))
+    && local.required.every(c => local.supported.includes(c) && peer.supported.includes(c))
+    && peer.required.every(c => peer.supported.includes(c) && local.supported.some(s => s === c));
+}
+export interface NewarchGapIdentityR2 {
+  readonly revision: 2; readonly gapId: string; readonly sequence: number;
+  readonly update: number; readonly state: 'open' | 'closed';
+}
+export type NewarchGapR2 = NewarchGap & { readonly repair: NewarchGapIdentityR2 };
+export interface NewarchIncidentR2 {
+  readonly revision: 2; readonly incidentId: string; readonly pane: NewarchPaneKey;
+  readonly leftRowId: NewarchRowId | null;
+  readonly openedAtWallMs: number; readonly openedAtMonoMs: number; readonly clockEpoch: string;
+  readonly collecting: boolean; readonly reason: 'storage-outage' | 'collector-stalled' | 'collector-exit' | 'io';
+  readonly quality: 'degraded' | 'resolved'; readonly resolvedAtWallMs: number | null;
+}
+export type NewarchPressureR2 = Extract<NewarchHistoryState, { readonly kind: 'pressure' }>
+  & { readonly repair: NewarchIncidentR2 };
+export type NewarchHistoryStateR2 =
+  | Exclude<NewarchHistoryState, { readonly kind: 'pressure' } | { readonly kind: 'gap' }>
+  | NewarchPressureR2 | { readonly kind: 'gap'; readonly gap: NewarchGapR2 };
+export type NewarchHistoryContinuationR2 =
+  | { readonly kind: 'end' }
+  | { readonly kind: 'more'; readonly cursor: NewarchHistoryCursor }
+  | { readonly kind: 'blocked'; readonly cursor: NewarchHistoryCursor;
+      readonly state: Exclude<NewarchHistoryStateR2, { readonly kind: 'exact' }> };
+export interface NewarchHistoryRepairR2 extends NewarchHistoryExtension {
+  readonly repair: NewarchRepairCapabilities;
+  readonly states: readonly NewarchHistoryStateR2[];
+  readonly before: NewarchHistoryContinuationR2;
+  readonly after: NewarchHistoryContinuationR2;
+}
+
+/** Q22 / PLAN-v2. This is NOT the repair-r2 envelope above. Never infer v2
+ * support from flag-on/repair support. D/U negotiate before sending these
+ * messages; old clients may read legacy panes but cannot resize v2 panes. */
+export const NEWARCH_V2_SCHEMA = 'newarch-v2' as const;
+export const NEWARCH_V2_CAPABILITIES = Object.freeze([
+  'permanent-capture-owner', 'fixed-geometry', 'pane-history-cursor',
+  'durable-incidents', 'live-checkpoint', 'bounded-audit',
+] as const);
+export interface NewarchV2Capabilities {
+  readonly schema: typeof NEWARCH_V2_SCHEMA;
+  readonly supported: readonly string[]; readonly required: readonly string[];
+}
+export function supportsNewarchV2(local: NewarchV2Capabilities, peer: NewarchV2Capabilities): boolean {
+  const known: readonly string[] = NEWARCH_V2_CAPABILITIES;
+  return local.schema === NEWARCH_V2_SCHEMA && peer.schema === NEWARCH_V2_SCHEMA
+    && [...local.required, ...peer.required].every(c => known.includes(c)
+      && local.supported.includes(c) && peer.supported.includes(c))
+    && known.every(c => local.required.includes(c) && peer.required.includes(c));
+}
+/** Session UUID is minted and persisted before birth, never a display name,
+ * tmux numeric session id or PID. serverIdentity changes on server recreation. */
+export interface NewarchV2SessionKey { readonly serverIdentity: string; readonly sessionId: string }
+export interface NewarchV2FixedGeometry {
+  readonly policy: 'fixed-at-birth'; readonly columns: number; readonly rows: number;
+  readonly configVersion: string; readonly panesPerWindow: 1;
+}
+export type NewarchV2PaneState = 'reserved' | 'active' | 'stopped' | 'closed' | 'unrecorded';
+export interface NewarchV2PaneDescriptor {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly session: NewarchV2SessionKey;
+  readonly pane: NewarchPaneKey; readonly windowId: string;
+  readonly owner: 'capture-engine'; readonly birthOperationId: string;
+  readonly geometry: NewarchV2FixedGeometry; readonly state: NewarchV2PaneState;
+}
+export type NewarchV2PaneSelection =
+  | { readonly kind: 'selected'; readonly pane: NewarchV2PaneDescriptor }
+  | { readonly kind: 'ambiguous'; readonly panes: readonly NewarchV2PaneDescriptor[]; readonly next: string | null }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'owner-unavailable'; readonly retryAfterMs: number };
+export type NewarchV2IncidentReason = 'geometry-violation' | 'unverified-restart'
+  | 'unrecorded-birth' | 'birth-failed' | 'pipe-eof' | 'collector-epoch-changed'
+  | 'storage-outage' | 'budget-exhausted' | 'audit-mismatch' | 'decoder-anomaly' | 'identity-change';
+/** Timeline positions, not legacy line numbers. null is before the first row.
+ * affected.to=null is open-ended; annotate published rows from last proof,
+ * not merely the tail at detection time. Unknown loss is never zero. */
+export interface NewarchV2Incident {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly incidentId: string;
+  readonly pane: NewarchPaneKey; readonly reason: NewarchV2IncidentReason;
+  readonly frontier: NewarchRowId | null;
+  readonly affected: { readonly after: NewarchRowId | null; readonly through: NewarchRowId | null };
+  readonly openedAtWallMs: number; readonly openedAtMonoMs: number; readonly clockEpoch: string;
+  readonly collecting: boolean; readonly missing: NewarchMissingCount;
+  readonly ruleVersion: string; readonly configVersion: string;
+  readonly geometry: NewarchV2FixedGeometry; readonly revision: number;
+  readonly sourceEpoch: NewarchV2SourceEpoch | null; readonly sourceOffset: number | null; readonly expectedDigest: string | null; readonly actualDigest: string | null;
+  readonly action: 'gap-and-stop' | 'annotate' | 'repair-pending';
+  readonly evidence: { readonly digest: string; readonly bytes: number; readonly redacted: true } | null;
+}
+/** H mints/validates token and binds it to pane/store/timeline revision. Token
+ * is opaque, <=4096 UTF-8 bytes. Segment migration MUST NOT change coordinates.
+ * Same cursor survives restart; missing/corrupt remote is blocked, never end. */
+export interface NewarchV2HistoryCursor {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchPaneKey;
+  readonly storeId: string; readonly timelineRevision: number; readonly token: string;
+}
+export type NewarchV2ReadState =
+  | { readonly kind: 'exact'; readonly auditedRevision: number | null }
+  | { readonly kind: 'incident'; readonly incident: NewarchV2Incident }
+  | { readonly kind: 'storage-unavailable'; readonly pendingIncidentId: string | null; readonly retryAfterMs: number }
+  | { readonly kind: 'remote-unavailable'; readonly bundleId: string; readonly reason: 'offline' | 'missing' | 'corrupt'; readonly retryAfterMs: number };
+export type NewarchV2Continuation =
+  | { readonly kind: 'end' }
+  | { readonly kind: 'more'; readonly cursor: NewarchV2HistoryCursor }
+  | { readonly kind: 'blocked'; readonly cursor: NewarchV2HistoryCursor;
+      readonly state: Extract<NewarchV2ReadState, { readonly kind: 'storage-unavailable' | 'remote-unavailable' }> };
+/** No server resize request is implied by viewport/font/fit-to-width changes.
+ * D/U use horizontal scrolling by default, no history rewrap. Labels are UI
+ * text outside copy/search content, including incidents when no live pane. */
+export interface NewarchV2FrameMeta {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchV2PaneDescriptor;
+  readonly revision: number; readonly durableRevision: number; readonly sourceEpoch: NewarchV2SourceEpoch;
+  readonly state: NewarchV2ReadState;
+}
+export interface NewarchV2HistoryRequest {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchPaneKey;
+  readonly cursor: NewarchV2HistoryCursor | null; readonly direction: 'before' | 'after';
+  readonly maxEntries: number; readonly maxBytes: number;
+}
+export interface NewarchV2GeometryReply {
+  readonly schema: typeof NEWARCH_V2_SCHEMA; readonly pane: NewarchPaneKey;
+  readonly status: 'fixed'; readonly geometry: NewarchV2FixedGeometry;
+}
+
+/** D/I add these to the negotiated transport; v1 frames are not reinterpreted.
+ * Delta bases must match pane, sourceEpoch, fixed geometry and not regress
+ * revision. Identity/geometry changes require a full reset. */
+export type NewarchV2OutputFrame = (Omit<MuxFullOutputFrame, 'newarch'> | Omit<MuxDeltaFrame, 'newarch'>)
+  & { readonly newarchV2: NewarchV2FrameMeta };
+
+/** Immutable collector incarnation + attachment, never host receive order. */
+export interface NewarchV2SourceEpoch { readonly attachId: string; readonly collectorIncarnation: string }
+
+/** Q22 flag-on (K, 2026-10-05): v2 history request/reply on the mux socket.
+ * Additive and separate from `history_expand`/`history` (legacy line anchors):
+ * legacy clients never see these frames and a v2 cursor is never flattened to
+ * a line number. D3 wires them; D1 answers from H through NewarchV2Display.
+ * Numbers mirror NEWARCH_V2_LIMITS (server) and are asserted equal by K. */
+export const NEWARCH_V2_WIRE_LIMITS = Object.freeze({
+  pageEntries: 256, pageBytes: 2 * 1024 * 1024, cursorBytes: 4096,
+} as const);
+/** Screen projection of a committed row: provenance (cellOrigins) stays server-side. */
+export interface NewarchV2WireCell {
+  readonly text: string; readonly width: 0 | 1 | 2; readonly style: readonly number[];
+}
+export interface NewarchV2WireRow {
+  readonly kind: 'row'; readonly id: NewarchRowId; readonly cells: readonly NewarchV2WireCell[];
+  readonly wrapStatus: 'wrapped' | 'unwrapped' | 'unknown'; readonly wrapPad: number;
+}
+export type NewarchV2WireEntry = NewarchV2WireRow
+  | { readonly kind: 'incident'; readonly incident: NewarchV2Incident };
+/** Client -> server. requestId is client-chosen, echoed verbatim. */
+export interface NewarchV2HistoryExpandMessage {
+  readonly type: 'history_expand_v2'; readonly session: string; readonly requestId: string;
+  readonly request: NewarchV2HistoryRequest;
+}
+export type NewarchV2HistoryErrorCode = 'wrong-pane' | 'stale-cursor' | 'bounded-read'
+  | 'owner-unavailable' | 'unsupported';
+/** Server -> client. Entries are ascending timeline order in either direction.
+ * An error is never an empty ok page; blocked continuation is never `end`. */
+export type NewarchV2HistoryReply =
+  | { readonly schema: typeof NEWARCH_V2_SCHEMA; readonly type: 'history_v2'; readonly channel: string;
+      readonly requestId: string; readonly status: 'ok'; readonly pane: NewarchPaneKey; readonly revision: number;
+      readonly entries: readonly NewarchV2WireEntry[]; readonly payloadBytes: number;
+      readonly states: readonly NewarchV2ReadState[];
+      readonly before: NewarchV2Continuation; readonly after: NewarchV2Continuation }
+  | { readonly schema: typeof NEWARCH_V2_SCHEMA; readonly type: 'history_v2'; readonly channel: string;
+      readonly requestId: string; readonly status: 'error'; readonly pane: NewarchPaneKey;
+      readonly code: NewarchV2HistoryErrorCode; readonly retryAfterMs: number | null };
+export function newarchV2SamePane(a: NewarchPaneKey, b: NewarchPaneKey): boolean {
+  return a.serverIdentity === b.serverIdentity && a.paneId === b.paneId && a.birthGeneration === b.birthGeneration;
+}
+/** Client-side invalidation: keep a cursor only for the SAME pane identity
+ * (server lifetime + pane id + birth generation). A new session/pane, a reused
+ * pane id or a restarted server drops it; never send a stale cursor. */
+export function newarchV2CursorFor(pane: NewarchV2PaneDescriptor, cursor: NewarchV2HistoryCursor | null): NewarchV2HistoryCursor | null {
+  return cursor && cursor.schema === NEWARCH_V2_SCHEMA && newarchV2SamePane(cursor.pane, pane.pane) ? cursor : null;
+}
+function newarchV2EntryPane(e: NewarchV2WireEntry): NewarchPaneKey {
+  return e.kind === 'row' ? e.id.pane : e.incident.pane;
+}
+function newarchV2Utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+/** Same rules as server validateV2ReadRequest for a cursor: same pane, non-empty
+ * store/token, token at most NEWARCH_V2_WIRE_LIMITS.cursorBytes UTF-8 bytes. */
+function newarchV2CursorInBounds(c: NewarchV2HistoryCursor, pane: NewarchPaneKey): boolean {
+  return c.schema === NEWARCH_V2_SCHEMA && newarchV2SamePane(c.pane, pane)
+    && typeof c.storeId === 'string' && c.storeId.length > 0 && typeof c.token === 'string' && c.token.length > 0
+    && newarchV2Utf8Bytes(c.token) <= NEWARCH_V2_WIRE_LIMITS.cursorBytes
+    && Number.isSafeInteger(c.timelineRevision) && c.timelineRevision >= 0;
+}
+/** Same bounds as server validateV2ReadRequest: 1..wire cap for both limits. */
+function newarchV2RequestInBounds(r: NewarchV2HistoryRequest): boolean {
+  const L = NEWARCH_V2_WIRE_LIMITS;
+  return r.schema === NEWARCH_V2_SCHEMA && (r.direction === 'before' || r.direction === 'after')
+    && Number.isSafeInteger(r.maxEntries) && r.maxEntries >= 1 && r.maxEntries <= L.pageEntries
+    && Number.isSafeInteger(r.maxBytes) && r.maxBytes >= 1 && r.maxBytes <= L.pageBytes
+    && (r.cursor === null || newarchV2CursorInBounds(r.cursor, r.pane));
+}
+/** Both sides check a reply against the request it answers: same request id,
+ * channel and pane. An ok page additionally needs a request within the wire
+ * caps; at most min(request, wire cap) entries/bytes; every entry/cursor on that
+ * pane with cursor tokens <= cursorBytes; revision not behind the cursor it was
+ * asked with; and storage/remote unavailable is never `end` in the requested
+ * direction (it is `blocked`). An error reply may answer an out-of-bounds
+ * request (that is what `bounded-read` is for). */
+export function newarchV2ReplyMatches(message: NewarchV2HistoryExpandMessage, reply: NewarchV2HistoryReply): boolean {
+  const req = message.request;
+  if (reply.schema !== NEWARCH_V2_SCHEMA || reply.type !== 'history_v2' || req.schema !== NEWARCH_V2_SCHEMA
+    || reply.requestId !== message.requestId || reply.channel !== message.session
+    || !newarchV2SamePane(reply.pane, req.pane)) return false;
+  if (reply.status === 'error') return true;
+  if (!newarchV2RequestInBounds(req)) return false;
+  const L = NEWARCH_V2_WIRE_LIMITS, minRevision = req.cursor ? req.cursor.timelineRevision : 0;
+  const ahead = req.direction === 'before' ? reply.before : reply.after;
+  const unavailable = reply.states.some(s => s.kind === 'storage-unavailable' || s.kind === 'remote-unavailable');
+  return Number.isSafeInteger(reply.revision) && reply.revision >= minRevision
+    && Number.isSafeInteger(reply.payloadBytes) && reply.payloadBytes >= 0
+    && reply.entries.length <= Math.min(req.maxEntries, L.pageEntries)
+    && reply.payloadBytes <= Math.min(req.maxBytes, L.pageBytes)
+    && reply.entries.every(e => newarchV2SamePane(newarchV2EntryPane(e), req.pane))
+    && [reply.before, reply.after].every(c => c.kind === 'end' || newarchV2CursorInBounds(c.cursor, req.pane))
+    && !(unavailable && ahead.kind === 'end');
+}

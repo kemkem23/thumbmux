@@ -1,3 +1,128 @@
+<script module lang="ts">
+  import type {
+    NewarchV2FixedGeometry,
+    NewarchV2PaneDescriptor,
+  } from '@thumbmux/core';
+
+  /**
+   * PLAN-v2 lot U: who decides this pane's size.
+   *
+   * - `viewer`        legacy pane; the host's claimGeometry applies as before.
+   * - `fixed`         NEWARCH v2 pane born at a fixed size. The viewport, font,
+   *                   rotation and keyboard are presentation only — no resize.
+   * - `unknown-owner` the inventory names a v2 lookup it could not resolve
+   *                   (owner store unavailable or a malformed descriptor).
+   * - `pending`       no inventory row delivered yet.
+   *
+   * Only `viewer` may claim geometry. An unresolved owner is never guessed to
+   * be legacy, because a guessed resize lands on a pane whose history the
+   * capture engine records at its birth geometry.
+   */
+  export type SessionGeometryPolicy =
+    | { readonly kind: 'viewer' }
+    | { readonly kind: 'pending' }
+    | { readonly kind: 'unknown-owner'; readonly reason: 'owner-unavailable' | 'malformed' }
+    | {
+        readonly kind: 'fixed';
+        readonly panes: readonly NewarchV2PaneDescriptor[];
+        /** Shared birth geometry; null when the session's panes differ. */
+        readonly geometry: NewarchV2FixedGeometry | null;
+      };
+
+  const V2_PANE_STATES = new Set(['reserved', 'active', 'stopped', 'closed', 'unrecorded']);
+  const V2_GEOMETRY_LIMIT = 10_000;
+
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  function nonEmptyString(value: unknown): value is string {
+    return typeof value === 'string' && value.length > 0;
+  }
+
+  function cellCount(value: unknown): value is number {
+    return Number.isInteger(value) && (value as number) > 0 && (value as number) <= V2_GEOMETRY_LIMIT;
+  }
+
+  function isFixedGeometry(value: unknown): value is NewarchV2FixedGeometry {
+    return isRecord(value)
+      && value.policy === 'fixed-at-birth'
+      && cellCount(value.columns)
+      && cellCount(value.rows)
+      && nonEmptyString(value.configVersion)
+      && value.panesPerWindow === 1;
+  }
+
+  /** Structural check of a wire descriptor; anything else is malformed. */
+  export function isNewarchV2PaneDescriptor(value: unknown): value is NewarchV2PaneDescriptor {
+    if (!isRecord(value) || value.schema !== 'newarch-v2' || value.owner !== 'capture-engine') return false;
+    const { session, pane } = value;
+    return isRecord(session)
+      && nonEmptyString(session.serverIdentity)
+      && nonEmptyString(session.sessionId)
+      && isRecord(pane)
+      && nonEmptyString(pane.serverIdentity)
+      && nonEmptyString(pane.paneId)
+      && Number.isInteger(pane.birthGeneration)
+      && (pane.birthGeneration as number) >= 0
+      && nonEmptyString(value.windowId)
+      && nonEmptyString(value.birthOperationId)
+      && typeof value.state === 'string'
+      && V2_PANE_STATES.has(value.state)
+      && isFixedGeometry(value.geometry);
+  }
+
+  function sameGeometry(a: NewarchV2FixedGeometry, b: NewarchV2FixedGeometry): boolean {
+    return a.columns === b.columns && a.rows === b.rows;
+  }
+
+  function fixedPolicy(panes: readonly NewarchV2PaneDescriptor[]): SessionGeometryPolicy {
+    const first = panes[0]!.geometry;
+    return {
+      kind: 'fixed',
+      panes,
+      geometry: panes.every((pane) => sameGeometry(pane.geometry, first)) ? first : null,
+    };
+  }
+
+  /**
+   * Resolve the policy from one session-inventory row. `rowsSeen` is false
+   * until the first inventory delivery; a row without `newarchV2` (or a v2
+   * lookup that answers `missing`) is a legacy session. The field carries a
+   * `NewarchV2PaneSelection`; panes inside `ambiguous` are all fixed.
+   */
+  export function resolveSessionGeometryPolicy(
+    row: unknown,
+    rowsSeen: boolean,
+  ): SessionGeometryPolicy {
+    if (!rowsSeen) return { kind: 'pending' };
+    if (!isRecord(row) || !('newarchV2' in row) || row.newarchV2 === undefined) {
+      return { kind: 'viewer' };
+    }
+    const selection = row.newarchV2;
+    if (!isRecord(selection)) return { kind: 'unknown-owner', reason: 'malformed' };
+    switch (selection.kind) {
+      case 'missing':
+        return { kind: 'viewer' };
+      case 'owner-unavailable':
+        return { kind: 'unknown-owner', reason: 'owner-unavailable' };
+      case 'selected':
+        return isNewarchV2PaneDescriptor(selection.pane)
+          ? fixedPolicy([selection.pane])
+          : { kind: 'unknown-owner', reason: 'malformed' };
+      case 'ambiguous': {
+        const panes = selection.panes;
+        if (!Array.isArray(panes) || panes.length === 0 || !panes.every(isNewarchV2PaneDescriptor)) {
+          return { kind: 'unknown-owner', reason: 'malformed' };
+        }
+        return fixedPolicy(panes);
+      }
+      default:
+        return { kind: 'unknown-owner', reason: 'malformed' };
+    }
+  }
+</script>
+
 <script lang="ts">
   import {
     DEFAULT_SHORTCUTS,
@@ -41,7 +166,9 @@
     DEFAULT_FONT_PX,
     clampFontPx,
     resolveFontBounds,
+    resolveFontFitMode,
     stepFontPx,
+    type FontFitMode,
   } from './font-range';
   import {
     nextStageOverlay,
@@ -100,12 +227,58 @@
   // TermView prop as undefined. Resolve each known key with ?? instead, which is
   // what EmbedView has always done; the spread stays first so unknown keys a host
   // passes through still arrive.
+  // PLAN-v2 lot U: the inventory row decides who owns the pane size before
+  // the host's claimGeometry is consulted. Rows arrive from the same mux the
+  // shell already watches; until the first delivery nothing is claimed.
+  let sessionRows = $state<SessionListItem[]>([]);
+  let sessionRowsSeen = $state(false);
+  let geometryPolicy = $derived(
+    resolveSessionGeometryPolicy(
+      sessionRows.find((row) => row.name === session),
+      sessionRowsSeen,
+    ),
+  );
+  let fixedGeometry = $derived(geometryPolicy.kind === 'fixed' ? geometryPolicy.geometry : null);
+  // NEWARCH fit-font: `auto` (default) shrinks the drawn font until the birth
+  // columns fit; `manual` keeps the user's size and scrolls sideways. Stored
+  // in prefs under `fontFit` (ThumbmuxPrefs carries host extras); the drawn
+  // size itself is never stored — `fontPx` stays the user's ceiling.
+  let fontFitMode = $state<FontFitMode>('auto');
+  let shownFontFit = $state<{ fontPx: number; fits: boolean } | null>(null);
+  let stageEl = $state<HTMLDivElement | null>(null);
+  // Space kept under a fixed pane's live tail so the ❯ button never covers
+  // the prompt row. Measured from the real button; the fallback is its stock
+  // footprint (52px + 14px offset + a little air) until layout exists.
+  const FAB_TAIL_FALLBACK_PX = 72;
+  let tailClearance = $state(FAB_TAIL_FALLBACK_PX);
+  function measureTailClearance(): number {
+    const host = stageEl?.querySelector<HTMLElement>('.mtv-host')?.getBoundingClientRect();
+    const fab = stageEl?.querySelector<HTMLElement>('.fab')?.getBoundingClientRect();
+    if (!host || !fab || host.height <= 0 || fab.height <= 0) return FAB_TAIL_FALLBACK_PX;
+    return Math.max(0, Math.ceil(host.bottom - fab.top + 6));
+  }
+  $effect(() => {
+    if (!fixedGeometry || !stageEl) return;
+    const measure = () => { tailClearance = measureTailClearance(); };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  });
   let resolvedTermProps = $derived({
     ...configuredTermProps,
-    claimGeometry: configuredTermProps.claimGeometry ?? true,
+    // Not overridable by the host: a fixed or unresolved pane never claims.
+    claimGeometry: geometryPolicy.kind === 'viewer'
+      ? configuredTermProps.claimGeometry ?? true
+      : false,
     altScreenMouse: configuredTermProps.altScreenMouse ?? false,
     palette: hostSurface?.palette ?? configuredTermProps.palette ?? fallbackSurface.palette,
     fontPx: configuredTermProps.fontPx ?? effectiveFontPx,
+    // Not overridable either: the inventory row owns the pane size.
+    fixedGeometry,
+    fontFit: fontFitMode,
+    fontFitFloorPx: fontBounds.min,
+    tailClearancePx: fixedGeometry ? tailClearance : 0,
+    onFontFit: (fit: { fontPx: number; fits: boolean }) => { shownFontFit = fit; },
   });
   let unpinNarrowCells = $derived(adapters.sessionPresentation?.pinNarrowCells === false);
   let themeMode = $derived(
@@ -149,7 +322,6 @@
   let scrollControlsHeight = $state(0);
   let termScrollState = $state({ bottomOffset: 0, scrolledUp: false });
   let hasNewContent = $state(false);
-  let sessionRows = $state<SessionListItem[]>([]);
 
   let overlay = $state<OverlayState>({
     composerOpen: false,
@@ -227,6 +399,7 @@
     if (Array.isArray(snapshot.shortcuts)) {
       shortcuts = snapshot.shortcuts.map((shortcut) => ({ ...shortcut }));
     }
+    if (snapshot.fontFit !== undefined) fontFitMode = resolveFontFitMode(snapshot.fontFit);
     claudeBashMode = CLAUDE_BASH_MODES.includes(snapshot.claudeBashMode as ClaudeBashMode)
       ? snapshot.claudeBashMode as ClaudeBashMode
       : 'off';
@@ -245,6 +418,11 @@
   function setFont(next: number): void {
     storedFontPx = clampFontPx(next, currentFontBounds());
     savePrefs({ fontPx: storedFontPx });
+  }
+
+  function setFontFit(next: FontFitMode): void {
+    fontFitMode = next;
+    savePrefs({ fontFit: next });
   }
 
   function setShortcuts(next: Shortcut[]): void {
@@ -696,6 +874,19 @@
         onTap: () => setFont(stepFontPx(storedFontPx, -1)),
       },
     );
+    if (fixedGeometry) {
+      // Fixed panes only: a legacy pane resizes tmux instead, nothing to fit.
+      stock.push({
+        id: 'font-fit',
+        label: 'FIT',
+        tag: fontFitMode === 'manual'
+          ? 'MANUAL'
+          : shownFontFit ? `AUTO ${shownFontFit.fontPx.toFixed(1)}` : 'AUTO',
+        testid: 'demo-font-fit',
+        // Stays open like A+/A− so the user can flip back after a look.
+        onTap: () => setFontFit(fontFitMode === 'manual' ? 'auto' : 'manual'),
+      });
+    }
     const extras = (adapters.extraActions?.(session, legacyActionContext) ?? [])
       .map(dismissingHostAction);
     const defaults = [...stock, ...extras];
@@ -816,6 +1007,7 @@
 
     const unsubscribeSessions = liveSessionsMux.onSessions((rows) => {
       sessionRows = normalizeSessionRows(rows as SessionListItem[]);
+      sessionRowsSeen = true;
     });
     const query = window.matchMedia('(min-width: 1024px)');
     setDesktopGate(query.matches);
@@ -905,6 +1097,7 @@
 {/snippet}
 
 <div
+  bind:this={stageEl}
   class="stage"
   data-testid="session-view"
   data-state={currentMeta?.state}
@@ -923,6 +1116,11 @@
     class="mtv-host"
     style:top={`${hudHeight}px`}
     data-mtv-unpin-narrow={unpinNarrowCells ? '' : undefined}
+    data-mtv-geometry-policy={geometryPolicy.kind}
+    data-mtv-fixed-cols={fixedGeometry?.columns}
+    data-mtv-fixed-rows={fixedGeometry?.rows}
+    style:--mtv-fixed-cols={fixedGeometry?.columns}
+    style:--mtv-fixed-rows={fixedGeometry?.rows}
   >
     {#key `${session}|${surface.tbg}`}
       {#if isDesktop}

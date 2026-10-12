@@ -70,6 +70,22 @@ const hostMux = new TmuxWsMux<HostSocket, HostSessionRow>({
 });
 hostMux.setSessionListProvider(() => hostRows);
 
+// 0.20.4 callers of handleResize/applyGeometry (then void) still compile now
+// that they return NewarchV2GeometryReply | null: a discarded result, a
+// void-typed callback slot, and a subclass that extends without overriding.
+// (A subclass overriding either method as `: void` is the reviewed break.)
+hostMux.handleResize("agent", 80, 24);
+hostMux.applyGeometry("agent", 80, 24);
+const voidResize: (session: string, cols: number, rows: number) => void =
+  hostMux.handleResize.bind(hostMux);
+class HostMux extends TmuxWsMux<HostSocket, HostSessionRow> {
+  fit(session: string): void {
+    this.handleResize(session, 120, 40);
+  }
+}
+const subclassMux = new HostMux({ driver: hostDriver, hooks: hostHooks });
+subclassMux.fit("agent");
+
 // createSpawnHandler only reads `name`, so a host driver with no stock tmux
 // fields must infer its row type without an explicit generic argument.
 const hostSpawnDriver: Pick<TmuxDriver<HostSpawnRow>, "listSessions"> = {
@@ -101,6 +117,7 @@ const noOptionsSpawnHandler = createSpawnHandler();
 
 void minimumRow;
 void hostMux;
+void voidResize;
 void completeDriver;
 void bundledDriver;
 void stockActivities;

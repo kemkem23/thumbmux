@@ -35,8 +35,26 @@
   import {
     applyHistoryWindowPage,
     createHistoryWindow,
+    historyContinuationFor,
+    historyIncidentLeftRowLabel,
+    historyIncidentStopLabel,
+    historyStatusNotes,
     historyWindowEndLine,
     historyWindowRequestCursor,
+    parseNewarchHistoryExtension,
+    presentNewarchV2,
+    fitNewarchFontPx,
+    applyNewarchV2PagerReply,
+    createNewarchV2Pager,
+    historyWindowRange,
+    newarchV2PagerAsk,
+    newarchV2PagerRetain,
+    newarchV2PaneStateLabel,
+    NEWARCH_V2_PAGER_BASE_LINE,
+    type NewarchV2PagerAsk,
+    type NewarchV2PagerState,
+    type NewarchV2StatusNote,
+    type HistoryStatusNote,
     type HistoryWindowDirection,
     type HistoryWindowLimits,
     type HistoryWindowState,
@@ -75,6 +93,7 @@
     validateHistoryPageMarkers,
     type MuxHistoryBoundary,
     type NewarchFrameMeta,
+    type NewarchHistoryExtension,
     isClaudeActivityStatusLine,
     detectClaudeBashBlocks,
     detectClaudeBashBlocksWithActivityEvidence,
@@ -94,7 +113,11 @@
     projectToolLines,
     reconcileToolBlockIds,
     type ToolCollapseBlock,
+    NEWARCH_V2_WIRE_LIMITS,
+    newarchV2SamePane,
+    type NewarchV2PaneDescriptor,
   } from '@thumbmux/core';
+  import type { NewarchV2HistoryResult } from './ws-mux.svelte';
 
   type CodexToolMode = 'off' | 'hide';
   type CodexToolProjection = ReturnType<typeof coalesceAdjacentToolProjection>;
@@ -196,6 +219,30 @@
      * newest completed group. Return summaries by id; rejection/missing ids
      * settle to a deterministic fallback. Active groups are never sent. */
     onClaudeBashSummaryRequest = undefined,
+    /** Birth geometry of a NEWARCH pane. Viewport changes must not resize it. */
+    fixedGeometry = null,
+    /** Shrink the picture to the viewport. Does not change terminal columns.
+     * Only in `fontFit: 'manual'` — `auto` already fits by font, and scaling
+     * on top would shrink twice. */
+    fitWidth = false,
+    /** Fixed-geometry panes only. `auto` shrinks the font (never below
+     * `fontFitFloorPx`, never above `fontPx`) until the birth columns fit the
+     * box; `manual` shows `fontPx` and scrolls sideways. No resize either way. */
+    fontFit = 'auto',
+    /** Lower bound of the `auto` font — the shell's `fontPxMin`. */
+    fontFitFloorPx = 4,
+    /** Fixed-geometry panes only: px kept clear under the live tail for a
+     * floating control (the ❯ button), so the prompt row is not covered. */
+    tailClearancePx = 0,
+    /** Size actually drawn on a fixed-geometry pane, and whether the birth
+     * columns fit without sideways scrolling. */
+    onFontFit = undefined,
+    /** Incident sentence drawn even when this view has no live pane. */
+    v2StatusText = null,
+    /** NEWARCH v2 pane of this session. History then pages by the pane's own
+     * cursors (`history_expand_v2`), never by line numbers. Defaults to the
+     * pane the mux learned from the session list. */
+    newarchV2Pane = null,
   }: {
     session: string;
     palette: AnsiPalette;
@@ -243,6 +290,14 @@
     onClaudeBashSummaryRequest?: (
       requests: readonly ClaudeBashSummaryRequest[],
     ) => ClaudeBashSummaries | void | Promise<ClaudeBashSummaries | void>;
+    fixedGeometry?: { columns: number; rows: number } | null;
+    fitWidth?: boolean;
+    fontFit?: 'auto' | 'manual';
+    fontFitFloorPx?: number;
+    tailClearancePx?: number;
+    onFontFit?: (fit: { fontPx: number; fits: boolean }) => void;
+    v2StatusText?: string | null;
+    newarchV2Pane?: NewarchV2PaneDescriptor | null;
   } = $props();
 
   /**
@@ -344,9 +399,20 @@
   let viewportBottom: number | null = null;
   let cursor = $state<{ row: number; col: number } | null>(null);
   let charW = $state(0);
+  let viewportWidthPx = $state(0);
   let layerEl = $state<HTMLDivElement | null>(null);
   let viewH = $state(0);
-  let lineH = $derived(Math.round(fontPx * LINE_RATIO));
+  // NEWARCH fit-font: the size the fit formula chose for a fixed pane. `fontPx`
+  // stays the user's ceiling; this is never written back to prefs.
+  let fitFontPx = $state<number | null>(null);
+  // How far a manual fixed pane is panned sideways. Box-pinned overlays are
+  // children of the scrolling `.mtv`, so they shift back by this much.
+  let panX = $state(0);
+  let autoFit = $derived(fixedGeometry != null && fontFit !== 'manual');
+  let renderFontPx = $derived(autoFit && fitFontPx !== null ? fitFontPx : fontPx);
+  // A picture scale only exists in manual; auto fits by font (one shrink).
+  let scaleToWidth = $derived(fitWidth && !autoFit);
+  let lineH = $derived(Math.round(renderFontPx * LINE_RATIO));
 
   // --- content model ---
   let rawLines: string[] = [];
@@ -531,11 +597,47 @@
   let pageLossMarkers = $state.raw<readonly LossMarker[]>([]);
   let lossMarkerPaneIdentity = '';
   const PAGE_LOSS_MARKER_LIMIT = 256;
+  const HISTORY_STATUS_NOTE_LIMIT = 6;
   /** Markers raised while this view watched; noted until their row is seen. */
   let freshLossKeys = $state.raw<ReadonlySet<string>>(new Set());
   const seenFreshLossKeys = new Set<string>();
   /** A history page read failed and nothing replaced it yet (CX M7). */
   let archiveUnavailable = $state(false);
+  // NEWARCH flag-on history states (gap/pending/remote/degraded/pressure) of
+  // the newest page per direction. Shown as notes beside the rows, never as
+  // row text, so copy and search cannot pick a label up as terminal output.
+  let historyStatusBefore = $state.raw<readonly HistoryStatusNote[]>([]);
+  let historyStatusAfter = $state.raw<readonly HistoryStatusNote[]>([]);
+  // NEWARCH v2 (D3): cursor pager + the incident/pending/stopped sentences it
+  // collected. Drawn as visible notes beside the rows, never as row text.
+  let v2Pager: NewarchV2PagerState | null = null;
+  let v2PagerNotes = $state.raw<readonly NewarchV2StatusNote[]>([]);
+  const v2Notes = $derived.by(() => {
+    const pane = currentV2Pane();
+    const paneLabel = pane ? newarchV2PaneStateLabel(pane) : null;
+    const paneNote = paneLabel && pane ? { key: `pane|${pane.state}`, text: paneLabel } : null;
+    const notes: NewarchV2StatusNote[] = [];
+    for (const note of v2PagerNotes) {
+      if (note.key !== paneNote?.key && !notes.some(held => held.key === note.key)) notes.push(note);
+    }
+    // The pane's own state stays on screen; incident sentences share the rest.
+    const kept = notes.slice(-(HISTORY_STATUS_NOTE_LIMIT - (paneNote ? 1 : 0)));
+    return paneNote ? [paneNote, ...kept] : kept;
+  });
+  // D3-r1: a v2 view counts lines from NEWARCH_V2_PAGER_BASE_LINE above the
+  // server's live seam. The v2 archive can hold more rows than the legacy
+  // liveStartLine counts (a young pane starts near 0), so pager lines would go
+  // negative; every boundary this view stores is shifted by the same amount,
+  // which keeps archive/live adjacency an exact equality. Legacy views: 0.
+  let v2LineShift = 0;
+  let v2ViewKey: string | null = null;
+  const historyStatus = $derived.by(() => {
+    const seen = new Map<string, HistoryStatusNote>();
+    for (const note of [...historyStatusBefore, ...historyStatusAfter]) {
+      if (!seen.has(note.key)) seen.set(note.key, note);
+    }
+    return [...seen.values()].slice(-HISTORY_STATUS_NOTE_LIMIT);
+  });
 
   // --- search + matching overlay ---
   let searchOpen = $state(false);
@@ -563,6 +665,10 @@
   let springFrame: number | null = null;
   let momentumWindowFrozen = false;
   let touchY = 0;
+  let touchX = 0;
+  // Axis a one-finger gesture locked to. Only a manual fixed pane wider than
+  // the box can lock 'x'; everything else is 'y' from the first move.
+  let touchAxis: 'x' | 'y' | null = null;
   let touchVel = 0;
   let touchAt = 0;
   let pendingDragPx = 0;
@@ -2564,8 +2670,26 @@
     return true;
   }
 
+  /** Fixed pane: blank rows below both the last content line and the caret.
+   * A NEWARCH pane is born taller than a phone shows (120 rows vs ~59), and
+   * tmux sends those rows; following the pane's real bottom would park the
+   * reader on an empty screen while the prompt sits far above. */
+  function fixedBlankTailPx(contentHeight: number): number {
+    if (!fixedGeometry || rawLines.length === 0) return 0;
+    const lastContent = lastContentLine(contentEpoch);
+    const caretBelow = cursor && cursor.row < 0 ? -cursor.row : 0;
+    const keepRaw = Math.min(rawLines.length, lastContent + 1 + caretBelow);
+    if (keepRaw >= rawLines.length) return 0;
+    return Math.max(0, contentHeight - presentationRowTopPx(visualRowForRaw(keepRaw)));
+  }
+
   function maxOffset(): number {
-    const contentHeight = presentationContentHeightPx();
+    const fullHeight = presentationContentHeightPx();
+    const contentHeight = fullHeight - fixedBlankTailPx(fullHeight);
+    // The live tail ends tailClearancePx above the box bottom (fixed panes).
+    const viewEff = fixedGeometry
+      ? Math.max(1, viewH - Math.max(0, Number.isFinite(tailClearancePx) ? tailClearancePx : 0))
+      : Math.max(1, viewH);
     if (
       historyPaging === 'sliding'
       && archiveWindow !== null
@@ -2581,9 +2705,9 @@
       const liveStart = visualRowForRaw(archivedLines.length);
       const liveTop = presentationRowTopPx(liveStart);
       const liveHeight = Math.max(0, contentHeight - liveTop);
-      return Math.max(0, liveTop + Math.max(0, liveHeight - Math.max(1, viewH)));
+      return Math.max(0, liveTop + Math.max(0, liveHeight - viewEff));
     }
-    return Math.max(0, contentHeight - Math.max(1, viewH));
+    return Math.max(0, contentHeight - viewEff);
   }
 
   /** Preserve an off-bottom row's physical screen position across layout.
@@ -3933,6 +4057,8 @@
   }
 
   function clearSlidingArchiveAtBoundary(liveStartLine: number, resetReader: boolean): void {
+    v2Pager = null;
+    v2PagerNotes = [];
     archiveWindow = null;
     archiveWindowAttachedToLive = true;
     detachedLiveProjectionPending = false;
@@ -4036,6 +4162,7 @@
       liveBoundaryProvesCurrentCapture = false;
       return unchanged;
     }
+    boundary = v2ViewBoundary(boundary);
     const previous = liveBoundary;
     if (previous && muxHistoryBoundaryTransition(previous, boundary) === 'regression') {
       // A reconnecting transport can race a cached full frame behind the last
@@ -4068,6 +4195,7 @@
       archiveTotalHint = boundary.liveStartLine;
       liveLines = [];
       archiveUnavailable = false;
+      clearHistoryStatus();
       clearSlidingArchiveAtBoundary(boundary.liveStartLine, true);
       return unchanged;
     }
@@ -4345,7 +4473,7 @@
       // same wire. Retire that wire first; all mux subscriptions re-arm on the
       // replacement connection and the next eligible scroll can retry safely.
       try {
-        tmuxMux.recoverHistoryRequest(requestSession);
+        if (!tmuxMux.cancelHistoryV2(requestSession)) tmuxMux.recoverHistoryRequest(requestSession);
       } catch {
         // Recovery detaches the ambiguous wire before it attempts a new
         // connection. A host URL/socket failure must not strand local state.
@@ -4371,7 +4499,18 @@
     // Mux rejection (another request owns this session, no open socket, or a
     // failed send) must not leave a phantom request that consumes another
     // caller's broadcast history reply or waits through a pointless timeout.
-    const accepted = direction === 'before'
+    const v2Pane = currentV2Pane();
+    const accepted = v2Pane
+      ? requestV2Page(
+          v2Pane,
+          direction,
+          requestId,
+          requestSession,
+          direction === 'before'
+            ? (historyPaging === 'sliding' ? cursorLine : archiveBeforeLine)
+            : (cursorLine === null ? null : cursorLine + 1),
+        )
+      : direction === 'before'
       ? tmuxMux.requestHistory(
           requestSession,
           historyPaging === 'sliding' ? cursorLine : archiveBeforeLine,
@@ -4390,6 +4529,157 @@
       return false;
     }
     return true;
+  }
+
+  function currentV2Pane(): NewarchV2PaneDescriptor | null {
+    try {
+      return newarchV2Pane ?? tmuxMux.newarchV2Pane(session);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Another pane (or a new timeline) owns this view now: no old cursor or
+   * resident row of the previous pane survives. */
+  function resetV2History(): void {
+    discardArchiveForAltScreen();
+  }
+
+  function v2ViewBoundary(boundary: MuxHistoryBoundary): MuxHistoryBoundary {
+    return v2LineShift === 0 ? boundary : { ...boundary, liveStartLine: boundary.liveStartLine + v2LineShift };
+  }
+
+  /** agy MAJOR 3: follow the pane this view reads. A different pane drops the
+   * old pane's rows, cursors and sentences at once (not at the next scroll);
+   * entering or leaving v2 restarts the boundary in the new line space. */
+  function syncV2View(): void {
+    const current = currentV2Pane();
+    const key = current
+      ? `${current.pane.serverIdentity}\u0000${current.pane.paneId}\u0000${current.pane.birthGeneration}`
+      : null;
+    if (key === v2ViewKey) return;
+    v2ViewKey = key;
+    if (v2Pager !== null || archiveWindow !== null || v2PagerNotes.length > 0) resetV2History();
+    const shift = key === null ? 0 : NEWARCH_V2_PAGER_BASE_LINE;
+    if (shift === v2LineShift) return;
+    v2LineShift = shift;
+    liveBoundary = null;
+    liveBoundaryProvesCurrentCapture = false;
+    liveBoundaryAdmission = createLiveBoundaryAdmission();
+  }
+
+  $effect(() => {
+    currentV2Pane();
+    untrack(syncV2View);
+  });
+
+  function requestV2Page(
+    pane: NewarchV2PaneDescriptor,
+    direction: HistoryWindowDirection,
+    requestId: number,
+    requestSession: string,
+    edgeLine: number | null,
+  ): boolean {
+    syncV2View();
+    if (v2Pager && !newarchV2SamePane(v2Pager.pane.pane, pane.pane)) resetV2History();
+    if (!v2Pager) {
+      if (archiveWindow) {
+        // Rows paged before this pane was known carry no v2 cursor.
+        discardArchiveForAltScreen();
+        edgeLine = null;
+      }
+      v2Pager = createNewarchV2Pager(pane, liveBoundary ? liveBoundary.liveStartLine : NEWARCH_V2_PAGER_BASE_LINE);
+    } else if (v2Pager.pane !== pane) {
+      v2Pager = { ...v2Pager, pane };
+    }
+    if (archiveWindow) v2Pager = newarchV2PagerRetain(v2Pager, historyWindowRange(archiveWindow));
+    const ask = newarchV2PagerAsk(v2Pager, direction, edgeLine);
+    if (ask.kind === 'end') {
+      if (direction === 'before') {
+        archiveExhausted = true;
+        historyStopReason = 'exhausted';
+      }
+      return false;
+    }
+    if (ask.kind !== 'ask') {
+      // No cursor is known for this edge: start over from the pane's tail
+      // rather than guess a position (never a line number on the wire).
+      resetV2History();
+      return false;
+    }
+    const pending = tmuxMux.requestHistoryV2(requestSession, pane, {
+      cursor: ask.cursor,
+      direction,
+      maxEntries: NEWARCH_V2_WIRE_LIMITS.pageEntries,
+      maxBytes: NEWARCH_V2_WIRE_LIMITS.pageBytes,
+    });
+    if (!pending) return false;
+    void pending.then(
+      result => receiveV2Result(requestId, requestSession, ask, result),
+      () => receiveV2Result(requestId, requestSession, ask, { kind: 'cancelled' }),
+    );
+    return true;
+  }
+
+  function receiveV2Result(
+    requestId: number,
+    requestSession: string,
+    ask: Extract<NewarchV2PagerAsk, { kind: 'ask' }>,
+    result: NewarchV2HistoryResult,
+  ): void {
+    // Superseded, timed out, or a reply for a session this view left.
+    if (destroyed || archiveInflightRequestId !== requestId || !archiveRequestActive) return;
+    if (requestSession !== session) return;
+    if (result.kind === 'disconnected') {
+      // Same cursor is asked again after reconnect; never an EOF.
+      applyArchiveReadError();
+      return;
+    }
+    if (result.kind === 'cancelled') {
+      finishArchiveRequest('empty');
+      return;
+    }
+    if (result.kind === 'pane-changed') {
+      resetV2History();
+      finishArchiveRequest('empty');
+      return;
+    }
+    if (result.kind === 'mismatch' || !v2Pager) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    const applied = applyNewarchV2PagerReply(v2Pager, ask, result.reply);
+    if (applied.kind === 'reset') {
+      resetV2History();
+      finishArchiveRequest('empty');
+      return;
+    }
+    if (applied.kind === 'refused') {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    v2Pager = applied.state;
+    v2PagerNotes = applied.state.notes;
+    if (applied.kind === 'retry') {
+      applyArchiveReadError();
+      return;
+    }
+    if (applied.lines.length === 0 && applied.hasMore) {
+      // Blocked (pending storage / remote) or incident-only page: the edge
+      // stays open and its sentence is on screen; nothing to draw yet.
+      if (applied.blocked) archiveUnavailable = true;
+      finishArchiveRequest('empty');
+      return;
+    }
+    const startLine = applied.startLine;
+    const endLine = startLine === null ? null : startLine + applied.lines.length;
+    applyArchivedHistory(JSON.stringify({
+      lines: applied.lines,
+      startLine,
+      endLine,
+      hasMore: applied.hasMore,
+      totalArchivedLines: Math.max(v2Pager.baseLine, endLine ?? 0),
+    }));
   }
 
   function requestOlderHistory(): boolean {
@@ -4861,6 +5151,8 @@
     totalArchivedLines: number;
     hasMore: boolean;
     markers: LossMarker[];
+    /** Flag-on states; null on a legacy page. */
+    flagOn: NewarchHistoryExtension | null;
   };
 
   function parseHistoryPage(data: string): ParsedHistoryPage | null {
@@ -4917,6 +5209,9 @@
     // drawing its rows without their gaps would hide a loss.
     const markers = validateHistoryPageMarkers(candidate.markers);
     if (markers === null) return null;
+    // Same rule for flag-on states: unreadable states refuse the page.
+    const flagOn = parseHistoryPageFlagOn(payload);
+    if (flagOn === undefined) return null;
     return {
       lines: [...lines],
       startLine,
@@ -4924,7 +5219,57 @@
       totalArchivedLines,
       hasMore: candidate.hasMore,
       markers: markers.map(marker => ({ lineId: marker.lineId, kind: marker.kind, missingCount: marker.missingCount })),
+      flagOn,
     };
+  }
+
+  /** undefined = present but unreadable (refuse the page); null = legacy. */
+  function parseHistoryPageFlagOn(payload: object): NewarchHistoryExtension | null | undefined {
+    if (!('flagOn' in payload) || (payload as { flagOn?: unknown }).flagOn === undefined) return null;
+    return parseNewarchHistoryExtension((payload as { flagOn: unknown }).flagOn) ?? undefined;
+  }
+
+  /**
+   * Flag-on continuation for the requested direction, checked against the
+   * legacy flag. `end` with hasMore, or blocked/more without it, is a lying
+   * page: refuse it rather than draw a false EOF or a false "more".
+   */
+  function flagOnContinuation(
+    flagOn: NewarchHistoryExtension | null,
+    direction: HistoryWindowDirection,
+    hasMore: boolean,
+  ): 'end' | 'more' | 'blocked' | null | undefined {
+    if (flagOn === null) return null;
+    const continuation = historyContinuationFor(flagOn, direction);
+    return (continuation === 'end') === hasMore ? undefined : continuation;
+  }
+
+  /** The opaque cursor the server handed for this edge; `end` has none. */
+  function flagOnCursorFor(
+    flagOn: NewarchHistoryExtension | null,
+    direction: HistoryWindowDirection,
+  ): { version: 1; token: string } | null {
+    const edge = flagOn === null ? null : direction === 'before' ? flagOn.before : flagOn.after;
+    return edge === null || edge.kind === 'end' ? null : { version: 1, token: edge.cursor.token };
+  }
+
+  /** A seeded window keeps the older-edge cursor of the page that seeded it. */
+  function withFlagOnCursorBefore(state: HistoryWindowState, flagOn: NewarchHistoryExtension | null): HistoryWindowState {
+    const cursor = flagOnCursorFor(flagOn, 'before');
+    return cursor ? { ...state, flagOnCursorBefore: cursor } : state;
+  }
+
+  function recordHistoryStatus(flagOn: NewarchHistoryExtension | null, direction: HistoryWindowDirection): void {
+    const notes = flagOn ? historyStatusNotes(flagOn) : [];
+    const held = direction === 'before' ? historyStatusBefore : historyStatusAfter;
+    if (held.length === 0 && notes.length === 0) return;
+    if (direction === 'before') historyStatusBefore = notes;
+    else historyStatusAfter = notes;
+  }
+
+  function clearHistoryStatus(): void {
+    if (historyStatusBefore.length) historyStatusBefore = [];
+    if (historyStatusAfter.length) historyStatusAfter = [];
   }
 
   function seedSlidingHistoryWindow(history: ParsedHistoryPage): {
@@ -5016,7 +5361,7 @@
         }
       }
       return {
-        state: createHistoryWindow({
+        state: withFlagOnCursorBefore(createHistoryWindow({
           startLine: normalizedStartLine + keepFrom,
           lines: normalizedHistoryLines.slice(keepFrom),
           lineBytes: lineBytes.slice(keepFrom),
@@ -5029,7 +5374,7 @@
             ? history.endLine !== liveBoundary.liveStartLine
             : history.endLine < history.totalArchivedLines,
           limits,
-        }),
+        }), history.flagOn),
         live,
         livePrefixDropped,
         entryState,
@@ -5332,12 +5677,19 @@
       return;
     }
     const history = parseHistoryPage(data);
-    if (!history || (history.lines.length === 0 && history.hasMore)) {
+    const continuation = history ? flagOnContinuation(history.flagOn, direction, history.hasMore) : undefined;
+    if (
+      !history
+      || continuation === undefined
+      // Only a blocked edge may arrive empty with more to read.
+      || (history.lines.length === 0 && history.hasMore && continuation !== 'blocked')
+    ) {
       finishArchiveRequest('malformed');
       return;
     }
     archiveTotalHint = Math.max(archiveTotalHint, history.totalArchivedLines);
     recordPageLossMarkers(history.markers);
+    recordHistoryStatus(history.flagOn, direction);
     if (archiveWindow && isAwayFromLiveTail()) {
       detachSlidingArchiveFromLive(archiveTotalHint);
     }
@@ -5401,6 +5753,10 @@
                 : history.endLine < archiveTotalHint
             )
           : history.hasMore,
+        // The after-edge hasMore above may be widened by the live boundary,
+        // so only the blocked state is passed through (it never means EOF).
+        ...(continuation === 'blocked' ? { continuation } : {}),
+        flagOnCursor: flagOnCursorFor(history.flagOn, direction),
       },
       { anchor: reader.anchor, protectedRange: reader.protectedRange },
     );
@@ -5519,6 +5875,15 @@
     }
 
     const history = candidate as { lines: string[]; startLine?: number | null; hasMore: boolean };
+    const flagOn = parseHistoryPageFlagOn(payload as object);
+    const continuation = flagOn === undefined ? undefined : flagOnContinuation(flagOn, 'before', history.hasMore);
+    // flagOn === undefined always yields continuation === undefined; the
+    // explicit check narrows flagOn for recordHistoryStatus.
+    if (flagOn === undefined || continuation === undefined) {
+      finishArchiveRequest('malformed');
+      return;
+    }
+    recordHistoryStatus(flagOn, 'before');
     const lines = history.lines;
     const historyStartLine = typeof history.startLine === 'number' ? history.startLine : null;
     if (
@@ -5530,8 +5895,11 @@
     }
     // A nonempty page without a numeric cursor can be rendered once, but it
     // cannot be advanced safely: requesting before null would duplicate it.
-    const serverSaysEnd =
-      historyStartLine === null || !history.hasMore || lines.length === 0;
+    // A blocked edge (pending/gap/remote) is never the end; only a nonempty
+    // cursorless page still cannot be advanced from.
+    const serverSaysEnd = continuation === 'blocked'
+      ? historyStartLine === null && lines.length > 0
+      : historyStartLine === null || !history.hasMore || lines.length === 0;
     if (lines.length === 0) {
       // An empty page contributes no resident bytes, even if a custom host
       // sends a numeric cursor with it. Keep the last resident floor; only the
@@ -5602,7 +5970,7 @@
   function admitLiveDelivery(meta?: MuxDeliveryMeta): boolean {
     const boundary = meta?.boundary;
     if (!boundary || historyPaging !== 'sliding') return true;
-    const result = admitLiveBoundary(liveBoundaryAdmission, liveBoundary, boundary);
+    const result = admitLiveBoundary(liveBoundaryAdmission, liveBoundary, v2ViewBoundary(boundary));
     liveBoundaryAdmission = result.admission;
     return result.accepted;
   }
@@ -5674,6 +6042,7 @@
     if (identity !== lossMarkerPaneIdentity) {
       lossMarkerPaneIdentity = identity;
       if (pageLossMarkers.length) pageLossMarkers = [];
+      clearHistoryStatus();
     }
     lossMarkerFrame = { liveStartLine: newarch.liveStartLine, lines: frameLines };
     lossMarkers = newarch.markers.map(marker => ({ ...marker }));
@@ -6018,7 +6387,14 @@
 
     if (layerEl) {
       const y = presentationRowTopPx(winStart) - scrollTop - (overshoot * 0.35);
-      layerEl.style.transform = `translate3d(0, ${y.toFixed(2)}px, 0)`;
+      const translate = `translate3d(0, ${y.toFixed(2)}px, 0)`;
+      // Fit-width scales the picture only. Birth columns stay on the grid.
+      if (fixedGeometry && scaleToWidth && fixedPresentation && fixedPresentation.scale > 0) {
+        layerEl.style.transformOrigin = 'top left';
+        layerEl.style.transform = `${translate} scale(${fixedPresentation.scale})`;
+      } else {
+        layerEl.style.transform = translate;
+      }
     }
     emitScrollState();
     if (!busy()) settledBottomOffsetPx = reportedBottomOffset();
@@ -6056,10 +6432,31 @@
     return e.deltaY;
   }
 
+  // Sideways wheel on a manual fixed pane: a trackpad's deltaX, or shift+wheel
+  // where the browser still reports deltaY. Vertical-dominant wheels fall
+  // through to history scrolling untouched.
+  function panWheelX(e: WheelEvent): boolean {
+    if (!canPanX() || !viewportEl) return false;
+    let dx = e.deltaX;
+    let dy = e.deltaY;
+    if (e.shiftKey && dx === 0) { dx = dy; dy = 0; }
+    if (dx === 0 || Math.abs(dx) <= Math.abs(dy)) return false;
+    const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+      ? Math.max(1, charW || 8)
+      : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? viewportEl.clientWidth : 1;
+    viewportEl.scrollLeft += dx * unit;
+    return true;
+  }
+
   function onWheel(e: WheelEvent) {
     updateSelectionActive();
     if (selectionActive) return;
 
+    if (panWheelX(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (useSgrMouse) {
       forwardAltWheel(e);
       return;
@@ -6117,6 +6514,20 @@
     if (!bounds) return null;
     if (bounds.width <= 0 || bounds.height <= 0) return null;
     const cellW = Math.max(1, charW || measureCharWidth());
+    if (fixedGeometry) {
+      const naturalW = geom.cols * cellW;
+      const scale = scaleToWidth && naturalW > 0 ? Math.max(bounds.width, 1) / naturalW : 1;
+      const scrollX = scaleToWidth ? 0 : viewportEl.scrollLeft;
+      return {
+        rect: {
+          left: bounds.left - scrollX,
+          top: bounds.top,
+          width: naturalW * scale,
+          height: Math.max(1, geom.rows * lineH * scale),
+        },
+        geom,
+      };
+    }
     const gridW = Math.min(Math.max(1, bounds.width - 12), geom.cols * cellW);
     // contentCellFromPoint scales the rect across geom.rows, so the rect it gets
     // must be the box those rows actually occupy — rows * lineH — not the box the
@@ -6241,6 +6652,16 @@
     flushPendingContent();
   }
 
+  // A manual fixed pane draws its birth columns at the user's size and lets
+  // them run past the box (`.mtv-fixed` overflow-x). `.mtv` is touch-action:
+  // none, so the browser never pans it — the sideways motion is ours to apply.
+  function canPanX(): boolean {
+    return !!viewportEl && fixedGeometry != null && !autoFit && !scaleToWidth
+      && viewportEl.scrollWidth - viewportEl.clientWidth > 0.5;
+  }
+
+  const AXIS_LOCK_PX = 6;
+
   // --- gesture physics (px-true, no quantization, iOS decel curve) ---
   function onTouchStart(e: TouchEvent) {
     updateSelectionActive();
@@ -6258,6 +6679,8 @@
         return;
       }
       altTouchY = touch.clientY;
+      touchX = touch.clientX;
+      touchAxis = canPanX() ? null : 'y';
       altTouchHitArea = contentHitArea();
       return;
     }
@@ -6271,6 +6694,8 @@
     pendingDragPx = 0;
     tapStart = { x: touch.clientX, y: touch.clientY, t: performance.now() };
     touchY = touch.clientY;
+    touchX = touch.clientX;
+    touchAxis = canPanX() ? null : 'y';
     touchAt = performance.now();
     touchVel = 0;
   }
@@ -6300,6 +6725,21 @@
       }
       e.stopPropagation();
       if (e.cancelable) e.preventDefault();
+      if (touchAxis === null) {
+        const ax = Math.abs(touch.clientX - touchX);
+        const ay = Math.abs(touch.clientY - altTouchY);
+        if (Math.max(ax, ay) < AXIS_LOCK_PX) return;
+        touchAxis = ax > ay ? 'x' : 'y';
+      }
+      if (touchAxis === 'x') {
+        const dx = touch.clientX - touchX;
+        touchX = touch.clientX;
+        if (dx !== 0 && viewportEl) {
+          altTouchMoved = true; // a pan is not a tap on touchend
+          viewportEl.scrollLeft -= dx;
+        }
+        return;
+      }
       const dy = touch.clientY - altTouchY;
       altTouchY = touch.clientY;
       if (dy !== 0) {
@@ -6327,6 +6767,20 @@
     e.preventDefault();
     const touch = e.touches.item(0);
     if (!touch) return;
+    if (touchAxis === null) {
+      // Hold still until the finger shows a direction; the held distance is
+      // applied on the locked axis, so nothing is lost.
+      const ax = Math.abs(touch.clientX - touchX);
+      const ay = Math.abs(touch.clientY - touchY);
+      if (Math.max(ax, ay) < AXIS_LOCK_PX) return;
+      touchAxis = ax > ay ? 'x' : 'y';
+    }
+    if (touchAxis === 'x') {
+      const dx = touch.clientX - touchX;
+      touchX = touch.clientX;
+      if (dx !== 0 && viewportEl) viewportEl.scrollLeft -= dx;
+      return;
+    }
     const y = touch.clientY;
     const dy = y - touchY;
     touchY = y;
@@ -6622,18 +7076,39 @@
 
   let measureCtx: CanvasRenderingContext2D | null = null;
 
-  function measureFontSpec(): string {
+  function measureFontSpec(px: number = renderFontPx): string {
     // Measure the font the DOM actually renders — hardcoding a family drifts
     // the col math when that font isn't installed (issue #1).
     const fam = (viewportEl && getComputedStyle(viewportEl).fontFamily) || "'JetBrains Mono', monospace";
-    return `${fontPx}px ${fam}`;
+    return `${px}px ${fam}`;
   }
 
-  function measureCharWidth(): number {
+  function measureCharWidth(px: number = renderFontPx): number {
     if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
-    if (!measureCtx) return fontPx * 0.6;
-    measureCtx.font = measureFontSpec();
+    if (!measureCtx) return px * 0.6;
+    measureCtx.font = measureFontSpec(px);
     return measureCtx.measureText('MMMMMMMMMM').width / 10;
+  }
+
+  let lastFontFit: { fontPx: number; fits: boolean } | null = null;
+  /** Fixed pane: choose the drawn size from the box width. Pure presentation —
+   * tmux keeps its birth geometry, so nothing here can reach sendResize. */
+  function fitFixedFont(geometry: { columns: number; rows: number }, widthPx: number): number {
+    const floor = Number.isFinite(fontFitFloorPx) && fontFitFloorPx > 0 ? fontFitFloorPx : 4;
+    const fit = fitNewarchFontPx({
+      columns: geometry.columns,
+      containerWidthPx: widthPx,
+      ceilingPx: fontPx,
+      bounds: { min: Math.min(floor, fontPx), max: Math.max(floor, fontPx) },
+      measureCellPx: (px) => measureCharWidth(px),
+      mode: fontFit === 'manual' ? 'manual' : 'auto',
+    });
+    fitFontPx = fit.fontPx;
+    if (!lastFontFit || lastFontFit.fontPx !== fit.fontPx || lastFontFit.fits !== fit.fits) {
+      lastFontFit = fit;
+      onFontFit?.(fit);
+    }
+    return measureCharWidth(autoFit ? fit.fontPx : fontPx);
   }
 
   // Caret column on the terminal grid. Dual-width glyphs (CJK/emoji) are
@@ -6644,7 +7119,7 @@
   let cursorPosCache = { key: '', left: 0, width: 0 };
   function cursorPos(cline: number, col: number): { left: number; width: number } {
     const raw = rawLines[cline] ?? '';
-    const key = `${col}|${fontPx}|${charW}|${raw}`;
+    const key = `${col}|${renderFontPx}|${charW}|${raw}`;
     if (cursorPosCache.key === key) return cursorPosCache;
     const left = col * charW;
     let width = charW;
@@ -6687,6 +7162,7 @@
   }
 
   function canSendResize(): boolean {
+    if (fixedGeometry) return false;
     return !!(
       claimGeometry &&
       typeof document !== 'undefined' &&
@@ -6706,6 +7182,14 @@
     // docked composer shrinks what's visible, not the pane the agent runs in.
     const h = visibleH + Math.max(0, bottomInsetPx);
     if (w <= 0 || visibleH <= 0 || h <= 0) return null;
+    if (fixedGeometry) {
+      charW = fitFixedFont(fixedGeometry, w);
+      viewportWidthPx = w;
+      lastPushedCols = fixedGeometry.columns;
+      lastPushedRows = fixedGeometry.rows;
+      applyScroll();
+      return { cols: lastPushedCols, rows: lastPushedRows, changed: false };
+    }
     const cw = measureCharWidth();
     charW = cw;
     const cols = Math.max(minCols, Math.floor((w - 12) / cw));
@@ -6774,12 +7258,55 @@
   let lastFontPx: number | null = null;
   $effect(() => {
     if (lastFontPx !== null && fontPx !== lastFontPx) {
-      // Paint on every tap. Only the tmux resize is deferred — a burst of
-      // A+ must not reprint the agent header N times (BRIEF-H).
-      refreshVisualLayout();
-      scheduleFontResize();
+      if (untrack(() => fixedGeometry) != null) {
+        // A fixed pane never resizes, so there is nothing to debounce: refit
+        // the drawn size against the new ceiling right away.
+        untrack(() => measureGeometry());
+        refreshVisualLayout();
+      } else {
+        // Paint on every tap. Only the tmux resize is deferred — a burst of
+        // A+ must not reprint the agent header N times (BRIEF-H).
+        refreshVisualLayout();
+        scheduleFontResize();
+      }
     }
     lastFontPx = fontPx;
+  });
+
+  // Birth geometry usually lands after mount: SessionView mounts this view
+  // while the inventory is pending, and no viewport change follows the row.
+  // Refit on the prop itself, or the first legacy-style measure (e.g. 48 cols
+  // at 13px) stays on screen until the phone is rotated.
+  let lastFixedKey: string | null | undefined = undefined;
+  $effect(() => {
+    const key = fixedGeometry ? `${fixedGeometry.columns}x${fixedGeometry.rows}` : null;
+    if (lastFixedKey !== undefined && key !== lastFixedKey) {
+      untrack(() => {
+        if (key === null) {
+          // Became a legacy pane: drop the fit and measure the old way, which
+          // re-claims only if this host claims (canSendResize).
+          fitFontPx = null;
+          lastFontFit = null;
+          lastPushedCols = 0;
+          pushGeometry({ force: true });
+        } else {
+          measureGeometry();
+        }
+        refreshVisualLayout();
+      });
+    }
+    lastFixedKey = key;
+  });
+
+  // auto ⇄ manual, or a new floor: refit only (no resize — fixed panes only).
+  let lastFontFitKey: string | null = null;
+  $effect(() => {
+    const key = `${fontFit}|${fontFitFloorPx}`;
+    if (lastFontFitKey !== null && key !== lastFontFitKey && untrack(() => fixedGeometry) != null) {
+      untrack(() => measureGeometry());
+      refreshVisualLayout();
+    }
+    lastFontFitKey = key;
   });
 
   const warnedBottomInsetValues = new Set<number>();
@@ -6898,6 +7425,9 @@
    * Live pane content stays.
    */
   function discardArchiveForAltScreen(): void {
+    v2Pager = null;
+    v2PagerNotes = [];
+    clearHistoryStatus();
     cancelScheduledPrependWork();
     pendingPrependWork = null;
     prependParseSeq++;
@@ -7225,12 +7755,34 @@
     });
   }
 
+  const fixedPresentation = $derived(
+    fixedGeometry && charW > 0 && viewportWidthPx > 0
+      ? presentNewarchV2(
+          { columns: fixedGeometry.columns, rows: fixedGeometry.rows },
+          {
+            widthPx: viewportWidthPx,
+            heightPx: viewportEl?.clientHeight ?? 0,
+            cellWidthPx: charW,
+            cellHeightPx: lineH,
+            keyboardInsetPx: bottomInsetPx,
+            fitWidth: scaleToWidth,
+            scrollXPx: 0,
+          },
+        )
+      : null,
+  );
+  const fixedLayerWidth = $derived(
+    fixedGeometry && charW > 0 ? `${fixedGeometry.columns * charW + 12}px` : undefined,
+  );
+
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
 <div
   bind:this={viewportEl}
   class="mtv"
+  class:mtv-fixed={fixedGeometry != null}
+  class:mtv-fit={fixedGeometry != null && scaleToWidth}
   data-testid="mtv"
   data-total={total}
   data-raw-total={rawLines.length}
@@ -7253,7 +7805,11 @@
   data-archive-offset={archiveOffset}
   data-last-cols={lastPushedCols}
   data-last-rows={lastPushedRows}
+  data-font-fit={fixedGeometry ? (autoFit ? 'auto' : 'manual') : undefined}
+  data-font-px={fixedGeometry ? renderFontPx : undefined}
+  data-tail-clearance={fixedGeometry ? tailClearancePx : undefined}
   data-history-stop={historyStopReason}
+  data-history-states={historyStatus.length ? historyStatus.map(note => note.kind).join(' ') : undefined}
   data-history-paging={historyPaging}
   data-history-ceiling={historyPaging === 'ceiling' && historyStopReason === 'ceiling' ? '1' : undefined}
   data-history-window-start={archiveWindow?.startLine}
@@ -7263,6 +7819,7 @@
   data-history-window-attached={archiveWindow ? (archiveWindowAttachedToLive ? '1' : '0') : undefined}
   data-history-window-has-older={archiveWindow ? (archiveWindow.hasOlder ? '1' : '0') : undefined}
   data-history-window-has-newer={archiveWindow ? (archiveWindow.hasNewer ? '1' : '0') : undefined}
+  data-history-flag-cursor={archiveWindow?.flagOnCursorBefore?.token}
   data-history-live-start={liveBoundary?.liveStartLine}
   data-history-generation={liveBoundary?.generation}
   data-history-total-hint={archiveTotalHint}
@@ -7277,10 +7834,11 @@
   data-live-cursor-col={cursor?.col}
   data-content-update-busy={busy() ? '1' : '0'}
   data-content-update-selection={selectionActive ? '1' : '0'}
-  style:font-size={`${fontPx}px`}
+  style:font-size={`${renderFontPx}px`}
   style:line-height={`${lineH}px`}
   style:--mtv-lineh={`${lineH}px`}
   style:--mtv-cw={charW > 0 ? `${charW}px` : '1ch'}
+  style:--mtv-pan-x={fixedGeometry && panX ? `${panX}px` : undefined}
   style:--tfg={palette.defaultFg}
   style:--tbg={palette.defaultBg}
   ontouchstart={onTouchStart}
@@ -7290,6 +7848,7 @@
   onpointerdown={onPointerDown}
   onpointerup={onPointerUp}
   onwheel={onWheel}
+  onscroll={() => { panX = fixedGeometry && viewportEl ? viewportEl.scrollLeft : 0; }}
   onclick={onClick}
 >
   {#if searchOpen}
@@ -7316,7 +7875,22 @@
       />
     </div>
   {/if}
-  <div bind:this={layerEl} class="mtv-layer">
+  {#if v2StatusText}
+    <div class="mtv-v2-status" role="note">
+      <span class="mtv-v2-status-text">{v2StatusText}</span>
+    </div>
+  {/if}
+  {#if fixedPresentation?.horizontalScroll}
+    <div class="mtv-hscroll" role="note">
+      <span class="mtv-hscroll-text">เลื่อนข้างได้</span>
+    </div>
+  {/if}
+  <div
+    bind:this={layerEl}
+    class="mtv-layer"
+    class:mtv-layer-fixed={fixedGeometry != null}
+    style:width={fixedLayerWidth}
+  >
     {#if renderer === 'canvas'}
       <CanvasTerminal
         lines={canvasWindowLines()}
@@ -7326,7 +7900,7 @@
         cols={Math.max(1, lastPushedCols)}
         cellWidth={charW}
         lineHeight={lineH}
-        fontSize={fontPx}
+        fontSize={renderFontPx}
         fontFamily={canvasFontFamily}
         vectorFont={canvasVectorFont}
         strokeWidth={canvasStrokeWidth}
@@ -7469,7 +8043,7 @@
       <span class="mtv-signpost-text">Alternate screen · no scrollback</span>
     </div>
   {/if}
-  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable}
+  {#if lossMarkerPlacement.notes.length > 0 || archiveUnavailable || historyStatus.length > 0 || v2Notes.length > 0}
     <div class="mtv-loss-notes" data-testid="mtv-loss-notes" lang="th">
       {#if lossMarkerPlacement.notes.length > 0}
         {@const newest = lossMarkerPlacement.notes[lossMarkerPlacement.notes.length - 1]!}
@@ -7486,6 +8060,37 @@
           <span class="mtv-signpost-text">{note}</span>
         </button>
       {/if}
+      {#each historyStatus as note (note.key)}
+        {@const stopLabel = historyIncidentStopLabel(note)}
+        <div
+          class="mtv-loss-note mtv-history-status"
+          role="note"
+          data-testid="mtv-history-status"
+          data-history-state={note.kind}
+          data-history-state-detail={note.detail}
+          data-history-opened-at={note.openedAtWallMs === undefined ? undefined : String(note.openedAtWallMs)}
+          data-history-left-row={historyIncidentLeftRowLabel(note)}
+          data-incident-id={note.incidentId}
+          aria-label={stopLabel ? `${note.text} · ${stopLabel}` : note.text}
+          title={note.detail}
+        >
+          <span class="mtv-signpost-text">{note.text}</span>
+          {#if stopLabel}
+            <span class="mtv-signpost-text" data-testid="mtv-history-stop">{stopLabel}</span>
+          {/if}
+        </div>
+      {/each}
+      {#each v2Notes as note (note.key)}
+        <div
+          class="mtv-loss-note mtv-history-status"
+          role="note"
+          data-testid="mtv-v2-history-note"
+          data-v2-note={note.key}
+          aria-label={note.text}
+        >
+          <span class="mtv-signpost-text">{note.text}</span>
+        </div>
+      {/each}
       {#if archiveUnavailable}
         <div class="mtv-loss-note" role="note" data-testid="mtv-archive-unavailable"
           aria-label="อ่านประวัติส่วนนี้ไม่ได้ตอนนี้ · เลื่อนอีกครั้งเพื่อลองใหม่">
@@ -7635,10 +8240,53 @@
     max-width: min(24rem, calc(100% - 0.9rem));
     pointer-events: auto;
   }
+  .mtv-fixed {
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .mtv-fixed.mtv-fit {
+    overflow-x: hidden;
+  }
+  .mtv-fixed > .mtv-search,
+  .mtv-fixed > .mtv-v2-status,
+  .mtv-fixed > .mtv-hscroll,
+  .mtv-fixed > .mtv-wait,
+  .mtv-fixed > .mtv-no-scrollback,
+  .mtv-fixed > .mtv-loss-notes {
+    translate: var(--mtv-pan-x, 0px) 0;
+  }
+  .mtv-v2-status,
+  .mtv-hscroll {
+    position: absolute;
+    left: 0;
+    right: 0;
+    z-index: 6;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mtv-v2-status { top: 0; }
+  .mtv-hscroll { bottom: 0; }
+  .mtv-v2-status-text,
+  .mtv-hscroll-text {
+    display: inline-block;
+    max-width: 100%;
+    padding: 2px 6px;
+    box-sizing: border-box;
+    font: 600 12px / 1.35 var(--font-mono, ui-monospace, monospace);
+    color: #141414;
+    background: #E0A020;
+  }
   .mtv-layer {
     position: absolute; left: 0; right: 0; top: 0;
     will-change: transform;
     padding: 0 6px;
+  }
+  .mtv-fixed .mtv-layer-fixed {
+    right: auto;
+    /* fixedLayerWidth already counts the 6+6 gutter; content-box would add
+       the padding again and scroll a fitted pane sideways by 12px. */
+    box-sizing: border-box;
   }
   .mtv-line {
     white-space: pre;

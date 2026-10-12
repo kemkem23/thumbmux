@@ -7,6 +7,28 @@
  * while the resident range slides in either direction.
  */
 
+import {
+  NEWARCH_FLAGON_CAPABILITIES,
+  NEWARCH_REPAIR_CAPABILITIES,
+  type NewarchGap,
+  type NewarchHistoryContinuation,
+  type NewarchHistoryExtension,
+  type NewarchHistoryState,
+  type NewarchRowId,
+  NEWARCH_V2_WIRE_LIMITS,
+  newarchV2SamePane,
+  type NewarchV2Continuation,
+  type NewarchV2FixedGeometry,
+  type NewarchV2HistoryCursor,
+  type NewarchV2HistoryReply,
+  type NewarchV2Incident,
+  type NewarchV2WireRow,
+  type NewarchV2IncidentReason,
+  type NewarchV2PaneDescriptor,
+  type NewarchV2PaneSelection,
+  type NewarchV2ReadState,
+} from '@thumbmux/core';
+
 export const HISTORY_WINDOW_MAX_ROWS = 10_000;
 export const HISTORY_WINDOW_MAX_BYTES = 8 * 1024 * 1024;
 export const HISTORY_WINDOW_ROW_OVERHEAD_BYTES = 64;
@@ -43,6 +65,10 @@ export type HistoryWindowState = Readonly<{
   hasOlder: boolean;
   hasNewer: boolean;
   limits: HistoryWindowLimits;
+  /** Opaque flag-on cursor for the older edge. Copied, never aliased to the caller. */
+  flagOnCursorBefore?: Readonly<{ version: 1; token: string }>;
+  /** Opaque flag-on cursor for the newer edge. */
+  flagOnCursorAfter?: Readonly<{ version: 1; token: string }>;
 }>;
 
 export type CreateHistoryWindowOptions = Readonly<{
@@ -85,7 +111,17 @@ export type HistoryWindowPage = Readonly<{
   lineBytes?: readonly number[];
   /** Direction-relative server continuation flag. */
   hasMore: boolean;
+  /**
+   * Flag-on continuation for this direction. `blocked` (pending, gap,
+   * remote-required, ...) keeps the edge pageable: it is never EOF, even when
+   * the page carries no rows. Absent = legacy page, `hasMore` alone decides.
+   */
+  continuation?: HistoryWindowContinuation;
+  /** Version 1 is readable. Any other shape is an unreadable cursor and refuses the page. */
+  flagOnCursor?: { readonly version: number; readonly token: string } | null;
 }>;
+
+export type HistoryWindowContinuation = NewarchHistoryContinuation['kind'];
 
 export type ApplyHistoryWindowOptions = Readonly<{
   anchor: HistoryWindowAnchor;
@@ -98,7 +134,8 @@ export type ApplyHistoryWindowOptions = Readonly<{
 }>;
 
 export type HistoryWindowApplySuccess = Readonly<{
-  kind: 'committed' | 'boundary';
+  /** `blocked`: an empty page whose edge stays open (not EOF). */
+  kind: 'committed' | 'boundary' | 'blocked';
   state: HistoryWindowState;
   anchor: HistoryWindowAnchorCommit;
   /** Portion of the incoming page retained in state; null for an empty page. */
@@ -134,8 +171,8 @@ export type HistoryWindowApplyResult =
   | HistoryWindowApplyRejected;
 
 export type HistoryWindowRequestCursor =
-  | Readonly<{ direction: 'before'; beforeLine: number }>
-  | Readonly<{ direction: 'after'; afterLine: number }>;
+  | Readonly<{ direction: 'before'; beforeLine: number; flagOnCursor?: Readonly<{ version: 1; token: string }> }>
+  | Readonly<{ direction: 'after'; afterLine: number; flagOnCursor?: Readonly<{ version: 1; token: string }> }>;
 
 function finiteInteger(value: number): boolean {
   return Number.isFinite(value) && Number.isSafeInteger(value);
@@ -294,11 +331,39 @@ export function historyWindowRequestCursor(
   direction: HistoryWindowDirection,
 ): HistoryWindowRequestCursor | null {
   if (direction === 'before') {
-    return state.hasOlder ? { direction, beforeLine: state.startLine } : null;
+    if (!state.hasOlder) return null;
+    return state.flagOnCursorBefore
+      ? { direction, beforeLine: state.startLine, flagOnCursor: state.flagOnCursorBefore }
+      : { direction, beforeLine: state.startLine };
   }
-  return state.hasNewer
-    ? { direction, afterLine: historyWindowEndLine(state) - 1 }
-    : null;
+  if (!state.hasNewer) return null;
+  return state.flagOnCursorAfter
+    ? { direction, afterLine: historyWindowEndLine(state) - 1, flagOnCursor: state.flagOnCursorAfter }
+    : { direction, afterLine: historyWindowEndLine(state) - 1 };
+}
+
+type StoredFlagCursor = Readonly<{ version: 1; token: string }>;
+
+function copyFlagCursor(value: HistoryWindowPage['flagOnCursor']): StoredFlagCursor | null | 'bad' {
+  if (value == null) return null;
+  if (value.version !== 1 || typeof value.token !== 'string' || value.token.length === 0) return 'bad';
+  return { version: 1, token: value.token };
+}
+
+function attachFlagCursor(
+  next: HistoryWindowState,
+  state: HistoryWindowState,
+  direction: HistoryWindowDirection,
+  cursor: StoredFlagCursor | null,
+): HistoryWindowState {
+  const before = direction === 'before' && cursor ? cursor : state.flagOnCursorBefore;
+  const after = direction === 'after' && cursor ? cursor : state.flagOnCursorAfter;
+  if (!before && !after) return next;
+  return {
+    ...next,
+    ...(before ? { flagOnCursorBefore: before } : {}),
+    ...(after ? { flagOnCursorAfter: after } : {}),
+  };
 }
 
 function rejected(
@@ -417,6 +482,39 @@ export function applyHistoryWindowPage(
     return rejected(state, 'invalid-page', 'history page lineBytes do not align with its lines');
   }
 
+  if (
+    page.continuation !== undefined
+    && (
+      (page.continuation !== 'end' && page.continuation !== 'more' && page.continuation !== 'blocked')
+      || (page.continuation === 'end') === page.hasMore
+    )
+  ) {
+    return rejected(state, 'invalid-page', 'flag-on continuation disagrees with hasMore');
+  }
+  const flagCursor = copyFlagCursor(page.flagOnCursor);
+  if (flagCursor === 'bad') {
+    return rejected(state, 'invalid-page', 'flag-on cursor is not readable');
+  }
+
+  if (page.lines.length === 0 && page.continuation === 'blocked') {
+    // Pending/gap/remote: nothing to merge, and the edge must stay pageable.
+    const next: HistoryWindowState = {
+      ...state,
+      lines: Array.from(state.lines),
+      lineBytes: Array.from(state.lineBytes),
+      hasOlder: page.direction === 'before' ? true : state.hasOlder,
+      hasNewer: page.direction === 'after' ? true : state.hasNewer,
+    };
+    return {
+      kind: 'blocked',
+      state: attachFlagCursor(next, state, page.direction, flagCursor),
+      anchor: anchorCommit(state, next, anchor),
+      acceptedPage: null,
+      evictedOpposite: null,
+      discardedIncoming: null,
+    };
+  }
+
   if (page.lines.length === 0) {
     if (page.hasMore) {
       return rejected(state, 'empty-page-with-more', 'an empty page cannot make directional progress while hasMore is true');
@@ -430,7 +528,7 @@ export function applyHistoryWindowPage(
     };
     return {
       kind: 'boundary',
-      state: next,
+      state: attachFlagCursor(next, state, page.direction, flagCursor),
       anchor: anchorCommit(state, next, anchor),
       acceptedPage: null,
       evictedOpposite: null,
@@ -566,10 +664,906 @@ export function applyHistoryWindowPage(
 
   return {
     kind: 'committed',
-    state: next,
+    state: attachFlagCursor(next, state, page.direction, flagCursor),
     anchor: anchorCommit(state, next, anchor),
     acceptedPage,
     evictedOpposite,
     discardedIncoming,
   };
+}
+
+// ── NEWARCH flag-on history states (display lot D) ─────────────────────────
+//
+// Status is never terminal text. These notes live beside the resident rows,
+// not inside `lines`, so copy/search over rows can never pick up a label, and
+// an unknown count renders as words, never as 0.
+
+export type HistoryStatusKind = Exclude<NewarchHistoryState['kind'], 'exact'>;
+
+export type HistoryStatusNote = Readonly<{
+  /** Stable identity from what the state names, never from row text. */
+  key: string;
+  kind: HistoryStatusKind;
+  /** Thai sentence for a reader. */
+  text: string;
+  /** Diagnostic detail (reason, range, bundle); not shown as row text. */
+  detail: string;
+  /** Present for states that a later read may clear. */
+  retryAfterMs: number | null;
+  /**
+   * Repair stop only. These sit beside the sentence: the sentence itself
+   * stays free of the incident id, the wall time, and the row coordinate.
+   * `leftRowId === null` means the stop happened before the first row.
+   */
+  openedAtWallMs?: number;
+  incidentId?: string;
+  leftRowId?: NewarchRowId | null;
+}>;
+
+function gapCountText(gap: NewarchGap): string {
+  if (gap.countKind === 'unknown') return 'จำนวนไม่ทราบ';
+  if (gap.countKind === 'estimate') return `ประมาณ ${gap.missingCount} แถว`;
+  return `${gap.missingCount} แถว`;
+}
+
+/** Reader-facing words for one state; `exact` has nothing to say. */
+export function historyStateLabel(state: NewarchHistoryState): string | null {
+  switch (state.kind) {
+    case 'exact':
+      return null;
+    case 'gap':
+      return `ช่วงนี้เก็บประวัติไม่ครบ — ${gapCountText(state.gap)}`;
+    case 'pending':
+      return 'กำลังกู้ประวัติช่วงนี้ — ยังไม่ใช่จุดสิ้นสุด';
+    case 'remote-required':
+      return 'ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน';
+    case 'remote-unavailable':
+      if (state.reason === 'offline') return 'ดึงประวัติจากคลังสำรองไม่ได้ตอนนี้ (ออฟไลน์) — ลองใหม่ภายหลัง';
+      if (state.reason === 'missing') return 'ไม่พบประวัติช่วงนี้ในคลังสำรอง';
+      return 'ประวัติช่วงนี้ในคลังสำรองเสียหาย อ่านไม่ได้';
+    case 'degraded':
+      return 'จอช่วงนี้ยังยืนยันไม่ครบ — แสดงเฉพาะส่วนที่ตรวจแล้ว';
+    case 'pressure':
+      if (!state.collecting) return 'หยุดเก็บประวัติ — พื้นที่ไม่พอ';
+      if (state.level === 'emergency') return 'พื้นที่เก็บประวัติวิกฤต — อาจหยุดเก็บเร็วๆ นี้';
+      if (state.level === 'critical') return 'พื้นที่เก็บประวัติใกล้เต็ม';
+      return 'พื้นที่เก็บประวัติเริ่มเต็ม — กำลังย้ายไปคลังสำรอง';
+  }
+}
+
+function rangeText(range: { segmentId: string; start: number; end: number }): string {
+  return `${range.segmentId}[${range.start},${range.end})`;
+}
+
+function stateKey(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): string {
+  switch (state.kind) {
+    case 'gap': {
+      const left = state.gap.leftRowId;
+      return `gap|${state.gap.episodeId}|${state.gap.reason}|${left ? `${left.segmentId}:${left.rowOrdinal}` : 'start'}`;
+    }
+    case 'pending':
+      return `pending|${state.operationId}`;
+    case 'remote-required':
+      return `remote-required|${state.bundleId}|${rangeText(state.range)}`;
+    case 'remote-unavailable':
+      return `remote-unavailable|${state.reason}|${state.bundleId}|${rangeText(state.range)}`;
+    case 'degraded':
+      return `degraded|${state.episodeId}`;
+    case 'pressure': {
+      const incident = pressureIncidentFields(state);
+      const id = incident ? `|${incident.incidentId}` : '';
+      return `pressure|${state.level}|${state.collecting ? 'collecting' : 'stopped'}${id}`;
+    }
+  }
+}
+
+function stateDetail(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): string {
+  switch (state.kind) {
+    case 'gap':
+      return `gap · ${state.gap.reason} · ${state.gap.countKind}`
+        + ` · withheld ${state.gap.withheldRows} · ${state.gap.quality}`;
+    case 'pending':
+      return `pending · ${state.operationId}`;
+    case 'remote-required':
+      return `remote-required · ${state.bundleId} · ${rangeText(state.range)}`;
+    case 'remote-unavailable':
+      return `remote-unavailable · ${state.reason} · ${state.bundleId} · ${rangeText(state.range)}`;
+    case 'degraded':
+      return `degraded · ${state.uncertainFields.join(',') || 'unknown fields'}`;
+    case 'pressure':
+      return `pressure · ${state.level} · ${state.collecting ? 'collecting' : 'stopped'}`;
+  }
+}
+
+function retryAfter(state: Exclude<NewarchHistoryState, { kind: 'exact' }>): number | null {
+  return state.kind === 'pending' || state.kind === 'remote-unavailable' ? state.retryAfterMs : null;
+}
+
+const REPAIR_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_REPAIR_CAPABILITIES);
+const INCIDENT_REASONS: ReadonlySet<string> = new Set([
+  'storage-outage', 'collector-stalled', 'collector-exit', 'io',
+]);
+
+/** `seg:ordinal` for a real row, `none` before the first row, absent on a v1 note. */
+export function historyIncidentLeftRowLabel(note: HistoryStatusNote): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(note, 'leftRowId')) return undefined;
+  if (note.leftRowId == null) return 'none';
+  return `${note.leftRowId.segmentId}:${note.leftRowId.rowOrdinal}`;
+}
+
+/**
+ * What the reader sees beside a repair stop: local wall time and the last row
+ * kept. Undefined on a v1 note. Never carries the raw ms or the incident id.
+ */
+export function historyIncidentStopLabel(note: HistoryStatusNote): string | undefined {
+  const row = historyIncidentLeftRowLabel(note);
+  if (row === undefined || note.openedAtWallMs === undefined) return undefined;
+  const at = new Date(note.openedAtWallMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const when = `${pad(at.getDate())}/${pad(at.getMonth() + 1)} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+  return `หยุดเมื่อ ${when} · ${row === 'none' ? 'ก่อนแถวแรก' : `แถวสุดท้าย ${row}`}`;
+}
+
+function copyRowId(value: Obj): NewarchRowId {
+  const pane = value.pane as Obj;
+  return {
+    pane: {
+      serverIdentity: String(pane.serverIdentity),
+      paneId: String(pane.paneId),
+      birthGeneration: pane.birthGeneration as number,
+    },
+    segmentId: String(value.segmentId),
+    rowOrdinal: value.rowOrdinal as number,
+  };
+}
+
+/** Incident carried on a pressure state. Absent when this stop never claimed one. */
+function pressureIncidentFields(state: NewarchHistoryState): {
+  incidentId: string;
+  openedAtWallMs: number;
+  leftRowId: NewarchRowId | null;
+} | null {
+  if (state.kind !== 'pressure') return null;
+  const repair = (state as { repair?: unknown }).repair;
+  if (!isObj(repair) || typeof repair.incidentId !== 'string' || typeof repair.openedAtWallMs !== 'number') return null;
+  const left = repair.leftRowId;
+  if (left !== null && !isObj(left)) return null;
+  return {
+    incidentId: repair.incidentId,
+    openedAtWallMs: repair.openedAtWallMs,
+    leftRowId: left === null ? null : copyRowId(left),
+  };
+}
+
+/** One note per distinct state, including the states that block an edge. */
+export function historyStatusNotes(extension: NewarchHistoryExtension): HistoryStatusNote[] {
+  const notes = new Map<string, HistoryStatusNote>();
+  const add = (state: NewarchHistoryState) => {
+    if (state.kind === 'exact') return;
+    const key = stateKey(state);
+    if (notes.has(key)) return;
+    const incident = pressureIncidentFields(state);
+    notes.set(key, {
+      key,
+      kind: state.kind,
+      text: historyStateLabel(state)!,
+      detail: stateDetail(state),
+      retryAfterMs: retryAfter(state),
+      ...(incident
+        ? {
+            openedAtWallMs: incident.openedAtWallMs,
+            incidentId: incident.incidentId,
+            leftRowId: incident.leftRowId,
+          }
+        : {}),
+    });
+  };
+  for (const state of extension.states) add(state);
+  if (extension.before.kind === 'blocked') add(extension.before.state);
+  if (extension.after.kind === 'blocked') add(extension.after.state);
+  return [...notes.values()];
+}
+
+export function historyContinuationFor(
+  extension: NewarchHistoryExtension,
+  direction: HistoryWindowDirection,
+): HistoryWindowContinuation {
+  return (direction === 'before' ? extension.before : extension.after).kind;
+}
+
+// ── wire validation: a page whose states cannot be read is refused, never
+// treated as an empty (EOF) page.
+
+type Obj = Record<string, unknown>;
+const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set(NEWARCH_FLAGON_CAPABILITIES);
+const GAP_REASONS: ReadonlySet<string> = new Set([
+  'pipe-eof', 'collector-exit', 'ambiguous-overlap', 'unproven-overlap', 'unknown-vt-state',
+  'interrupted-capture', 'storage-outage', 'corruption', 'identity-change', 'geometry-change',
+  'ownership-lost', 'visible-divergence',
+]);
+
+function isObj(value: unknown): value is Obj {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+function isText(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+function validPane(value: unknown): boolean {
+  return isObj(value) && typeof value.serverIdentity === 'string' && typeof value.paneId === 'string'
+    && isCount(value.birthGeneration);
+}
+function validRowRange(value: unknown): boolean {
+  return isObj(value) && validPane(value.pane) && typeof value.segmentId === 'string'
+    && isCount(value.start) && isCount(value.end) && value.start <= value.end;
+}
+function validCursor(value: unknown): boolean {
+  return isObj(value) && value.version === 1 && isText(value.token);
+}
+function validGap(value: unknown): boolean {
+  if (!isObj(value) || value.version !== 1 || !isText(value.episodeId) || !validPane(value.pane)) return false;
+  if (value.parentEpisodeId !== null && !isText(value.parentEpisodeId)) return false;
+  if (value.rightSegmentId !== null && typeof value.rightSegmentId !== 'string') return false;
+  const left = value.leftRowId;
+  if (left !== null && !(isObj(left) && validPane(left.pane) && typeof left.segmentId === 'string' && isCount(left.rowOrdinal))) return false;
+  if (typeof value.reason !== 'string' || !GAP_REASONS.has(value.reason)) return false;
+  // unknown is null, never 0; exact/estimate carry a real count.
+  if (value.countKind === 'unknown') { if (value.missingCount !== null) return false; }
+  else if (value.countKind === 'exact' || value.countKind === 'estimate') { if (!isCount(value.missingCount)) return false; }
+  else return false;
+  return isCount(value.withheldRows) && isCount(value.lowerBound)
+    && typeof value.openedAt === 'number' && Number.isFinite(value.openedAt)
+    && (value.closedAt === null || (typeof value.closedAt === 'number' && Number.isFinite(value.closedAt)))
+    && typeof value.clockEpoch === 'string'
+    && (value.quality === 'degraded' || value.quality === 'resolved');
+}
+function validRepairCaps(value: unknown): boolean {
+  if (!isObj(value) || value.revision !== 2 || !Array.isArray(value.supported) || !Array.isArray(value.required)) return false;
+  const supported = value.supported as unknown[];
+  const required = value.required as unknown[];
+  if (![...supported, ...required].every(cap => typeof cap === 'string' && REPAIR_CAPABILITIES.has(cap))) return false;
+  return required.every(cap => supported.includes(cap));
+}
+function validIncident(value: unknown, collecting: boolean): boolean {
+  if (!isObj(value) || value.revision !== 2 || !isText(value.incidentId) || !validPane(value.pane)) return false;
+  if (!('leftRowId' in value)) return false;
+  const left = value.leftRowId;
+  if (left !== null && !(isObj(left) && validPane(left.pane) && isText(left.segmentId) && isCount(left.rowOrdinal))) return false;
+  if (!isCount(value.openedAtWallMs) || !isCount(value.openedAtMonoMs) || !isText(value.clockEpoch)) return false;
+  if (value.collecting !== collecting) return false;
+  if (typeof value.reason !== 'string' || !INCIDENT_REASONS.has(value.reason)) return false;
+  if (value.quality !== 'degraded' && value.quality !== 'resolved') return false;
+  if (!('resolvedAtWallMs' in value)) return false;
+  return value.resolvedAtWallMs === null || isCount(value.resolvedAtWallMs);
+}
+function validState(value: unknown, repairClaimed: boolean): value is NewarchHistoryState {
+  if (!isObj(value)) return false;
+  switch (value.kind) {
+    case 'exact': return true;
+    case 'gap': return validGap(value.gap);
+    case 'pending': return isText(value.operationId) && isCount(value.retryAfterMs);
+    case 'remote-required': return validRowRange(value.range) && isText(value.bundleId);
+    case 'remote-unavailable':
+      return validRowRange(value.range) && isText(value.bundleId) && isCount(value.retryAfterMs)
+        && (value.reason === 'offline' || value.reason === 'missing' || value.reason === 'corrupt');
+    case 'degraded':
+      return isText(value.episodeId) && Array.isArray(value.uncertainFields)
+        && value.uncertainFields.every(field => typeof field === 'string');
+    case 'pressure': {
+      if (!(value.level === 'archive' || value.level === 'critical' || value.level === 'emergency')) return false;
+      if (typeof value.collecting !== 'boolean') return false;
+      if (typeof value.sinceMonoMs !== 'number' || !Number.isFinite(value.sinceMonoMs) || value.sinceMonoMs < 0) return false;
+      // A v1 page that never claimed repair still parses. A repair claim
+      // without an incident id, wall time, and last row is not a stop label.
+      if (!repairClaimed) return value.repair === undefined;
+      return validIncident(value.repair, value.collecting);
+    }
+    default: return false;
+  }
+}
+function validContinuation(value: unknown, repairClaimed: boolean): boolean {
+  if (!isObj(value)) return false;
+  if (value.kind === 'end') return true;
+  if (value.kind === 'more') return validCursor(value.cursor);
+  if (value.kind === 'blocked') {
+    return validCursor(value.cursor) && validState(value.state, repairClaimed) && (value.state as Obj).kind !== 'exact';
+  }
+  return false;
+}
+
+export const NEWARCH_V2_NOTE_CAP = 64;
+
+const V2_INCIDENT_REASON: Record<NewarchV2IncidentReason, string> = {
+  'geometry-violation': 'ขนาดจอถูกเปลี่ยนระหว่างเก็บ',
+  'unverified-restart': 'เครื่องดับแล้วพิสูจน์ความต่อเนื่องไม่ได้',
+  'unrecorded-birth': 'มี pane ที่ไม่ได้บันทึกตั้งแต่เกิด',
+  'birth-failed': 'เปิดเซสชันไม่สำเร็จ',
+  'pipe-eof': 'ท่อเก็บขาด',
+  'collector-epoch-changed': 'ตัวเก็บเปลี่ยนรุ่น',
+  'storage-outage': 'พื้นที่เก็บใช้ไม่ได้',
+  'budget-exhausted': 'พื้นที่เก็บเต็ม',
+  'audit-mismatch': 'ภาพจอไม่ตรงกับที่บันทึก',
+  'decoder-anomaly': 'ถอดรหัสจอไม่สมบูรณ์',
+  'identity-change': 'ตัวตนของ pane เปลี่ยน',
+};
+
+function v2WallClock(openedAtWallMs: number): string {
+  const at = new Date(openedAtWallMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(at.getDate())}/${pad(at.getMonth() + 1)} ${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+}
+
+/** Visible sentence for one incident. Frontier null is before the first row. */
+export function newarchV2IncidentLabel(incident: NewarchV2Incident): string {
+  const reason = V2_INCIDENT_REASON[incident.reason];
+  const row = incident.frontier
+    ? `แถวสุดท้าย ${incident.frontier.segmentId}:${incident.frontier.rowOrdinal}`
+    : 'ก่อนแถวแรก';
+  const stopped = incident.collecting ? '' : ' — หยุดเก็บแล้ว';
+  return `${reason} — ${v2WallClock(incident.openedAtWallMs)} — ${row}${stopped}`;
+}
+
+/** Exact history has no label. A blocked store is never described as the end. */
+export function newarchV2StateLabel(state: NewarchV2ReadState): string | null {
+  switch (state.kind) {
+    case 'exact':
+      return null;
+    case 'incident':
+      return newarchV2IncidentLabel(state.incident);
+    case 'storage-unavailable':
+      return state.pendingIncidentId
+        ? 'ที่เก็บประวัติใช้ไม่ได้ตอนนี้ — มีเหตุรอบันทึก — ยังไม่ใช่จุดสิ้นสุด'
+        : 'ที่เก็บประวัติใช้ไม่ได้ตอนนี้ — ยังไม่ใช่จุดสิ้นสุด';
+    case 'remote-unavailable':
+      if (state.reason === 'offline') return 'ดึงประวัติจากคลังสำรองไม่ได้ตอนนี้ (ออฟไลน์) — ยังไม่ใช่จุดสิ้นสุด';
+      if (state.reason === 'missing') return 'ไม่พบประวัติช่วงนี้ในคลังสำรอง — ยังไม่ใช่จุดสิ้นสุด';
+      return 'ประวัติช่วงนี้ในคลังสำรองเสียหาย อ่านไม่ได้ — ยังไม่ใช่จุดสิ้นสุด';
+  }
+}
+
+export type NewarchV2StatusNote = Readonly<{ key: string; text: string }>;
+
+/** Labels stay outside row text. The list is capped so a storm cannot grow without bound. */
+export function newarchV2StatusNotes(input: {
+  readonly entries: readonly ({ readonly kind: 'incident'; readonly incident: NewarchV2Incident } | { readonly kind: 'row' })[];
+  readonly states: readonly NewarchV2ReadState[];
+}): NewarchV2StatusNote[] {
+  const notes: NewarchV2StatusNote[] = [];
+  const push = (key: string, text: string | null) => {
+    if (!text || notes.some(note => note.key === key) || notes.length >= NEWARCH_V2_NOTE_CAP) return;
+    notes.push({ key, text });
+  };
+  for (const entry of input.entries) {
+    if (entry.kind !== 'incident') continue;
+    push(`incident|${entry.incident.incidentId}`, newarchV2IncidentLabel(entry.incident));
+  }
+  for (const state of input.states) {
+    const text = newarchV2StateLabel(state);
+    const key = state.kind === 'incident'
+      ? `state|${state.incident.incidentId}`
+      : state.kind === 'remote-unavailable'
+        ? `state|remote-unavailable|${state.reason}|${state.bundleId}`
+        : state.kind === 'storage-unavailable'
+          ? `state|storage-unavailable|${state.pendingIncidentId ?? ''}`
+          : 'state|exact';
+    push(key, text);
+  }
+  return notes;
+}
+
+/** Visible sentence for a pane that no longer collects. Active panes have none. */
+export function newarchV2PaneStateLabel(pane: NewarchV2PaneDescriptor): string | null {
+  switch (pane.state) {
+    case 'stopped': return 'pane นี้หยุดเก็บแล้ว — ไม่มีแถวใหม่เข้าประวัติ';
+    case 'closed': return 'pane นี้ปิดแล้ว — ประวัติที่เห็นคือทั้งหมดที่บันทึกไว้';
+    case 'unrecorded': return 'pane นี้ไม่ได้บันทึกประวัติ';
+    default: return null;
+  }
+}
+
+// --- D3: v2 cursor pager over the existing bounded line window ---
+//
+// The resident window (above) stays line-addressed and bounded. A v2 pane has
+// no line numbers on the wire, so the pager numbers rows locally, keeps the
+// server's own cursor at every page boundary, and never turns a cursor into a
+// line. Bookkeeping is bounded: pages wholly outside the resident window are
+// dropped (`newarchV2PagerRetain`).
+
+/** Local line the newest v2 row ends at when the window has no live seam. */
+export const NEWARCH_V2_PAGER_BASE_LINE = 1_000_000_000;
+
+export type NewarchV2PagerPage = Readonly<{
+  startLine: number;
+  /** One stable row key per line, `segmentId:rowOrdinal`. */
+  keys: readonly string[];
+  /** Server cursor at this page's older edge; null = none known at this boundary. */
+  before: NewarchV2Continuation | null;
+  /** Server cursor at this page's newer edge; null = none known at this boundary. */
+  after: NewarchV2Continuation | null;
+}>;
+
+export type NewarchV2PagerState = Readonly<{
+  pane: NewarchV2PaneDescriptor;
+  baseLine: number;
+  /** Highest timeline revision a reply carried; an older reply is stale. */
+  revision: number;
+  /** Ascending, contiguous local line ranges. */
+  pages: readonly NewarchV2PagerPage[];
+  notes: readonly NewarchV2StatusNote[];
+}>;
+
+export type NewarchV2PagerAsk =
+  | Readonly<{ kind: 'ask'; direction: HistoryWindowDirection; cursor: NewarchV2HistoryCursor | null; edgeLine: number; overlap: number }>
+  | Readonly<{ kind: 'end' }>
+  /** The edge has no known cursor (window outside the pager's pages). */
+  | Readonly<{ kind: 'unknown' }>;
+
+export type NewarchV2PagerApply =
+  | Readonly<{
+      kind: 'page';
+      state: NewarchV2PagerState;
+      direction: HistoryWindowDirection;
+      /** Local line of lines[0]; null for a page without new rows. */
+      startLine: number | null;
+      lines: readonly string[];
+      /** The edge stays pageable: `more` or `blocked`. */
+      hasMore: boolean;
+      /** Storage/remote fault at this edge: never EOF. */
+      blocked: boolean;
+    }>
+  /** Pane or timeline changed under the cursor: drop every cursor and restart. */
+  | Readonly<{ kind: 'reset'; reason: 'wrong-pane' | 'stale-cursor' }>
+  | Readonly<{ kind: 'retry'; retryAfterMs: number | null; state: NewarchV2PagerState }>
+  | Readonly<{ kind: 'refused'; reason: string }>;
+
+export function createNewarchV2Pager(pane: NewarchV2PaneDescriptor, baseLine = NEWARCH_V2_PAGER_BASE_LINE): NewarchV2PagerState {
+  if (!validAbsoluteLine(baseLine)) throw new RangeError('v2 pager base line must be a non-negative safe integer');
+  // The pane-state sentence is drawn from the live descriptor, not kept here.
+  return { pane, baseLine, revision: 0, pages: [], notes: [] };
+}
+
+function v2PagerKey(row: NewarchV2WireRow): string {
+  return `${row.id.segmentId}:${row.id.rowOrdinal}`;
+}
+
+function v2PagerEnd(page: NewarchV2PagerPage): number {
+  return page.startLine + page.keys.length;
+}
+
+function v2CursorOf(continuation: NewarchV2Continuation | null): NewarchV2PagerAsk | null {
+  if (continuation === null) return null;
+  if (continuation.kind === 'end') return { kind: 'end' };
+  return { kind: 'ask', direction: 'before', cursor: continuation.cursor, edgeLine: 0, overlap: 0 };
+}
+
+/**
+ * The request for one edge of the resident window. `edgeLine` is the window's
+ * first line (before) or its exclusive end (after). When the edge falls inside
+ * a page, the pager asks from that page's nearest known boundary and reports
+ * how many already-resident rows the reply must repeat (`overlap`).
+ */
+export function newarchV2PagerAsk(
+  state: NewarchV2PagerState,
+  direction: HistoryWindowDirection,
+  edgeLine: number | null,
+): NewarchV2PagerAsk {
+  const pages = state.pages;
+  if (pages.length === 0) {
+    return direction === 'before'
+      ? { kind: 'ask', direction, cursor: null, edgeLine: state.baseLine, overlap: 0 }
+      : { kind: 'end' };
+  }
+  const edge = edgeLine ?? (direction === 'before' ? pages[0]!.startLine : v2PagerEnd(pages.at(-1)!));
+  const limit = NEWARCH_V2_WIRE_LIMITS.pageEntries;
+  const finish = (found: NewarchV2PagerAsk | null, overlap: number): NewarchV2PagerAsk => {
+    if (found === null || overlap >= limit) return { kind: 'unknown' };
+    if (found.kind !== 'ask') return overlap === 0 ? found : { kind: 'unknown' };
+    return { kind: 'ask', direction, cursor: found.cursor, edgeLine: edge, overlap };
+  };
+  // A page edge cut by eviction has no cursor (null): resume from the
+  // neighbouring page's edge and let the reply repeat the rows in between.
+  if (direction === 'before') {
+    const index = pages.findIndex(page => page.startLine <= edge && edge < v2PagerEnd(page));
+    if (index < 0) return { kind: 'unknown' };
+    const page = pages[index]!;
+    if (page.startLine === edge && page.before !== null) return finish(v2CursorOf(page.before), 0);
+    const next = pages[index + 1];
+    return finish(next ? v2CursorOf(next.before) : null, v2PagerEnd(page) - edge);
+  }
+  const index = pages.findIndex(page => page.startLine < edge && edge <= v2PagerEnd(page));
+  if (index < 0) return { kind: 'unknown' };
+  const page = pages[index]!;
+  if (v2PagerEnd(page) === edge && page.after !== null) return finish(v2CursorOf(page.after), 0);
+  const previous = pages[index - 1];
+  return finish(previous ? v2CursorOf(previous.after) : null, edge - page.startLine);
+}
+
+function v2PagerKeysAt(state: NewarchV2PagerState, from: number, to: number): string[] | null {
+  const keys: string[] = [];
+  for (let line = from; line < to; line++) {
+    const page = state.pages.find(candidate => candidate.startLine <= line && line < v2PagerEnd(candidate));
+    const key = page?.keys[line - page.startLine];
+    if (key === undefined) return null;
+    keys.push(key);
+  }
+  return keys;
+}
+
+function v2SgrText(row: NewarchV2WireRow): string {
+  let out = '';
+  let current = '';
+  let last = row.cells.length;
+  // Trailing unstyled blanks are padding, not text a reader copies.
+  while (last > 0 && row.cells[last - 1]!.text === ' ' && row.cells[last - 1]!.style.length === 0) last--;
+  for (let index = 0; index < last; index++) {
+    const cell = row.cells[index]!;
+    if (cell.width === 0 && cell.text === '') continue;
+    const style = cell.style.join(';');
+    if (style !== current) {
+      out += style ? `\u001b[0;${style}m` : '\u001b[0m';
+      current = style;
+    }
+    out += cell.text;
+  }
+  return current ? `${out}\u001b[0m` : out;
+}
+
+function v2MergeNotes(held: readonly NewarchV2StatusNote[], fresh: readonly NewarchV2StatusNote[]): NewarchV2StatusNote[] {
+  const notes = [...held];
+  for (const note of fresh) {
+    if (notes.length >= NEWARCH_V2_NOTE_CAP) break;
+    // One incident arrives both as an entry and as a state: one sentence.
+    if (!notes.some(existing => existing.key === note.key || existing.text === note.text)) notes.push(note);
+  }
+  return notes;
+}
+
+/**
+ * Apply one reply to the ask that produced it. Rows already resident (the
+ * overlap) must come back identical, and no other row may repeat: a page
+ * that would lose, duplicate, or reorder a row is refused, never drawn.
+ */
+export function applyNewarchV2PagerReply(
+  state: NewarchV2PagerState,
+  ask: Extract<NewarchV2PagerAsk, { kind: 'ask' }>,
+  reply: NewarchV2HistoryReply,
+): NewarchV2PagerApply {
+  if (!newarchV2SamePane(reply.pane, state.pane.pane)) return { kind: 'reset', reason: 'wrong-pane' };
+  if (reply.status === 'error') {
+    switch (reply.code) {
+      case 'wrong-pane': return { kind: 'reset', reason: 'wrong-pane' };
+      case 'stale-cursor': return { kind: 'reset', reason: 'stale-cursor' };
+      case 'owner-unavailable': return {
+        kind: 'retry', retryAfterMs: reply.retryAfterMs,
+        state: { ...state, notes: v2MergeNotes(state.notes, [{ key: 'owner-unavailable', text: 'เจ้าของประวัติยังไม่พร้อม — ยังไม่ใช่จุดสิ้นสุด' }]) },
+      };
+      default: return { kind: 'refused', reason: reply.code };
+    }
+  }
+  if (reply.revision < state.revision) return { kind: 'reset', reason: 'stale-cursor' };
+  const rows = reply.entries.filter((entry): entry is NewarchV2WireRow => entry.kind === 'row');
+  const keys = rows.map(v2PagerKey);
+  if (new Set(keys).size !== keys.length) return { kind: 'refused', reason: 'duplicate-row' };
+  const { direction, edgeLine, overlap } = ask;
+  if (rows.length < overlap) return { kind: 'refused', reason: 'overlap-short' };
+  const expected = direction === 'before'
+    ? v2PagerKeysAt(state, edgeLine, edgeLine + overlap)
+    : v2PagerKeysAt(state, edgeLine - overlap, edgeLine);
+  const repeated = direction === 'before' ? keys.slice(keys.length - overlap) : keys.slice(0, overlap);
+  if (expected === null || expected.join('\n') !== repeated.join('\n')) return { kind: 'refused', reason: 'overlap-mismatch' };
+  const freshRows = direction === 'before' ? rows.slice(0, rows.length - overlap) : rows.slice(overlap);
+  const freshKeys = direction === 'before' ? keys.slice(0, keys.length - overlap) : keys.slice(overlap);
+  const resident = new Set(state.pages.flatMap(page => page.keys));
+  if (freshKeys.some(key => resident.has(key))) return { kind: 'refused', reason: 'duplicate-row' };
+  const continuation = direction === 'before' ? reply.before : reply.after;
+  const notes = v2MergeNotes(state.notes, newarchV2StatusNotes({ entries: reply.entries, states: reply.states }));
+  let pages = [...state.pages];
+  let startLine: number | null = null;
+  if (freshRows.length > 0) {
+    startLine = direction === 'before' ? edgeLine - freshRows.length : edgeLine;
+    if (startLine < 0 || !Number.isSafeInteger(startLine + freshRows.length)) return { kind: 'refused', reason: 'line-range' };
+    const page: NewarchV2PagerPage = {
+      startLine,
+      keys: freshKeys,
+      // A cursor is kept only where it sits exactly on this record's edge.
+      before: direction === 'before' || overlap === 0 ? reply.before : null,
+      after: direction === 'after' || overlap === 0 ? reply.after : null,
+    };
+    if (direction === 'before') pages.unshift(page);
+    else pages.push(page);
+  } else if (pages.length > 0 && overlap === 0) {
+    // An incident-only or blocked page still moves this edge's cursor.
+    if (direction === 'before') pages[0] = { ...pages[0]!, before: continuation };
+    else pages[pages.length - 1] = { ...pages.at(-1)!, after: continuation };
+  }
+  return {
+    kind: 'page',
+    state: { ...state, revision: Math.max(state.revision, reply.revision), pages, notes },
+    direction,
+    startLine,
+    lines: freshRows.map(v2SgrText),
+    hasMore: continuation.kind !== 'end',
+    blocked: continuation.kind === 'blocked',
+  };
+}
+
+/**
+ * Keep exactly the resident rows: pages outside the window are dropped and a
+ * page cut by eviction keeps only its resident keys. A cut edge loses its
+ * cursor (that position is no longer a page boundary), so a row that left the
+ * window can come back once and is never mistaken for a duplicate.
+ */
+export function newarchV2PagerRetain(state: NewarchV2PagerState, range: HistoryWindowRange): NewarchV2PagerState {
+  let changed = false;
+  const pages: NewarchV2PagerPage[] = [];
+  for (const page of state.pages) {
+    const end = v2PagerEnd(page);
+    const from = Math.max(page.startLine, range.startLine);
+    const to = Math.min(end, range.endLine);
+    if (to <= from) {
+      changed = true;
+      continue;
+    }
+    if (from === page.startLine && to === end) {
+      pages.push(page);
+      continue;
+    }
+    changed = true;
+    pages.push({
+      startLine: from,
+      keys: page.keys.slice(from - page.startLine, to - page.startLine),
+      before: from === page.startLine ? page.before : null,
+      after: to === end ? page.after : null,
+    });
+  }
+  return changed ? { ...state, pages } : state;
+}
+
+/** Terminal rows only. Status sentences are not part of copy or search. */
+export function newarchV2RowCopy(rows: readonly string[]): string {
+  return rows.join('\n');
+}
+
+export interface NewarchV2GeometryIntent {
+  readonly source: 'viewport' | 'font' | 'fit-width' | 'rotation' | 'keyboard-inset' | 'apply-geometry';
+  readonly columns: number;
+  readonly rows: number;
+}
+
+/** Every viewer intent gets the birth geometry back. Nothing here is a resize write. */
+export function answerNewarchV2Geometry(
+  geometry: NewarchV2FixedGeometry,
+  _intent: NewarchV2GeometryIntent,
+): { readonly status: 'fixed'; readonly geometry: NewarchV2FixedGeometry; readonly resize: null } {
+  return { status: 'fixed', geometry, resize: null };
+}
+
+/** One pane is selected. Two or more stay a list, including a display-name collision. */
+export function selectNewarchV2Panes(
+  panes: readonly NewarchV2PaneDescriptor[],
+  next: string | null,
+): NewarchV2PaneSelection {
+  if (panes.length === 0 && next === null) return { kind: 'missing' };
+  if (panes.length === 1 && next === null) return { kind: 'selected', pane: panes[0]! };
+  return { kind: 'ambiguous', panes: [...panes], next };
+}
+
+export interface NewarchV2Viewport {
+  readonly widthPx: number;
+  readonly heightPx: number;
+  readonly cellWidthPx: number;
+  readonly cellHeightPx: number;
+  readonly keyboardInsetPx: number;
+  readonly fitWidth: boolean;
+  readonly scrollXPx: number;
+}
+
+export interface NewarchV2Presentation {
+  readonly columns: number;
+  readonly rows: number;
+  readonly scale: number;
+  readonly contentWidthPx: number;
+  readonly contentHeightPx: number;
+  readonly visibleHeightPx: number;
+  readonly maxScrollXPx: number;
+  readonly scrollXPx: number;
+  readonly horizontalScroll: boolean;
+  readonly resize: null;
+}
+
+/**
+ * Viewport, font, fit-width, rotation, and keyboard inset change only this
+ * picture. Terminal columns and rows stay on the birth geometry.
+ */
+export function presentNewarchV2(
+  terminal: { readonly columns: number; readonly rows: number },
+  viewport: NewarchV2Viewport,
+): NewarchV2Presentation {
+  const columns = terminal.columns;
+  const rows = terminal.rows;
+  const naturalWidth = columns * viewport.cellWidthPx;
+  const naturalHeight = rows * viewport.cellHeightPx;
+  const scale = viewport.fitWidth && naturalWidth > 0 ? viewport.widthPx / naturalWidth : 1;
+  const contentWidthPx = naturalWidth * scale;
+  const contentHeightPx = naturalHeight * scale;
+  const maxScrollXPx = viewport.fitWidth ? 0 : Math.max(0, naturalWidth - viewport.widthPx);
+  const scrollXPx = viewport.fitWidth ? 0 : Math.min(Math.max(0, viewport.scrollXPx), maxScrollXPx);
+  const inset = Math.max(0, viewport.keyboardInsetPx);
+  return {
+    columns,
+    rows,
+    scale,
+    contentWidthPx,
+    contentHeightPx,
+    visibleHeightPx: Math.max(0, viewport.heightPx - inset),
+    maxScrollXPx,
+    scrollXPx,
+    horizontalScroll: maxScrollXPx > 0,
+    resize: null,
+  };
+}
+
+// --- NEWARCH fit-font (plan §6): font that fits birth columns, never a resize ---
+
+/** Horizontal padding TermView puts around the line: 6px each side. */
+export const FONT_FIT_GUTTER_PX = 12;
+
+/** Granularity of the fit search, in CSS pixels. */
+export const FONT_FIT_STEP_PX = 0.05;
+
+/** Upper bound on cell measurements after the first guess. */
+export const FONT_FIT_MAX_PROBES = 8;
+
+/**
+ * Cell-to-font ratio used **only** when the measure returns nothing usable
+ * (canvas not ready, font not loaded). It is a stand-in until the caller
+ * re-measures — never the answer on a real screen, because installed fonts
+ * give different cells.
+ */
+export const FONT_FIT_FALLBACK_CELL_RATIO = 0.6;
+
+export type NewarchFontFitInput = {
+  /** Birth columns of the fixed-geometry pane. */
+  columns: number;
+  /** Width of the terminal box in CSS pixels, gutter included. */
+  containerWidthPx: number;
+  /** Padding subtracted from the box. Defaults to `FONT_FIT_GUTTER_PX`. */
+  gutterPx?: number;
+  /** The user's size — the result never exceeds it. */
+  ceilingPx: number;
+  /** Lower and upper limits in CSS pixels (the shell's `fontPxMin` / `fontPxMax`). */
+  bounds: { readonly min: number; readonly max: number };
+  /** Width of one cell at a given font size, as measured by the renderer. */
+  measureCellPx: (fontPx: number) => number;
+  /** Defaults to `auto`. */
+  mode?: 'auto' | 'manual';
+};
+
+export type NewarchFontFitResult = {
+  /** Size to render, at most two decimals. */
+  fontPx: number;
+  /** Whether `columns` cells fit the usable width at that size (no sideways scroll). */
+  fits: boolean;
+};
+
+/** Clamp without rounding; non-finite falls back to the stock 13px. */
+function clampExact(value: number, bounds: { readonly min: number; readonly max: number }): number {
+  const fallback = Number.isFinite(value) ? value : 13;
+  if (fallback < bounds.min) return bounds.min;
+  if (fallback > bounds.max) return bounds.max;
+  return fallback;
+}
+
+/** Floor to two decimals, tolerating float noise just under a hundredth. */
+function floor2(value: number): number {
+  return Math.floor(value * 100 + 1e-6) / 100;
+}
+
+/**
+ * Font size that makes a fixed-geometry pane's columns fit its box.
+ *
+ * Pure: it returns a size and whether it fits — never a resize. tmux keeps the
+ * geometry the pane was born with; only the browser's font changes.
+ *
+ * - `manual`, or no usable geometry/width yet (columns ≤ 0, box not laid out):
+ *   the ceiling as-is. An unlaid box does not collapse the font to the floor.
+ * - Wide box: the ceiling exactly — the desktop never grows past the user size.
+ * - Narrow box: the largest size on the 0.05px grid whose `columns × cell`
+ *   fits, starting from the proportional guess and probing at most
+ *   `FONT_FIT_MAX_PROBES` times. Never below `bounds.min`; if the floor still
+ *   overflows, `fits` is false and the caller scrolls sideways.
+ */
+export function fitNewarchFontPx(input: NewarchFontFitInput): NewarchFontFitResult {
+  const { columns, containerWidthPx, bounds } = input;
+  const gutter = typeof input.gutterPx === 'number' && Number.isFinite(input.gutterPx)
+    ? input.gutterPx
+    : FONT_FIT_GUTTER_PX;
+  const ceiling = floor2(clampExact(input.ceilingPx, bounds));
+  const usable = containerWidthPx - gutter;
+
+  const cellAt = (px: number): number => {
+    const measured = input.measureCellPx(px);
+    return Number.isFinite(measured) && measured > 0
+      ? measured
+      : px * FONT_FIT_FALLBACK_CELL_RATIO;
+  };
+  // 1e-6 absorbs float noise such as 70 × 9 × 0.6 = 378.00000000000006.
+  const fitsAt = (px: number): boolean => columns * cellAt(px) <= usable + 1e-6;
+
+  if (!Number.isFinite(columns) || columns <= 0 || !Number.isFinite(usable) || usable <= 0) {
+    return { fontPx: ceiling, fits: false };
+  }
+  if (input.mode === 'manual') {
+    return { fontPx: ceiling, fits: fitsAt(ceiling) };
+  }
+  if (fitsAt(ceiling)) {
+    return { fontPx: ceiling, fits: true };
+  }
+
+  const floor = bounds.min;
+  const snap = (px: number): number => {
+    const grid = Math.floor(px / FONT_FIT_STEP_PX + 1e-6) * FONT_FIT_STEP_PX;
+    return Math.min(ceiling, Math.max(floor, floor2(grid)));
+  };
+
+  let candidate = snap(ceiling * usable / (columns * cellAt(ceiling)));
+  let best: number | null = null;
+  for (let probe = 0; probe < FONT_FIT_MAX_PROBES; probe++) {
+    if (fitsAt(candidate)) {
+      if (best === null || candidate > best) best = candidate;
+      const up = snap(candidate + FONT_FIT_STEP_PX);
+      // Converged: the next step overflows (it is known not to fit at the ceiling).
+      if (up <= candidate || !fitsAt(up)) break;
+      candidate = up;
+    } else {
+      if (candidate <= floor) break;
+      // Re-aim from the cell measured at this size: a cell that is not
+      // proportional to the font can leave the first guess many steps high,
+      // and stepping down 0.05px would run out of probes and fall to the floor.
+      const aimed = snap(candidate * usable / (columns * cellAt(candidate)));
+      candidate = aimed < candidate ? aimed : snap(candidate - FONT_FIT_STEP_PX);
+    }
+  }
+
+  if (best !== null) return { fontPx: best, fits: true };
+  return { fontPx: floor, fits: fitsAt(floor) };
+}
+
+/** Map a viewport point through scroll and fit-width scale onto the fixed grid. */
+export function hitNewarchV2Cell(
+  presentation: NewarchV2Presentation,
+  point: { readonly clientX: number; readonly clientY: number; readonly originX: number; readonly originY: number },
+  cell: { readonly widthPx: number; readonly heightPx: number },
+): { readonly col: number; readonly row: number } | null {
+  if (!(presentation.scale > 0) || !(cell.widthPx > 0) || !(cell.heightPx > 0)) return null;
+  const localX = (point.clientX - point.originX + presentation.scrollXPx) / presentation.scale;
+  const localY = (point.clientY - point.originY) / presentation.scale;
+  if (!Number.isFinite(localX) || !Number.isFinite(localY) || localX < 0 || localY < 0) return null;
+  const col = Math.floor(localX / cell.widthPx);
+  const row = Math.floor(localY / cell.heightPx);
+  if (col < 0 || col >= presentation.columns || row < 0 || row >= presentation.rows) return null;
+  return { col, row };
+}
+
+/**
+ * Parse the optional `flagOn` envelope of a history page. Returns null for
+ * anything unreadable or for capabilities this display does not know; the
+ * caller must then refuse the page (not draw rows without their states).
+ */
+export function parseNewarchHistoryExtension(value: unknown): NewarchHistoryExtension | null {
+  if (!isObj(value) || value.version !== 1) return null;
+  const caps = value.capabilities;
+  if (!isObj(caps) || caps.extensionVersion !== 1
+    || !Array.isArray(caps.supported) || !Array.isArray(caps.required)) return null;
+  const supported = caps.supported as unknown[];
+  const required = caps.required as unknown[];
+  if (![...supported, ...required].every(cap => typeof cap === 'string' && KNOWN_CAPABILITIES.has(cap))) return null;
+  if (!supported.includes('history-states-v1') || !required.every(cap => supported.includes(cap))) return null;
+  const repairClaimed = value.repair !== undefined;
+  if (repairClaimed && !validRepairCaps(value.repair)) return null;
+  if (!Array.isArray(value.states) || !value.states.every(state => validState(state, repairClaimed))) return null;
+  if (!validContinuation(value.before, repairClaimed) || !validContinuation(value.after, repairClaimed)) return null;
+  return value as unknown as NewarchHistoryExtension;
 }

@@ -4,7 +4,9 @@ import {
   DEFAULT_FONT_PX_MAX,
   DEFAULT_FONT_PX_MIN,
   clampFontPx,
+  clampFontPxExact,
   resolveFontBounds,
+  resolveFontFitMode,
   stepFontPx,
 } from '../src/font-range';
 
@@ -98,5 +100,33 @@ describe('stepFontPx', () => {
     ]);
     // Same values in reverse order (excluding the starting 40, including the floor 4).
     expect(down).toEqual([...up].reverse().slice(1).concat(4));
+  });
+});
+
+describe('clampFontPxExact', () => {
+  const band = { min: 4, max: 40 };
+
+  test('keeps the fraction that clampFontPx rounds away', () => {
+    expect(clampFontPxExact(8.29, band)).toBe(8.29);
+    expect(clampFontPxExact(8.05, band)).toBe(8.05);
+    expect(clampFontPx(8.29, band)).toBe(8);
+  });
+
+  test('still clamps, and non-finite still falls back to the stock default', () => {
+    expect(clampFontPxExact(3.5, band)).toBe(4);
+    expect(clampFontPxExact(40.5, band)).toBe(40);
+    expect(clampFontPxExact(Number.NaN, band)).toBe(DEFAULT_FONT_PX);
+    expect(clampFontPxExact(Number.NaN, { min: 4, max: 10 })).toBe(10);
+  });
+});
+
+describe('resolveFontFitMode', () => {
+  test('only the literal "manual" opts out; anything else is auto', () => {
+    expect(resolveFontFitMode('manual')).toBe('manual');
+    expect(resolveFontFitMode('auto')).toBe('auto');
+    expect(resolveFontFitMode(undefined)).toBe('auto');
+    expect(resolveFontFitMode(null)).toBe('auto');
+    expect(resolveFontFitMode('MANUAL')).toBe('auto');
+    expect(resolveFontFitMode(13)).toBe('auto');
   });
 });

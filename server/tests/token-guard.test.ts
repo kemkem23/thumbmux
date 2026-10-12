@@ -803,6 +803,33 @@ describe("WebSocket message matrix", () => {
   });
 });
 
+describe("NEWARCH v2 history on the guarded mux gate", () => {
+  test("history_expand_v2 is a read operation scoped to an allowed session, like history_expand", () => {
+    const guard = createTokenGuardWithClock({
+      grants: [makeGrant("read", "ws-v2", 5000, ["allowed"])],
+    });
+    const principal = principalFromAuthentication(authenticateQuery(guard, "ws-v2"));
+    const request = { schema: "newarch-v2", pane: { serverIdentity: "s", paneId: "%1", birthGeneration: 1 }, cursor: null, direction: "before", maxEntries: 10, maxBytes: 4096 };
+
+    expect(guard.authorizeMuxMessage({ type: "history_expand_v2", session: "allowed", requestId: "req-1", request }, principal)).toMatchObject({
+      ok: true,
+      status: 200,
+      operation: "history_expand_v2",
+      session: "allowed",
+    });
+    expect(guard.authorizeMuxMessage({ type: "history_expand_v2", session: "denied", requestId: "req-1", request }, principal)).toMatchObject({
+      ok: false,
+      status: 403,
+      code: "forbidden_session",
+    });
+    expect(guard.authorizeMuxMessage({ type: "history_expand_v2", requestId: "req-1", request }, principal)).toMatchObject({
+      ok: false,
+      status: 403,
+      code: "forbidden_operation",
+    });
+  });
+});
+
 describe("allowlists and session filtering", () => {
   test("omitted sessions is unrestricted; exact empty list denies all", () => {
     const guard = createTokenGuardWithClock({

@@ -332,7 +332,7 @@
   {
     "name": "MuxClientMessage",
     "kind": "type",
-    "signature": "11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08",
+    "signature": "95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c",
     "tier": "F"
   },
   {
@@ -410,7 +410,7 @@
   {
     "name": "MuxStrictClientMessage",
     "kind": "type",
-    "signature": "51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7",
+    "signature": "b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8",
     "tier": "S"
   },
   {
@@ -1269,6 +1269,324 @@
     "name": "validateNewarchFrameMeta",
     "kind": "value",
     "signature": "e96e0ee04e8bad71339e3e02bc4d2730a41a9a231e8d7dbbe2e7439179c69dd9",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_FLAGON_CAPABILITIES",
+    "kind": "value",
+    "signature": "818c9e515d1bd872211b9574d1394b88af3644d7b8b648815b1a79f769aa6585",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_HISTORY_EXTENSION_VERSION",
+    "kind": "value",
+    "signature": "72ba8ecc2a4ced7358a07e9de0b0e1d98740cff6cc4427a4ecddfb3e77578251",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_REPAIR_CAPABILITIES",
+    "kind": "value",
+    "signature": "ab3c7b4f5d53c18a2fb26dc83a37a416549d0e179ee5d326b6b1ad61ecac7bcb",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_V2_CAPABILITIES",
+    "kind": "value",
+    "signature": "64531e06ce78d0d3fd0f4eda1861bfaa04b98727d4e4a0e6ae8f89294b0a3c00",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_V2_SCHEMA",
+    "kind": "value",
+    "signature": "c0f253ce0fa6e9eb79154ac1fedf5a95621c3aea9702f7396305a989d83600e1",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchCapabilities",
+    "kind": "type",
+    "signature": "d87eb0c7356320514d87f177f82f69c8c8f0f079c1a6da606163a846e3b2f7b8",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchFlagOnCapability",
+    "kind": "type",
+    "signature": "94595b58d924003e214a812a5963340445e3b6de821c57f6f916901e4094e45d",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchGap",
+    "kind": "type",
+    "signature": "45683bfbeca800904435c8e8f8902c1709d6b56e82ec3b18ffa5c04505b1960a",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchGapIdentityR2",
+    "kind": "type",
+    "signature": "5daac1f094eaa489bf30544bd508b9cc5d9b3681cbe474d05f326e4ca9599dbb",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchGapR2",
+    "kind": "type",
+    "signature": "46527a9262940fb394e2135f05d04dea31efbddfbd15c5e941e0ef3c433ad7bc",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryContinuation",
+    "kind": "type",
+    "signature": "cefd90c750083eb2c0a402c0e734d09913969ed5766e013b61f2bf4556b0daa2",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryContinuationR2",
+    "kind": "type",
+    "signature": "fabf36ec3a829ced3fc58d91e4cec48eeb9e4028891583bb9d98fc5a5b4aff42",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryCursor",
+    "kind": "type",
+    "signature": "1f8eaa17cabc8cf0c197025f532df2faf574ac970a715f108cf4a2618ad09a4f",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryExtension",
+    "kind": "type",
+    "signature": "1c52d036c4b775d4970dbf0f5bc9612642f1dc3d77fb90f2c2729de27803f0fb",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryRepairR2",
+    "kind": "type",
+    "signature": "910fe3b32744b55321a909ec7b5facea7c609bf197dccf9dfc204f2557a36ddf",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryState",
+    "kind": "type",
+    "signature": "b63639efeb73229be8cc6319a8537e1365bc88c6ae8bd202244ab66e6fe5a7ac",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchHistoryStateR2",
+    "kind": "type",
+    "signature": "869acc429f5b0b2c089230d50963c55141f877323fc3f6d329d217b3609a74c9",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchIncidentR2",
+    "kind": "type",
+    "signature": "0c13ef311c312f760a6041c5597449517262012443e162874ff03b0871aca2a1",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchMissingCount",
+    "kind": "type",
+    "signature": "322f35dd0b89c28a5150e3c461065ddeee9ff9c32097f0738f3b88e9e8591065",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchPaneKey",
+    "kind": "type",
+    "signature": "704a8b109746e3944c4a91d58eb0cec94b6db4bb8109e6799b37eb342fc5089d",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchPressureR2",
+    "kind": "type",
+    "signature": "a997244871ac59d0de4c921562fc8e151e9a2eb022c8ebc68197d01b660e3a72",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchRepairCapabilities",
+    "kind": "type",
+    "signature": "be7cdaa4e30c2af02200ed63beb716d25093bf56c2f0a13d762ef1fdcc4476bb",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchRepairCapability",
+    "kind": "type",
+    "signature": "cd185bf2b85541a34dbae1b962ad598e49b293ea0480111f9947b050d89b88f0",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchRowId",
+    "kind": "type",
+    "signature": "1e9593f3c32ad9be44b65b1bc1fc2cd2787d16a84071123953a97ebc6944e475",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchRowRange",
+    "kind": "type",
+    "signature": "8dc0f4b9c2ba1031d601769a8686ea14eb4479f904352737380d9d9ba81ee8ac",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2Capabilities",
+    "kind": "type",
+    "signature": "68cb1913b50fb10fc0f68a72d8c5897ba2d3be4141a76a6d2d9adedb1fb50c6a",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2Continuation",
+    "kind": "type",
+    "signature": "7e7e8f92c5c575eff0bac2d65f75f34a0bd7c6396b7fc2cdb0e80bca02562463",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2FixedGeometry",
+    "kind": "type",
+    "signature": "bd57c510cfbf3e96c8d00f4addcd68c0cee7f5042c8b9e43f98bbeb3afc0616c",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2FrameMeta",
+    "kind": "type",
+    "signature": "dcb4f817559d06acc9e86eb7d1fd0de9a61e8c785b3f2062fc4ad2f38b411656",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2GeometryReply",
+    "kind": "type",
+    "signature": "07af6a1a2a28e78c41b427bfec0b461f3ad418ca374d8be14ede6038efa1af75",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryCursor",
+    "kind": "type",
+    "signature": "54d41cccd3e3e3b1bffd532fc5dd4a218a24600023a5af1b1e58e168b162b473",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryRequest",
+    "kind": "type",
+    "signature": "e5b211f777c62a2f61257a89ea1f37a7d72d09f157ba85f9ba4204cf356db2c1",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2Incident",
+    "kind": "type",
+    "signature": "b1ba4f60235465c9234ade1719df99943e177b1d4b8810492697c65bc9bb5e79",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2IncidentReason",
+    "kind": "type",
+    "signature": "482b7dd099418823bf17b89ae510f60c42096db7b95a8d93e0a7d892a21c0372",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2OutputFrame",
+    "kind": "type",
+    "signature": "779d198e1bdd28d6db7486a64173fe18231fea8a43a1b742b2846a1716c435de",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2PaneDescriptor",
+    "kind": "type",
+    "signature": "f039e88271d6bc5fbf8c3113f218c6238c85df64da528a9ba9a60e0eed98f1f9",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2PaneSelection",
+    "kind": "type",
+    "signature": "8f1ccc5ab6652f1998baf8b6da0812348a3ec945c4eed88e634fe075879caf30",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2PaneState",
+    "kind": "type",
+    "signature": "c46eb474872bf09eb653f3f5f7ddf19b0db1f00e8d27b9c38f27ecb22b0b2cef",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2ReadState",
+    "kind": "type",
+    "signature": "8ab6aa038ceb4415902baaf75a33e98ee323a1e58b8849fc2b849d4c5eff48ce",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2SessionKey",
+    "kind": "type",
+    "signature": "b1600391da2954347157f3fd0924d27b9dcdae1d2475a1d3f8fe258569e7fd8d",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2SourceEpoch",
+    "kind": "type",
+    "signature": "3cabc4661f7de570cf44138d861a09cc25ce37e2a01bc96cd03411b2fa309fca",
+    "tier": "S"
+  },
+  {
+    "name": "supportsNewarchRepair",
+    "kind": "value",
+    "signature": "fa1c3f2ca0eac56ced54a3011ef71066438e5fda310b61025a63cc8d0d3c9b88",
+    "tier": "S"
+  },
+  {
+    "name": "supportsNewarchV2",
+    "kind": "value",
+    "signature": "a1707f746ec10a32d92c4e3626f65e9c347594bcb4762f3938359c3efcc6e3f4",
+    "tier": "S"
+  },
+  {
+    "name": "NEWARCH_V2_WIRE_LIMITS",
+    "kind": "value",
+    "signature": "9494168f71294a320418e03be796c75bb51f46396a7d614145668a89e569e457",
+    "tier": "S"
+  },
+  {
+    "name": "newarchV2CursorFor",
+    "kind": "value",
+    "signature": "6707eeadccea7a01d76a03f9f91d0caabb9f720422cc869f0432ebb065257cc3",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryErrorCode",
+    "kind": "type",
+    "signature": "25eff5ddf5536ab52ae18220a291dfa4df147bcd4cd7dd452ed2c66fbec71a05",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryExpandMessage",
+    "kind": "type",
+    "signature": "1fe069ebf773b317b35bb9daf31ca3e28f281a33483b2dbc9a8f1ab22e3d5e24",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2HistoryReply",
+    "kind": "type",
+    "signature": "004f777ae44a703cf7f373fbfd822b6527aefc9f9f5faf7d69ea9f0e65a48997",
+    "tier": "S"
+  },
+  {
+    "name": "newarchV2ReplyMatches",
+    "kind": "value",
+    "signature": "55386507acc491c431a1f8a6eb68119388990759492874e3df00c5380d630bde",
+    "tier": "S"
+  },
+  {
+    "name": "newarchV2SamePane",
+    "kind": "value",
+    "signature": "0d9adb0bb4be8da8df16625143e830a356a05cf3d9960c00c3814f204ed507bc",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2WireCell",
+    "kind": "type",
+    "signature": "baf13c2feb7a3316628407a1c39552533135e104640cc858bbf3f65e4d850c23",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2WireEntry",
+    "kind": "type",
+    "signature": "20a5ef6172de57bf51bc607259ca48eacec6a49bb25a40ed7aae175691d1eea6",
+    "tier": "S"
+  },
+  {
+    "name": "NewarchV2WireRow",
+    "kind": "type",
+    "signature": "20b94749a59c7ef268fb90857be70984d9cdcbf9feff4c7a2b8c5fbd2f6c8da6",
     "tier": "S"
   }
 ]

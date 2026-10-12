@@ -2,7 +2,7 @@
   {
     "name": "AppAdapters",
     "kind": "type",
-    "signature": "50d641bf27f09f0ae615e970bf8d7624989b114f622f72c11835cbfc4500198e",
+    "signature": "07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b",
     "tier": "S"
   },
   {
@@ -26,7 +26,7 @@
   {
     "name": "createSessionsStore",
     "kind": "value",
-    "signature": "320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc",
+    "signature": "a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034",
     "tier": "S"
   },
   {
@@ -134,7 +134,7 @@
   {
     "name": "EmbedView",
     "kind": "component",
-    "signature": "572213494862d88db6ea5007e2121c2dfd7864f6ac68141f6ceb36f8e8deabc5",
+    "signature": "aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416",
     "tier": "S"
   },
   {
@@ -158,7 +158,7 @@
   {
     "name": "HubView",
     "kind": "component",
-    "signature": "1ec52ee234f6d0360204fe9d6821d307ce835b9d8d983e979e4844c42bd4fbc2",
+    "signature": "9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e",
     "tier": "S"
   },
   {
@@ -171,12 +171,6 @@
     "name": "prefillOnError",
     "kind": "value",
     "signature": "79bbfbc42dfbbf82536e953de34ba8fac1e7c19f1d62bff62628a8e1276424ac",
-    "tier": "S"
-  },
-  {
-    "name": "PromptEntry",
-    "kind": "type",
-    "signature": "9b6616320842f9e1609b0d32f78b8c6ffed2198d31b761da043f0b49d52d05e9",
     "tier": "S"
   },
   {
@@ -206,19 +200,13 @@
   {
     "name": "SessionView",
     "kind": "component",
-    "signature": "1eacff8aa9a25c47c4b3f6d8a1de9ce1c636b55bf8c823b31781c2dcdb1370dc",
+    "signature": "b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675",
     "tier": "S"
   },
   {
     "name": "stepFontPx",
     "kind": "value",
     "signature": "3248bf46e3dc7e62df1d348115384a3654d0f5b063f48866408b4ba67992834c",
-    "tier": "S"
-  },
-  {
-    "name": "SubmissionReceipt",
-    "kind": "type",
-    "signature": "a8d6d88ffd1699ec59a1a305b1026baefefa2507d17d506cbb13d080e19abea5",
     "tier": "S"
   },
   {
@@ -230,7 +218,19 @@
   {
     "name": "ThumbmuxApp",
     "kind": "component",
-    "signature": "5c112b90f02054e06fed35a770bfc078f9820af0c4553058502693f54fd7806d",
+    "signature": "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f",
+    "tier": "S"
+  },
+  {
+    "name": "PromptEntry",
+    "kind": "type",
+    "signature": "9b6616320842f9e1609b0d32f78b8c6ffed2198d31b761da043f0b49d52d05e9",
+    "tier": "S"
+  },
+  {
+    "name": "SubmissionReceipt",
+    "kind": "type",
+    "signature": "a8d6d88ffd1699ec59a1a305b1026baefefa2507d17d506cbb13d080e19abea5",
     "tier": "S"
   }
 ]

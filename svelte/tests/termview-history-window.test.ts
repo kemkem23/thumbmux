@@ -5,6 +5,9 @@
  * pixel anchoring, signposts, and alt-screen teardown to that model.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import type { ComponentProps } from "svelte";
 import { flushSync, mount, unmount, tick } from "./svelte-client";
 
 import TermView from "../src/TermView.svelte";
@@ -16,6 +19,14 @@ import type {
   ClaudeBashSummaryRequest,
   MuxHistoryBoundary,
 } from "@thumbmux/core";
+
+const svelteClientInternals = join(
+  dirname(createRequire(import.meta.url).resolve("svelte/package.json")),
+  "src/internal/client/index.js",
+);
+const { proxy } = (await import(svelteClientInternals)) as {
+  proxy: <T extends object>(value: T) => T;
+};
 
 type ScreenMode = { alt: boolean; mouseSgr: boolean; mouseAny: boolean };
 type MuxCallback = (
@@ -45,6 +56,7 @@ type HistoryPrependDetail = {
 };
 type Mounted = {
   app: Record<string, unknown>;
+  props: Record<string, unknown>;
   target: HTMLElement;
   viewport: HTMLElement;
 };
@@ -153,37 +165,56 @@ function mountTermView(options: {
   mode?: ClaudeBashMode;
   onSummary?: SummaryHandler;
   historyPaging?: "ceiling" | "sliding";
+  claimGeometry?: boolean;
+  fixedGeometry?: { columns: number; rows: number } | null;
+  fitWidth?: boolean;
+  v2StatusText?: string | null;
+  onGeometryChange?: (geometry: { cols: number; rows: number }) => void;
+  viewportWidth?: number;
+  fontPx?: number;
+  fontFit?: "auto" | "manual";
+  tailClearancePx?: number;
+  onFontFit?: (fit: { fontPx: number; fits: boolean }) => void;
+  newarchV2Pane?: unknown;
 } = {}): Mounted {
+  const width = options.viewportWidth ?? 320;
   const target = document.createElement("div");
-  target.style.cssText = "position:relative;width:320px;height:240px;";
+  target.style.cssText = `position:relative;width:${width}px;height:240px;`;
   document.body.appendChild(target);
 
   let app!: Record<string, unknown>;
+  // A proxy, like the compiler's $state, so a case can change a prop live.
+  const props = proxy<Record<string, unknown>>({
+    session: SESSION,
+    palette,
+    claimGeometry: options.claimGeometry ?? false,
+    ...(options.fixedGeometry ? { fixedGeometry: options.fixedGeometry } : {}),
+    ...(options.fitWidth ? { fitWidth: true } : {}),
+    ...(options.v2StatusText ? { v2StatusText: options.v2StatusText } : {}),
+    ...(options.onGeometryChange ? { onGeometryChange: options.onGeometryChange } : {}),
+    fontPx: options.fontPx ?? 13,
+    ...(options.fontFit ? { fontFit: options.fontFit } : {}),
+    ...(options.tailClearancePx !== undefined ? { tailClearancePx: options.tailClearancePx } : {}),
+    ...(options.onFontFit ? { onFontFit: options.onFontFit } : {}),
+    ...(options.newarchV2Pane ? { newarchV2Pane: options.newarchV2Pane } : {}),
+    ...(options.mode && options.mode !== "off"
+      ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
+      : {}),
+    claudeBashMode: options.mode ?? "off",
+    onClaudeBashSummaryRequest: options.onSummary,
+    // Omit unless a test explicitly exercises the legacy ceiling mode;
+    // the rest of this file therefore continues to verify the default.
+    ...(options.historyPaging ? { historyPaging: options.historyPaging } : {}),
+    onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
+  });
   flushSync(() => {
-    app = mount(TermView, {
-      target,
-      props: {
-        session: SESSION,
-        palette,
-        claimGeometry: false,
-        fontPx: 13,
-        ...(options.mode && options.mode !== "off"
-          ? { screen: { alt: false, mouseSgr: false, mouseAny: false } }
-          : {}),
-        claudeBashMode: options.mode ?? "off",
-        onClaudeBashSummaryRequest: options.onSummary,
-        // Omit unless a test explicitly exercises the legacy ceiling mode;
-        // the rest of this file therefore continues to verify the default.
-        ...(options.historyPaging ? { historyPaging: options.historyPaging } : {}),
-        onLinesChange: (lines: string[]) => deliveredLines.push([...lines]),
-      },
-    }) as Record<string, unknown>;
+    app = mount(TermView, { target, props: props as ComponentProps<typeof TermView> }) as Record<string, unknown>;
   });
 
   const viewport = target.querySelector<HTMLElement>('[data-testid="mtv"]');
   if (!viewport) throw new Error("TermView root not found");
   Object.defineProperties(viewport, {
-    clientWidth: { configurable: true, get: () => 320 },
+    clientWidth: { configurable: true, get: () => width },
     clientHeight: { configurable: true, get: () => VIEW_HEIGHT },
   });
   viewport.getBoundingClientRect = () => ({
@@ -191,9 +222,9 @@ function mountTermView(options: {
     y: 0,
     left: 0,
     top: 0,
-    right: 320,
+    right: width,
     bottom: VIEW_HEIGHT,
-    width: 320,
+    width,
     height: VIEW_HEIGHT,
     toJSON: () => ({}),
   }) as DOMRect;
@@ -203,7 +234,7 @@ function mountTermView(options: {
   flushSync();
   drainScheduledWork();
 
-  const entry = { app, target, viewport };
+  const entry = { app, props, target, viewport };
   mounted.push(entry);
   return entry;
 }
@@ -2407,5 +2438,957 @@ describe("TermView sliding archive window", () => {
       await settleUi();
       expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).toBeNull();
     });
+  });
+  describe("NEWARCH D flag-on history states", () => {
+    const PANE = { serverIdentity: "srv-d", paneId: "%7", birthGeneration: 1 };
+    const CURSOR = { version: 1, token: "opaque-h" };
+    const CAPS = { extensionVersion: 1, supported: ["history-states-v1"], required: ["history-states-v1"] };
+    const UNKNOWN_GAP = {
+      version: 1, episodeId: "ep-ui", parentEpisodeId: null, pane: PANE,
+      leftRowId: { pane: PANE, segmentId: "seg-1", rowOrdinal: 4 }, rightSegmentId: "seg-2",
+      reason: "collector-exit", countKind: "unknown", missingCount: null, withheldRows: 0, lowerBound: 0,
+      openedAt: 1, closedAt: null, clockEpoch: "clock-ui", quality: "degraded",
+    };
+    const PENDING_BLOCK = { kind: "blocked", cursor: CURSOR, state: { kind: "pending", operationId: "op-ui", retryAfterMs: 100 } };
+
+    function deliverFlagOnHistory(
+      startLine: number | null,
+      lines: string[],
+      hasMore: boolean,
+      flagOn: unknown,
+      totalArchivedLines?: number,
+    ): void {
+      if (!sessionCallback) throw new Error("subscribe was not invoked");
+      sessionCallback(JSON.stringify({
+        lines,
+        startLine,
+        endLine: startLine === null ? null : startLine + lines.length,
+        hasMore,
+        ...(totalArchivedLines === undefined ? {} : { totalArchivedLines }),
+        flagOn,
+      }), "history");
+      flushSync();
+      drainScheduledWork();
+    }
+
+    function statusNotes(target: HTMLElement): Array<{ kind: string | null; text: string }> {
+      return [...target.querySelectorAll<HTMLElement>('[data-testid="mtv-history-status"]')]
+        .map(note => ({ kind: note.getAttribute("data-history-state"), text: note.textContent?.trim() ?? "" }));
+    }
+
+    test("RD-01/UI: an empty pending page is not EOF; the note shows and the same cursor is asked again", async () => {
+      const { target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      expect(historyCalls).toEqual([{ direction: "before", cursor: null, limit: 2_000 }]);
+
+      deliverFlagOnHistory(null, [], true, {
+        version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" },
+      });
+      expect(viewport.getAttribute("data-history-request-direction")).toBeNull();
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(viewport.getAttribute("data-history-states")).toBe("pending");
+      expect(statusNotes(target)).toEqual([{ kind: "pending", text: "กำลังกู้ประวัติช่วงนี้ — ยังไม่ใช่จุดสิ้นสุด" }]);
+
+      wheel(viewport, -1_000_000);
+      expect(historyCalls).toEqual([
+        { direction: "before", cursor: null, limit: 2_000 },
+        { direction: "before", cursor: null, limit: 2_000 },
+      ]);
+      // A clean page replaces this edge's states: the pending note is gone.
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, {
+        version: 1, capabilities: CAPS, states: [{ kind: "exact" }],
+        before: { kind: "more", cursor: CURSOR }, after: { kind: "end" },
+      });
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      expect(statusNotes(target)).toEqual([]);
+      expect(viewport.getAttribute("data-history-states")).toBeNull();
+    });
+
+    test("UI: gap/remote/pressure states render as notes; unknown is words, not 0, and never enter copy or rows", async () => {
+      const { app, target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, {
+        version: 1, capabilities: CAPS,
+        states: [
+          { kind: "gap", gap: UNKNOWN_GAP },
+          { kind: "remote-required", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui" },
+          { kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 9 },
+          { kind: "degraded", episodeId: "ep-ui", uncertainFields: ["savedCursor"] },
+        ],
+        before: { kind: "blocked", cursor: CURSOR, state: { kind: "remote-unavailable", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui", retryAfterMs: 1000, reason: "offline" } },
+        after: { kind: "end" },
+      });
+      await settleUi();
+      const notes = statusNotes(target);
+      expect(notes.map(note => note.kind)).toEqual(["gap", "remote-required", "pressure", "degraded", "remote-unavailable"]);
+      expect(notes[0]!.text).toBe("ช่วงนี้เก็บประวัติไม่ครบ — จำนวนไม่ทราบ");
+      expect(notes[0]!.text).not.toMatch(/\d/);
+      expect(notes[1]!.text).toBe("ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน");
+      expect(notes[2]!.text).toBe("หยุดเก็บประวัติ — พื้นที่ไม่พอ");
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      // Notes live outside every terminal row.
+      for (const note of target.querySelectorAll('[data-testid="mtv-history-status"]')) {
+        expect(note.closest(".mtv-line")).toBeNull();
+        expect(note.closest(".mtv-loss-notes")).not.toBeNull();
+      }
+      const rowText = [...target.querySelectorAll(".mtv-line")].map(row => row.textContent ?? "").join("\n");
+      // Copy-all is built from terminal rows only.
+      const copied: string[] = [];
+      const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text: string) => { copied.push(text); } },
+      });
+      try {
+        expect(await (app.copyAll as () => Promise<boolean>)()).toBe(true);
+      } finally {
+        if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+        else Reflect.deleteProperty(navigator, "clipboard");
+      }
+      expect(copied).toHaveLength(1);
+      expect(copied[0]).toContain("archive-18000");
+      const lastLines = deliveredLines.at(-1) ?? [];
+      for (const note of notes) {
+        expect(rowText).not.toContain(note.text);
+        expect(copied[0]).not.toContain(note.text);
+        expect(lastLines.join("\n")).not.toContain(note.text);
+      }
+    });
+
+    test("pages whose states cannot be read, or that contradict hasMore, are refused (not EOF, not drawn)", async () => {
+      const lying: Array<[string, boolean, unknown]> = [
+        ["unknown count as 0", true, { version: 1, capabilities: CAPS, states: [{ kind: "gap", gap: { ...UNKNOWN_GAP, missingCount: 0 } }], before: PENDING_BLOCK, after: { kind: "end" } }],
+        ["blocked but hasMore false", false, { version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" } }],
+        ["end but hasMore true", true, { version: 1, capabilities: CAPS, states: [], before: { kind: "end" }, after: { kind: "end" } }],
+        ["unknown capability", true, { version: 1, capabilities: { ...CAPS, supported: ["history-states-v1", "x-v9"] }, states: [], before: PENDING_BLOCK, after: { kind: "end" } }],
+      ];
+      for (const [name, hasMore, flagOn] of lying) {
+        const { target, viewport } = mountTermView();
+        await tick();
+        deliverOutput(liveLines());
+        wheel(viewport, -1_000_000);
+        deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), hasMore, flagOn);
+        expect([name, viewport.getAttribute("data-history-window-start")]).toEqual([name, null]);
+        expect([name, viewport.getAttribute("data-history-stop")]).toEqual([name, "none"]);
+        expect([name, statusNotes(target)]).toEqual([name, []]);
+        for (const entry of mounted.splice(0)) {
+          unmount(entry.app);
+          entry.target.remove();
+        }
+      }
+    });
+
+    test("ceiling paging: a blocked empty page keeps the archive open instead of exhausted", async () => {
+      const { target, viewport } = mountTermView({ historyPaging: "ceiling" });
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      expect(historyCalls.length).toBe(1);
+      deliverFlagOnHistory(null, [], true, {
+        version: 1, capabilities: CAPS, states: [], before: PENDING_BLOCK, after: { kind: "end" },
+      });
+      await settleUi();
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(statusNotes(target).map(note => note.kind)).toEqual(["pending"]);
+      wheel(viewport, -1_000_000);
+      expect(historyCalls.length).toBe(2);
+    });
+
+    const WALL_MS = 1_700_000_000_123;
+    const INCIDENT_ID = "incident-storage-7";
+    const REMOTE_TOKEN = "opaque-remote-T";
+    const REPAIR = { revision: 2, supported: ["incident-r2", "timeline-replay-r2"], required: ["incident-r2"] };
+    function incident(leftRowId: unknown) {
+      return {
+        revision: 2, incidentId: INCIDENT_ID, pane: PANE, leftRowId,
+        openedAtWallMs: WALL_MS, openedAtMonoMs: 80, clockEpoch: "clock-ui",
+        collecting: false, reason: "storage-outage", quality: "degraded", resolvedAtWallMs: null,
+      };
+    }
+    function repairFlagOn(leftRowId: unknown) {
+      return {
+        version: 1, capabilities: CAPS, repair: REPAIR,
+        states: [{
+          kind: "pressure", level: "emergency", collecting: false, sinceMonoMs: 9,
+          repair: incident(leftRowId),
+        }],
+        before: {
+          kind: "blocked",
+          cursor: { version: 1, token: REMOTE_TOKEN },
+          state: { kind: "remote-required", range: { pane: PANE, segmentId: "seg-0", start: 0, end: 64 }, bundleId: "bundle-ui" },
+        },
+        after: { kind: "end" },
+      };
+    }
+
+    test("R18/UI: mounted pressure note shows backend time and row, and copy/search stay on terminal rows", async () => {
+      const { app, target, viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, repairFlagOn({ pane: PANE, segmentId: "seg-9", rowOrdinal: 41 }));
+      await settleUi();
+      const pressure = target.querySelector<HTMLElement>('[data-history-state="pressure"]');
+      expect(pressure).not.toBeNull();
+      expect(pressure!.textContent).toContain("หยุดเก็บประวัติ — พื้นที่ไม่พอ");
+      expect(pressure!.textContent).not.toContain(String(WALL_MS));
+      expect(pressure!.textContent).not.toContain(INCIDENT_ID);
+      expect(pressure!.getAttribute("data-history-opened-at")).toBe(String(WALL_MS));
+      expect(pressure!.getAttribute("data-history-left-row")).toBe("seg-9:41");
+      expect(pressure!.getAttribute("data-incident-id")).toBe(INCIDENT_ID);
+      expect(pressure!.closest(".mtv-line")).toBeNull();
+      // The reader sees when collection stopped and the last row kept, not only a data-* attribute.
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const stoppedAt = new Date(WALL_MS);
+      const shownTime = `${pad(stoppedAt.getDate())}/${pad(stoppedAt.getMonth() + 1)} ${pad(stoppedAt.getHours())}:${pad(stoppedAt.getMinutes())}:${pad(stoppedAt.getSeconds())}`;
+      const stopLine = pressure!.querySelector<HTMLElement>('[data-testid="mtv-history-stop"]');
+      expect(stopLine).not.toBeNull();
+      expect(stopLine!.textContent).toBe(`หยุดเมื่อ ${shownTime} · แถวสุดท้าย seg-9:41`);
+      expect(pressure!.getAttribute("aria-label")).toContain(shownTime);
+      expect(pressure!.getAttribute("aria-label")).toContain("seg-9:41");
+
+      const copied: string[] = [];
+      const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: async (text: string) => { copied.push(text); } },
+      });
+      try {
+        expect(await (app.copyAll as () => Promise<boolean>)()).toBe(true);
+      } finally {
+        if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+        else Reflect.deleteProperty(navigator, "clipboard");
+      }
+      expect(copied).toHaveLength(1);
+      expect(copied[0]).toContain("archive-18000");
+      for (const piece of ["หยุดเก็บประวัติ — พื้นที่ไม่พอ", "ประวัติช่วงนี้อยู่ในคลังสำรอง ต้องดึงคืนก่อนอ่าน", INCIDENT_ID, String(WALL_MS), "หยุดเมื่อ", "แถวสุดท้าย"]) {
+        expect(copied[0]).not.toContain(piece);
+      }
+
+      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true }));
+      await settleUi();
+      const input = target.querySelector<HTMLInputElement>('[data-testid="term-search-input"]');
+      expect(input).not.toBeNull();
+      input!.value = INCIDENT_ID;
+      input!.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await settleUi();
+      expect(target.querySelector('[data-testid="term-search-match"]')?.textContent).toContain("0 matches");
+      expect(target.querySelector(".mtv-line .search-match, .mtv-line .search-active")).toBeNull();
+      input!.value = "หยุดเก็บประวัติ";
+      input!.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await settleUi();
+      expect(target.querySelector('[data-testid="term-search-match"]')?.textContent).toContain("0 matches");
+      const rowText = [...target.querySelectorAll(".mtv-line")].map(row => row.textContent ?? "").join("\n");
+      expect(rowText).not.toContain("หยุดเก็บประวัติ");
+      expect(rowText).not.toContain(INCIDENT_ID);
+    });
+
+    test("R13/UI: the same opaque cursor and line anchor survive an empty remote page", async () => {
+      const { viewport } = mountTermView();
+      await tick();
+      deliverOutput(liveLines());
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(18_000, archiveLines(18_000, 2_000), true, repairFlagOn({ pane: PANE, segmentId: "seg-9", rowOrdinal: 41 }));
+      await settleUi();
+      expect(viewport.getAttribute("data-history-flag-cursor")).toBe(REMOTE_TOKEN);
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      wheel(viewport, -1_000_000);
+      deliverFlagOnHistory(null, [], true, repairFlagOn(null));
+      await settleUi();
+      expect(numberAttr(viewport, "data-history-window-start")).toBe(18_000);
+      expect(viewport.getAttribute("data-history-flag-cursor")).toBe(REMOTE_TOKEN);
+      expect(viewport.getAttribute("data-history-stop")).toBe("none");
+      expect(viewport.getAttribute("data-history-window-has-older")).toBe("1");
+      const pressure = viewport.ownerDocument.querySelector<HTMLElement>('[data-history-state="pressure"]');
+      expect(pressure?.getAttribute("data-history-left-row")).toBe("none");
+      expect(pressure?.getAttribute("data-history-opened-at")).toBe(String(WALL_MS));
+      expect(pressure?.querySelector('[data-testid="mtv-history-stop"]')?.textContent).toContain("ก่อนแถวแรก");
+    });
+  });
+});
+
+describe("NEWARCH v2 fixed geometry on the screen", () => {
+  const status = "ท่อเก็บขาด — 04/10 08:02:03 — ก่อนแถวแรก — หยุดเก็บแล้ว";
+
+  async function mountFixed(options: {
+    viewportWidth: number;
+    fitWidth?: boolean;
+    fontFit?: "auto" | "manual";
+  }) {
+    const calls: Array<{ cols: number; rows: number }> = [];
+    const geometryCalls: Array<{ cols: number; rows: number }> = [];
+    const original = tmuxMux.sendResize.bind(tmuxMux);
+    tmuxMux.sendResize = (session, cols, rows) => {
+      calls.push({ cols, rows });
+      void session;
+    };
+    try {
+      const mountedView = mountTermView({
+        claimGeometry: true,
+        fixedGeometry: { columns: 100, rows: 40 },
+        fitWidth: options.fitWidth ?? false,
+        ...(options.fontFit ? { fontFit: options.fontFit } : {}),
+        v2StatusText: status,
+        onGeometryChange: geometry => geometryCalls.push(geometry),
+        viewportWidth: options.viewportWidth,
+      });
+      await settleUi();
+      return { ...mountedView, calls, geometryCalls };
+    } finally {
+      tmuxMux.sendResize = original;
+    }
+  }
+
+  test("a phone shows the stopped incident with no live pane and does not resize", async () => {
+    // manual: the user's size as-is, so 100 columns scroll sideways.
+    for (const viewportWidth of [320, 390]) {
+      const view = await mountFixed({ viewportWidth, fontFit: "manual" });
+      expect(view.calls).toEqual([]);
+      expect(view.geometryCalls).toEqual([]);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("100");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("40");
+      const label = view.viewport.querySelector(".mtv-v2-status-text");
+      expect(label?.textContent).toContain("ก่อนแถวแรก");
+      expect(label?.textContent).toContain("หยุดเก็บแล้ว");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")?.textContent).toBe("เลื่อนข้างได้");
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeGreaterThan(viewportWidth);
+      const copied = [...view.viewport.querySelectorAll(".mtv-line")].map(node => node.textContent ?? "").join("\n");
+      expect(copied.includes("หยุดเก็บแล้ว")).toBe(false);
+    }
+  });
+
+  test("fit-width and a wide desktop keep 100 columns and write no resize", async () => {
+    // fitWidth scales the picture only in manual; auto shrinks the font instead.
+    const fit = await mountFixed({ viewportWidth: 320, fitWidth: true, fontFit: "manual" });
+    expect(fit.calls).toEqual([]);
+    expect(fit.viewport.getAttribute("data-last-cols")).toBe("100");
+    expect(fit.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+    expect(fit.viewport.querySelector(".mtv-v2-status-text")?.textContent).toContain("หยุดเก็บแล้ว");
+    const fitLayer = fit.viewport.querySelector<HTMLElement>(".mtv-layer");
+    expect(parseFloat(fitLayer?.style.width ?? "0")).toBeGreaterThan(320);
+    expect(fitLayer?.style.transform ?? "").toContain("scale(");
+
+    const desktop = await mountFixed({ viewportWidth: 1280 });
+    expect(desktop.calls).toEqual([]);
+    expect(desktop.geometryCalls).toEqual([]);
+    expect(desktop.viewport.getAttribute("data-last-cols")).toBe("100");
+    expect(desktop.viewport.getAttribute("data-last-rows")).toBe("40");
+  });
+});
+
+describe("NEWARCH fit-font: a fixed pane's columns fit the screen", () => {
+  const BIRTH = { columns: 78, rows: 120 };
+
+  function captureResizes() {
+    const calls: Array<{ cols: number; rows: number }> = [];
+    const original = tmuxMux.sendResize.bind(tmuxMux);
+    tmuxMux.sendResize = (session, cols, rows) => {
+      void session;
+      calls.push({ cols, rows });
+    };
+    return { calls, restore: () => { tmuxMux.sendResize = original; } };
+  }
+
+  function shownFontPx(viewport: HTMLElement): number {
+    return parseFloat(viewport.style.fontSize);
+  }
+
+  function setWidth(viewport: HTMLElement, width: number): void {
+    Object.defineProperty(viewport, "clientWidth", { configurable: true, get: () => width });
+    ControlledResizeObserver.latest?.fire();
+    flushSync();
+    drainScheduledWork();
+  }
+
+  /** A pane born 120 rows tall with the agent's prompt on row `cursorRow`;
+   * every row below it is blank, as tmux sends a tall, mostly empty pane. */
+  function tallPane(cursorRow: number): { lines: string[]; cursor: { row: number; col: number } } {
+    const lines = Array.from({ length: BIRTH.rows }, (_, index) => index <= cursorRow ? `row-${index}` : "");
+    // Protocol: row counts up from the last content line.
+    return { lines, cursor: { row: 0, col: 3 } };
+  }
+
+  test("78 columns on a 390px phone: fractional font, every column drawn, no resize ever", async () => {
+    const resizes = captureResizes();
+    const fits: Array<{ fontPx: number; fits: boolean }> = [];
+    try {
+      const view = mountTermView({
+        claimGeometry: true,
+        fixedGeometry: BIRTH,
+        viewportWidth: 390,
+        fontPx: 13,
+        onFontFit: fit => fits.push(fit),
+      });
+      await settleUi();
+      const font = shownFontPx(view.viewport);
+      expect(font).toBeGreaterThanOrEqual(8);
+      expect(font).toBeLessThan(8.1);
+      expect(Number.isInteger(font)).toBe(false);
+      expect(78 * font * 0.6).toBeLessThanOrEqual(378 + 1e-6);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("78");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("120");
+      expect(view.viewport.getAttribute("data-font-fit")).toBe("auto");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeLessThanOrEqual(390);
+      expect(layer?.style.transform ?? "").not.toContain("scale(");
+      expect(fits.at(-1)?.fits).toBe(true);
+      expect(fits.at(-1)?.fontPx).toBe(font);
+
+      // Rotate to landscape: wide enough, so the user's size comes back.
+      setWidth(view.viewport, 844);
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("78");
+
+      // And back to portrait.
+      setWidth(view.viewport, 390);
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(font);
+
+      // A+ raises the ceiling; the phone still cannot show more than the fit.
+      view.props.fontPx = 14;
+      flushSync();
+      await settleUi();
+      await new Promise(resolve => setTimeout(resolve, 260));
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(font);
+
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("birth geometry that arrives after mount (inventory comes late) refits at once, no resize", async () => {
+    // SessionView mounts TermView while the policy is still pending (no claim,
+    // no geometry); the inventory row lands later. No viewport change follows,
+    // so the prop change itself must trigger the refit. (Caught by Playwright.)
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: false, viewportWidth: 390, fontPx: 13 });
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      view.props.fixedGeometry = BIRTH;
+      flushSync();
+      await settleUi();
+      expect(view.viewport.getAttribute("data-last-cols")).toBe("78");
+      expect(view.viewport.getAttribute("data-last-rows")).toBe("120");
+      expect(shownFontPx(view.viewport)).toBeLessThan(8.1);
+      expect(view.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("fitWidth together with auto never scales the picture — one shrink only", async () => {
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: true, fixedGeometry: BIRTH, fitWidth: true, viewportWidth: 390 });
+      await settleUi();
+      expect(view.viewport.querySelector<HTMLElement>(".mtv-layer")?.style.transform ?? "").not.toContain("scale(");
+      expect(shownFontPx(view.viewport)).toBeLessThan(8.1);
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("manual keeps the user's size on a phone and scrolls sideways — still no resize", async () => {
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: true, fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      expect(view.viewport.getAttribute("data-font-fit")).toBe("manual");
+      expect(view.viewport.querySelector(".mtv-hscroll-text")?.textContent).toBe("เลื่อนข้างได้");
+      const layer = view.viewport.querySelector<HTMLElement>(".mtv-layer");
+      expect(parseFloat(layer?.style.width ?? "0")).toBeGreaterThan(390);
+
+      // Switch back to auto live.
+      view.props.fontFit = "auto";
+      flushSync();
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBeLessThan(8.1);
+      expect(view.viewport.querySelector(".mtv-hscroll-text")).toBeNull();
+      expect(resizes.calls).toEqual([]);
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  // REVIEW-grok BLOCK 1: `.mtv` is touch-action: none, so a manual pane that
+  // runs past the box only pans sideways if TermView applies the motion.
+  function finger(viewport: HTMLElement, path: Array<[number, number]>): void {
+    const ev = (type: string, pts: Array<[number, number]>) => {
+      const list = pts.map(([clientX, clientY]) => ({ clientX, clientY, identifier: 1 }));
+      const touchList = Object.assign([...list], { item: (i: number) => list[i] ?? null });
+      const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+      Object.defineProperties(event, {
+        touches: { value: type === "touchend" ? Object.assign([], { item: () => null }) : touchList },
+        changedTouches: { value: touchList },
+      });
+      viewport.dispatchEvent(event);
+      flushSync();
+    };
+    ev("touchstart", [path[0]!]);
+    for (const point of path.slice(1)) ev("touchmove", [point]);
+    ev("touchend", [path.at(-1)!]);
+    // Momentum frames are left queued (afterEach drops them): they move the
+    // pane vertically only, and a fling never settles under this scheduler.
+  }
+
+  function wideBox(viewport: HTMLElement, scrollWidth: number): void {
+    Object.defineProperty(viewport, "scrollWidth", { configurable: true, get: () => scrollWidth });
+  }
+
+  test("manual: a sideways swipe pans the pane, a vertical one does not", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+    await settleUi();
+    wideBox(view.viewport, 622);
+    expect(view.viewport.scrollLeft).toBe(0);
+    finger(view.viewport, [[320, 100], [300, 101], [250, 102], [150, 103], [100, 104]]);
+    expect(view.viewport.scrollLeft).toBe(220);
+    finger(view.viewport, [[200, 40], [201, 80], [202, 160], [203, 200]]);
+    expect(view.viewport.scrollLeft).toBe(220);
+    finger(view.viewport, [[100, 100], [140, 101], [330, 102]]);
+    expect(view.viewport.scrollLeft).toBeLessThanOrEqual(0);
+  });
+
+  test("manual: deltaX and shift+wheel pan sideways, a plain wheel does not", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+    await settleUi();
+    wideBox(view.viewport, 622);
+    view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaX: 40, deltaY: 3, bubbles: true, cancelable: true }));
+    expect(view.viewport.scrollLeft).toBe(40);
+    // happy-dom drops shiftKey from the init dict; a browser keeps it.
+    const shifted = new WheelEvent("wheel", { deltaY: 30, bubbles: true, cancelable: true });
+    Object.defineProperty(shifted, "shiftKey", { value: true });
+    view.viewport.dispatchEvent(shifted);
+    expect(view.viewport.scrollLeft).toBe(70);
+    view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaY: 30, bubbles: true, cancelable: true }));
+    expect(view.viewport.scrollLeft).toBe(70);
+  });
+
+  test("manual: box-pinned notes follow the pan instead of scrolling away", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, fontFit: "manual" });
+    await settleUi();
+    view.viewport.scrollLeft = 120;
+    view.viewport.dispatchEvent(new Event("scroll"));
+    flushSync();
+    expect(view.viewport.style.getPropertyValue("--mtv-pan-x")).toBe("120px");
+  });
+
+  for (const [name, options] of [
+    ["auto", { fixedGeometry: BIRTH, viewportWidth: 390 }],
+    ["legacy", { viewportWidth: 390 }],
+  ] as const) {
+    test(`a ${name} pane never pans sideways from a swipe or wheel`, async () => {
+      const view = mountTermView(options);
+      await settleUi();
+      wideBox(view.viewport, 622);
+      finger(view.viewport, [[320, 100], [300, 101], [150, 103], [100, 104]]);
+      view.viewport.dispatchEvent(new WheelEvent("wheel", { deltaX: 40, bubbles: true, cancelable: true }));
+      expect(view.viewport.scrollLeft).toBe(0);
+    });
+  }
+
+  test("a legacy pane (no birth geometry) is untouched: user size, and it still claims", async () => {
+    const resizes = captureResizes();
+    try {
+      const view = mountTermView({ claimGeometry: true, viewportWidth: 390 });
+      await settleUi();
+      expect(shownFontPx(view.viewport)).toBe(13);
+      expect(view.viewport.getAttribute("data-font-fit")).toBeNull();
+      expect(resizes.calls.length).toBeGreaterThan(0);
+      expect(resizes.calls.at(-1)?.cols).toBe(Math.floor((390 - 12) / (13 * 0.6)));
+    } finally {
+      resizes.restore();
+    }
+  });
+
+  test("the live tail ends at the prompt row, not at the blank bottom of a 120-row pane", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390 });
+    await settleUi();
+    const pane = tallPane(39);
+    deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
+    await settleUi();
+    const lineH = Math.round(shownFontPx(view.viewport) * 1.6);
+    const caret = view.viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    expect(caret).not.toBeNull();
+    const caretBottom = layerTranslateY(view.viewport) + parseFloat(caret?.style.top ?? "NaN") + lineH;
+    expect(caretBottom).toBeLessThanOrEqual(VIEW_HEIGHT + 0.5);
+    expect(caretBottom).toBeGreaterThan(VIEW_HEIGHT - lineH);
+    // The rows above the prompt are on screen, the blank rows 41-119 are not.
+    const shown = Array.from(view.viewport.querySelectorAll(".mtv-line"), node => node.textContent ?? "");
+    expect(shown).toContain("row-39");
+  });
+
+  test("the tail clears the ❯ button: tailClearancePx lifts the prompt row above it", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, tailClearancePx: 72 });
+    await settleUi();
+    const pane = tallPane(39);
+    deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
+    await settleUi();
+    const lineH = Math.round(shownFontPx(view.viewport) * 1.6);
+    const caret = view.viewport.querySelector<HTMLElement>('[data-testid="mtv-cursor"]');
+    const caretBottom = layerTranslateY(view.viewport) + parseFloat(caret?.style.top ?? "NaN") + lineH;
+    expect(caretBottom).toBeLessThanOrEqual(VIEW_HEIGHT - 72 + 0.5);
+    expect(caretBottom).toBeGreaterThan(VIEW_HEIGHT - 72 - lineH);
+  });
+
+  test("a short screen stays top-aligned: no blank gap is invented above the content", async () => {
+    const view = mountTermView({ fixedGeometry: BIRTH, viewportWidth: 390, tailClearancePx: 72 });
+    await settleUi();
+    const pane = tallPane(4);
+    deliverOutput(pane.lines, undefined, undefined, { cursor: pane.cursor });
+    await settleUi();
+    expect(layerTranslateY(view.viewport)).toBe(0);
+  });
+});
+
+// --- D3 (flag-on 2026-10-05): the v2 cursor walks all the way to the screen ---
+
+describe("NEWARCH v2 cursor history on the screen (D3)", () => {
+  type V2Pane = { serverIdentity: string; paneId: string; birthGeneration: number };
+  type V2Call = { session: string; pane: V2Pane; cursor: { token: string; pane: V2Pane } | null; direction: "before" | "after"; maxEntries?: number; settle: (result: unknown) => void };
+  const PANE_A: V2Pane = { serverIdentity: "srv-1", paneId: "%1", birthGeneration: 1 };
+  const PANE_B: V2Pane = { serverIdentity: "srv-1", paneId: "%2", birthGeneration: 1 };
+  const GEOMETRY = { policy: "fixed-at-birth", columns: 78, rows: 120, configVersion: "q22-default-1", panesPerWindow: 1 };
+  const WIDE = "x".repeat(12_000);
+  let calls: V2Call[] = [];
+  let cancels = 0;
+  let original: Record<string, unknown> = {};
+
+  function descriptor(pane: V2Pane, state = "active") {
+    return {
+      schema: "newarch-v2", session: { serverIdentity: pane.serverIdentity, sessionId: `s-${pane.paneId}` }, pane,
+      windowId: `@${pane.paneId}`, owner: "capture-engine", birthOperationId: `birth-${pane.paneId}`, geometry: GEOMETRY, state,
+    };
+  }
+
+  function cursor(pane: V2Pane, token: string) {
+    return { schema: "newarch-v2", pane, storeId: "local", timelineRevision: 2, token };
+  }
+
+  function row(pane: V2Pane, ordinal: number, wide = true) {
+    return { kind: "row", id: { pane, segmentId: "seg", rowOrdinal: ordinal }, cells: [{ text: `r${ordinal}-${wide ? WIDE : ""}`, width: 1, style: [] }], wrapStatus: "unwrapped", wrapPad: 0 };
+  }
+
+  function incident(pane: V2Pane, collecting: boolean) {
+    return {
+      schema: "newarch-v2", incidentId: "inc-first", pane, reason: "pipe-eof", frontier: null,
+      affected: { after: null, through: null }, openedAtWallMs: Date.UTC(2026, 9, 4, 1, 2, 3), openedAtMonoMs: 1, clockEpoch: "e",
+      collecting, missing: { countKind: "unknown", missingCount: null }, ruleVersion: "r@1", configVersion: "q22-default-1",
+      geometry: GEOMETRY, revision: 1, sourceEpoch: null, sourceOffset: null, expectedDigest: null, actualDigest: null,
+      action: collecting ? "annotate" : "gap-and-stop", evidence: null,
+    };
+  }
+
+  /** Server-side store of rows 1..total; cursors name an ordinal boundary. */
+  function storeReply(call: V2Call, total: number, pageRows = 256, wide = true) {
+    let first: number;
+    let last: number;
+    if (call.direction === "before") {
+      const bound = call.cursor ? Number(call.cursor.token.slice(2)) : total + 1;
+      last = bound - 1;
+      first = Math.max(1, bound - pageRows);
+    } else {
+      const bound = Number(call.cursor!.token.slice(2));
+      first = bound + 1;
+      last = Math.min(total, bound + pageRows);
+    }
+    const ordinals = Array.from({ length: Math.max(0, last - first + 1) }, (_, i) => first + i);
+    return {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: call.pane,
+        revision: 2, entries: ordinals.map(n => row(call.pane, n, wide)), payloadBytes: 1, states: [{ kind: "exact", auditedRevision: 2 }],
+        before: first > 1 ? { kind: "more", cursor: cursor(call.pane, `b:${first}`) } : { kind: "end" },
+        after: last < total ? { kind: "more", cursor: cursor(call.pane, `a:${last}`) } : { kind: "end" },
+      },
+    };
+  }
+
+  async function answer(call: V2Call, result: unknown) {
+    call.settle(result);
+    await settleUi();
+    await settleUi();
+  }
+
+  function ordinalsOnScreen(): number[] {
+    const lines = deliveredLines.at(-1) ?? [];
+    return lines.map(line => /^r(\d+)-/.exec(line)?.[1]).filter((m): m is string => m !== undefined).map(Number);
+  }
+
+  function noteTexts(target: HTMLElement): string[] {
+    return Array.from(target.querySelectorAll('[data-testid="mtv-v2-history-note"]')).map(node => node.textContent ?? "");
+  }
+
+  beforeEach(() => {
+    calls = [];
+    cancels = 0;
+    const mux = tmuxMux as unknown as Record<string, unknown>;
+    original = { requestHistoryV2: mux.requestHistoryV2, newarchV2Pane: mux.newarchV2Pane, cancelHistoryV2: mux.cancelHistoryV2 };
+    mux.requestHistoryV2 = (session: string, pane: { pane: V2Pane }, ask: { cursor: V2Call["cursor"]; direction: "before" | "after"; maxEntries?: number }) => {
+      // the real mux drops a cursor of another pane; the fake records what TermView asked
+      return new Promise(settle => calls.push({ session, pane: pane.pane, cursor: ask.cursor, direction: ask.direction, maxEntries: ask.maxEntries, settle }));
+    };
+    mux.newarchV2Pane = () => null;
+    mux.cancelHistoryV2 = () => { cancels++; return true; };
+  });
+
+  afterEach(() => {
+    Object.assign(tmuxMux as unknown as Record<string, unknown>, original);
+  });
+
+  test("scrolls back across three v2 pages and forward again; each row once, in order, by the pane's own cursors", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    const total = 900;
+    for (let page = 0; page < 3; page++) {
+      wheel(viewport, -1_000_000);
+      const call = calls.at(-1)!;
+      expect(calls).toHaveLength(page + 1);
+      expect(call.direction).toBe("before");
+      expect(call.maxEntries).toBe(256);
+      expect(call.cursor?.token ?? null).toBe(page === 0 ? null : `b:${total + 1 - 256 * page}`);
+      await answer(call, storeReply(call, total));
+    }
+    expect(historyCalls).toEqual([]);
+    // 3 x 256 wide rows cross the 8 MiB resident budget: the newer side was evicted.
+    expect(viewport.getAttribute("data-history-window-has-newer")).toBe("1");
+    const back = ordinalsOnScreen();
+    expect(back[0]).toBe(133);
+    expect(back).toEqual(Array.from({ length: back.length }, (_, i) => 133 + i));
+    const residentEnd = back.at(-1)!;
+    expect(residentEnd).toBeLessThan(900);
+
+    // forward: the newer edge sits inside an evicted page, so the pager asks from the
+    // nearest boundary it holds a cursor for and the repeated rows must match.
+    wheel(viewport, 1_000_000);
+    const forward = calls.at(-1)!;
+    expect(forward.direction).toBe("after");
+    // which boundary depends on how many wide rows the byte budget kept; it is
+    // always a server cursor at a page edge, never a line number
+    expect(forward.cursor?.token).toMatch(/^a:(388|644)$/);
+    await answer(forward, storeReply(forward, total));
+    const after = ordinalsOnScreen();
+    expect(after).toEqual(Array.from({ length: after.length }, (_, i) => after[0]! + i));
+    expect(after.at(-1)!).toBeGreaterThan(residentEnd);
+    expect(new Set(after).size).toBe(after.length);
+  });
+
+  test("a reconnect is not the end: the same cursor is asked again and the rows land once", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    wheel(viewport, -1_000_000);
+    const lost = calls.at(-1)!;
+    expect(lost.cursor?.token).toBe("b:345");
+    await answer(lost, { kind: "disconnected" });
+    expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).not.toBeNull();
+    expect(viewport.getAttribute("data-history-exhausted")).not.toBe("1");
+    wheel(viewport, -1_000_000);
+    const retry = calls.at(-1)!;
+    expect(retry).not.toBe(lost);
+    expect(retry.cursor?.token).toBe("b:345");
+    await answer(retry, storeReply(retry, 600, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(89);
+    expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => 89 + i));
+  });
+
+  test("two panes: switching the view's pane drops the old cursor and rows; the new pane starts from its own tail", async () => {
+    const { viewport, props } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    flushSync(() => { props.newarchV2Pane = descriptor(PANE_B); });
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    expect(call.pane).toEqual(PANE_B);
+    expect(call.cursor).toBeNull();
+    await answer(call, storeReply(call, 40, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows).toEqual(Array.from({ length: 40 }, (_, i) => i + 1));
+    expect(calls.every(c => c.cursor === null || c.cursor.pane.paneId === c.pane.paneId)).toBe(true);
+  });
+
+  test("an incident before the first row, a pending storage fault and a stopped pane are sentences on screen", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A, "stopped") });
+    await tick();
+    deliverOutput(liveLines());
+    expect(noteTexts(target).join("|")).toContain("หยุดเก็บแล้ว");
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const pending = { kind: "storage-unavailable", pendingIncidentId: "pend-1", retryAfterMs: 500 };
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [{ kind: "incident", incident: incident(PANE_A, false) }, row(PANE_A, 1, false), row(PANE_A, 2, false)],
+        payloadBytes: 1, states: [{ kind: "incident", incident: incident(PANE_A, false) }, pending],
+        before: { kind: "blocked", cursor: cursor(PANE_A, "b:1"), state: pending }, after: { kind: "end" },
+      },
+    });
+    const notes = noteTexts(target).join("|");
+    expect(notes).toContain("ก่อนแถวแรก");
+    expect(notes).toContain("ท่อเก็บขาด");
+    expect(notes).toContain("มีเหตุรอบันทึก");
+    expect(notes).toContain("ยังไม่ใช่จุดสิ้นสุด");
+    expect(ordinalsOnScreen()).toEqual([1, 2]);
+    // sentences are outside the rows: copy/search never pick them up
+    const copied = Array.from(viewport.querySelectorAll(".mtv-line")).map(node => node.textContent ?? "").join("\n");
+    expect(copied.includes("ก่อนแถวแรก")).toBe(false);
+    // blocked is not EOF: the next scroll asks again with the blocked cursor
+    wheel(viewport, -1_000_000);
+    expect(calls.at(-1)!.cursor?.token).toBe("b:1");
+  });
+
+  test("a remote/owner fault shows a sentence and keeps the edge open; a stale cursor restarts from the tail", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const remote = { kind: "remote-unavailable", bundleId: "bundle-9", reason: "offline", retryAfterMs: 1000 };
+    let call = calls.at(-1)!;
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [], payloadBytes: 0, states: [remote], before: { kind: "blocked", cursor: cursor(PANE_A, "b:50"), state: remote }, after: { kind: "end" },
+      },
+    });
+    expect(noteTexts(target).join("|")).toContain("ออฟไลน์");
+    expect(target.querySelector('[data-testid="mtv-archive-unavailable"]')).not.toBeNull();
+    wheel(viewport, -1_000_000);
+    call = calls.at(-1)!;
+    await answer(call, { kind: "reply", reply: { schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "error", pane: PANE_A, code: "owner-unavailable", retryAfterMs: 300 } });
+    expect(noteTexts(target).join("|")).toContain("เจ้าของประวัติยังไม่พร้อม");
+    wheel(viewport, -1_000_000);
+    call = calls.at(-1)!;
+    await answer(call, { kind: "reply", reply: { schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "error", pane: PANE_A, code: "stale-cursor", retryAfterMs: null } });
+    wheel(viewport, -1_000_000);
+    expect(calls.at(-1)!.cursor).toBeNull();
+  });
+
+  test("a page that would duplicate a resident row is refused, not drawn", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const dup = storeReply(call, 600, 256, false) as { reply: { entries: unknown[] } };
+    dup.reply.entries.push(row(PANE_A, 400, false));
+    await answer(call, dup);
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(345);
+    expect(new Set(rows).size).toBe(rows.length);
+  });
+
+  // --- D3-r1 (review agy 2026-10-05) ---
+
+  test("a young session whose live seam is near line 0 still scrolls back through every v2 page", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines(), undefined, historyBoundary("g-young", 0));
+    wheel(viewport, -1_000_000);
+    const first = calls.at(-1)!;
+    expect(first.cursor).toBeNull();
+    await answer(first, storeReply(first, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    wheel(viewport, -1_000_000);
+    const second = calls.at(-1)!;
+    expect(second.cursor?.token).toBe("b:345");
+    await answer(second, storeReply(second, 600, 256, false));
+    const rows = ordinalsOnScreen();
+    expect(rows[0]).toBe(89);
+    expect(rows).toEqual(Array.from({ length: rows.length }, (_, i) => 89 + i));
+  });
+
+  test("back at the live tail the old pages are gone: the next scroll back starts from the tail again", async () => {
+    const { viewport } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines(), undefined, historyBoundary("g-tail", 1000));
+    wheel(viewport, -1_000_000);
+    await answer(calls.at(-1)!, storeReply(calls.at(-1)!, 600, 256, false));
+    expect(ordinalsOnScreen()[0]).toBe(345);
+    wheel(viewport, 1_000_000);
+    // the seam moves while the reader sits at the tail: the resident archive is cleared
+    deliverOutput(liveLines("live2"), undefined, historyBoundary("g-tail", 1010));
+    expect(ordinalsOnScreen()).toEqual([]);
+    const asked = calls.length;
+    wheel(viewport, -1_000_000);
+    expect(calls.length).toBe(asked + 1);
+    expect(calls.at(-1)!.cursor).toBeNull();
+  });
+
+  test("a pane change clears the old pane's rows and sentences at once, before any scroll", async () => {
+    const { viewport, target, props } = mountTermView({ newarchV2Pane: descriptor(PANE_A) });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [{ kind: "incident", incident: incident(PANE_A, false) }, row(PANE_A, 1, false), row(PANE_A, 2, false)],
+        payloadBytes: 1, states: [{ kind: "incident", incident: incident(PANE_A, false) }], before: { kind: "end" }, after: { kind: "end" },
+      },
+    });
+    expect(ordinalsOnScreen()).toEqual([1, 2]);
+    expect(noteTexts(target).join("|")).toContain("ท่อเก็บขาด");
+    expect(viewport.getAttribute("data-history-window-rows")).toBe("2");
+    const asked = calls.length;
+    flushSync(() => { props.newarchV2Pane = descriptor(PANE_B); });
+    await settleUi();
+    expect(calls.length).toBe(asked);
+    // no resident row of pane A is left in the window, and its sentence is gone
+    expect(viewport.getAttribute("data-history-window-rows")).toBeNull();
+    expect(noteTexts(target).join("|")).not.toContain("ท่อเก็บขาด");
+  });
+
+  test("the pane learned from the session list (no prop) still shows its stopped sentence", async () => {
+    (tmuxMux as unknown as Record<string, unknown>).newarchV2Pane = () => descriptor(PANE_A, "stopped");
+    const { target } = mountTermView();
+    await tick();
+    deliverOutput(liveLines());
+    expect(noteTexts(target).join("|")).toContain("หยุดเก็บแล้ว");
+  });
+
+  test("many incident sentences never push the pane's own stopped sentence off the screen", async () => {
+    const { viewport, target } = mountTermView({ newarchV2Pane: descriptor(PANE_A, "stopped") });
+    await tick();
+    deliverOutput(liveLines());
+    wheel(viewport, -1_000_000);
+    const call = calls.at(-1)!;
+    const many = Array.from({ length: 8 }, (_, i) => ({ ...incident(PANE_A, false), incidentId: `inc-${i}` }));
+    await answer(call, {
+      kind: "reply",
+      reply: {
+        schema: "newarch-v2", type: "history_v2", channel: call.session, requestId: "x", status: "ok", pane: PANE_A, revision: 2,
+        entries: [...many.map(inc => ({ kind: "incident", incident: inc })), row(PANE_A, 1, false)],
+        payloadBytes: 1, states: many.map(inc => ({ kind: "incident", incident: inc })), before: { kind: "end" }, after: { kind: "end" },
+      },
+    });
+    const notes = noteTexts(target);
+    expect(notes.length).toBeLessThanOrEqual(6);
+    expect(notes.join("|")).toContain("หยุดเก็บแล้ว");
   });
 });

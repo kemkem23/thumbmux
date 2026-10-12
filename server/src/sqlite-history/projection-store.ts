@@ -26,7 +26,7 @@ const GUARANTEE_MAX=768*1024, ROSTER_MS=30000;
 // after SEAL_LAG) rewrites its block, so a line is never stored twice.
 // 2 KiB pages keep a typical line in its page (WITHOUT ROWID local limit
 // ~488 B) while halving each WAL frame and the fixed per-table pages.
-const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, SEAL_QUIET_MS=30000, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5;
+const SEAL_LINES=256, SEAL_LAG=128, SEAL_UNCHECKED_LAG=4608, SEAL_RETRY_MS=200, SEAL_QUIET_MS=30000, DISK_PAGE_SIZE=2048, WAL_LIMIT=16*1024, CHECKPOINT_COMMITS=5, WORKER_GC_COMMITS=32;
 export interface ProjectionOptions {
   historyRoot: string; file?: string; mode: 'create'|'recover';
   /**
@@ -423,6 +423,13 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
   const disk=new Database(workerData.file,{strict:true});
   disk.exec(`PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=250; PRAGMA cache_size=-8192; PRAGMA journal_size_limit=${WAL_LIMIT};`);
   let commits=0;
+  // Bun does not collect this worker's own heap at the host's commit rate: every
+  // batch cloned into it stayed as garbage (+30-45 MiB/h at 21 panes, collected
+  // about once an hour) and the host's heapUsed never shows it (NEWARCH
+  // native-growth). Live heap here is ~1.5 MiB, so a full collection costs ~2 ms
+  // on this thread; it runs after the ack, off the commit's latency path.
+  let sinceCollect=0;
+  const collect=()=>{if(++sinceCollect>=WORKER_GC_COMMITS){sinceCollect=0;Bun.gc(true);}};
   const stats=archiveStatsOf(disk);
   let reported={...stats};
   let drainTimer:ReturnType<typeof setTimeout>|null=null;
@@ -431,13 +438,15 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
     try {drainArchives(disk,workerData.fence);}
     // Compaction only: the receipts stay live and valid; the next commit or flush retries.
     catch(error){console.error('[newarch] archive drain failed',String(error));return;}
-    scheduleDrain();
+    collect();scheduleDrain();
   };
   const scheduleDrain=()=>{
     const due=[archiveNextDue(disk),quietNextDue(disk)].filter((t):t is number=>t!==null),next=due.length?Math.min(...due):null;
     if(!drainTimer && next!==null)drainTimer=setTimeout(drain,Math.max(ARCHIVE_IDLE_MS,next-archiveClock()));
   };
-  const onMessage=(batch:Batch|'close')=>{
+  const onMessage=(batch:Batch|'close'|'heap')=>{
+    // The worker's JS heap is its own VM: the host's process.memoryUsage() never sees it.
+    if(batch==='heap'){parentPort!.postMessage({heap:process.memoryUsage().heapUsed,commits});return;}
     if(batch==='close') {
       if(drainTimer){clearTimeout(drainTimer);drainTimer=null;}
       try {closePrepared(disk);}catch(error){console.error('[newarch] disk worker close failed',String(error));}
@@ -462,6 +471,7 @@ if(!isMainThread && workerData?.projectionDiskWriter===true) {
       errors.set(bytes);Atomics.store(signal,1,bytes.length);Atomics.store(signal,0,2);
     }
     Atomics.notify(signal,0);parentPort!.postMessage(batch.id);
+    collect();
   };
   parentPort!.on('message',onMessage);
 }
@@ -504,6 +514,7 @@ export class ProjectionStore implements ProjectionWriterPort {
   private storageBatchId:string|null=null;
   private closeReceipt:ProjectionCloseReceipt|null=null;
   private worker:Worker|null=null;
+  private heapWaiters:Array<(r:{heap:number;commits:number}|null)=>void>=[];
   private readonly signal=new Int32Array(new SharedArrayBuffer(4104));
   private inFlight=false;
   private diskTiming={totalMs:0,writeMs:0,commitMs:0,archiveMs:0};
@@ -1193,7 +1204,8 @@ export class ProjectionStore implements ProjectionWriterPort {
       const bytes=new TextEncoder().encode(String(error)).subarray(0,4096);
       new Uint8Array(this.signal.buffer,8).set(bytes);Atomics.store(this.signal,1,bytes.length);Atomics.store(this.signal,0,2);Atomics.notify(this.signal,0);
     };
-    this.worker.on('message',(id:string)=>{
+    this.worker.on('message',(id:string|{heap:number;commits:number})=>{
+      if(typeof id!=='string'){for(const resolve of this.heapWaiters.splice(0))resolve(id);return;}
       if(this.closed || !this.inFlight || this.retry?.id!==id)return;
       try {
         this.finishWorker();
@@ -1201,7 +1213,7 @@ export class ProjectionStore implements ProjectionWriterPort {
       }catch(error){this.handleFlushFailure(error);}
     });
     this.worker.on('error',failed);
-    this.worker.on('exit',code=>{this.worker=null;if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
+    this.worker.on('exit',code=>{this.worker=null;for(const resolve of this.heapWaiters.splice(0))resolve(null);if(!this.closed)failed(new Error(`disk-worker-exited:${code}`));});
     this.worker.unref();
   }
   private flushAsync():void {
@@ -1256,6 +1268,11 @@ export class ProjectionStore implements ProjectionWriterPort {
    * Archive scheduling and receipt lookup counters (D2): the disk worker's
    * commits plus this thread's barrier flushes and boot/calibration lookups.
    */
+  /** Heap of the disk worker's own JS VM (bytes in use, garbage included) and its commit count; null without a worker. */
+  diskWorkerHeap():Promise<{heap:number;commits:number}|null> {
+    const worker=this.worker;if(!worker)return Promise.resolve(null);
+    return new Promise(resolve=>{this.heapWaiters.push(resolve);worker.postMessage('heap');});
+  }
   archiveStats():ArchiveStats {
     const own=archiveStatsOf(this.disk),sum=emptyArchiveStats();
     for(const key of Object.keys(sum) as (keyof ArchiveStats)[])sum[key]=own[key]+this.workerArchive[key];

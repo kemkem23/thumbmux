@@ -1442,11 +1442,21 @@ function isV0203PatchException(
  * assigns it to TmuxDriver). The generic proof cannot model the intersection.
  * Pin both artifact digests and versions; unrelated drift still fails.
  * createActivityPoll / readActivityProcess left the barrel instead of freezing.
- * Evidence: server/tests/session-row-type.fixture.ts (`bundledDriver`)
- * compiles createBunTmuxDriver() into a plain TmuxDriver binding.
+ * NEWARCH v2 (lot I) adds, on the same graph: TmuxWsMuxOptions.newarchV2?
+ * (optional), private members, and handleResize/applyGeometry now return
+ * NewarchV2GeometryReply | null instead of void. Callers that ignore the result
+ * still compile; AppRoutes / AppRoutesOptions / createAppRoutes change only
+ * through that TmuxWsMux graph (app-routes.d.ts is byte-identical).
+ * Evidence: server/tests/session-row-type.fixture.ts compiles 0.20.4-shaped
+ * callers (discarded result, void callback, non-overriding subclass). A
+ * subclass that overrides either method as `: void` no longer compiles.
  */
 const V0205_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
-  "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b"
+  "server:createBunTmuxDriver:5794c580d54ac2143b9d42aac0cbc2b93ae27ee9f2d019e55938caff91d9bb06:3efb16f11cae1e6712b1a96e3871bc1949d5becbe732ce43f2a08a22ce391e0b",
+  "server:AppRoutes:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:0cee4584b304111af833cf65a34d7205cdd27e714d815411d9ca1ad137d054e3",
+  "server:AppRoutesOptions:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:413b5cbbaada29e23a00e522f4dcd30c9990dd926048df394ebf004fb2d66ce7",
+  "server:createAppRoutes:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:dcd3b01f07acdc453c2cf3cd977c44478d384beb6b592e7431b58e2700ec700e",
+  "server:TmuxWsMux:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:24d3a6f011af24425930aec4c32d0707f4e5264776d26bba3ab26791186f0ebb"
 ]);
 
 function isV0205PatchException(
@@ -1463,23 +1473,96 @@ function isV0205PatchException(
 }
 
 /**
- * Reviewed optional additions for 0.20.5 -> 0.21.0 (WJ-A semantic submit).
- * - svelte PromptsPanel (F): new optional `entries?` prop, and its optional
- *   `labels?` inline object gained optional `sourceUi?` `sourceScreen?`
- *   `uncertain?`. The generic proof sees only direct optional members, so the
- *   changed hash of the `labels` member reads as a removal.
- * - app DEFAULT_APP_LABELS (S): the frozen default object gained the four
- *   0.21.0 label strings; every existing key keeps its value and type.
- * The four keys are optional on `AppLabels`, so AppLabels, AppAdapters and the
- * shells pass the generic proof and need no row. Pin both artifact digests and
- * versions; unrelated drift still fails.
+ * 0.22 candidate exceptions, derived separately from immutable v0.20.5-dist
+ * (62f092bd8c54cac4b47e04b52189ce52751b8579) and v0.21.0-dist
+ * (f057decc360b007907dfafdf56ec1efb9f7079fa). These authorize this exact
+ * release delta, not blanket source compatibility. CHANGELOG documents the
+ * union/exhaustive-handler and void-override breaking edges in this 0.x minor.
+ * Tests contain independent artifact literals; consumer/runtime assertions
+ * still require review and runner execution. Ordinary optional additions
+ * (TmuxWsMuxOptions, TermView, AppLabels) use the structural proof instead.
+ * Key: from:subpackage:name:kind:oldSignature:newSignature:oldCompatibility:newCompatibility.
  */
-const V0210_REVIEWED_ADDITIONS: ReadonlySet<string> = new Set([
-  "svelte:PromptsPanel:a01d69dc347c3a26ab42fe661d95bbcd9fc74387a88c9b7dcb204feaa5f39a8e:62ff18e2aa2b7c89a0e0086e4700a7a2310856060ff16a7aa4e90fb48786bdf5",
-  "app:DEFAULT_APP_LABELS:fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0:96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5",
+const V0220_REVIEWED_SIGNATURES: ReadonlySet<string> = new Set([
+  // 0.20.5 core/MuxClientMessage: History request union addition; old inputs remain valid, exhaustive handlers may break.
+  "0.20.5:core:MuxClientMessage:type:11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08:95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c:11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08:95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c",
+  // 0.20.5 core/MuxStrictClientMessage: History request union addition; old inputs remain valid, exhaustive handlers may break.
+  "0.20.5:core:MuxStrictClientMessage:type:51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7:b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8:51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7:b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8",
+  // 0.20.5 server/AppRoutes: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:AppRoutes:type:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+  // 0.20.5 server/AppRoutesOptions: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:AppRoutesOptions:type:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd",
+  // 0.20.5 server/createAppRoutes: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:createAppRoutes:value:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+  // 0.20.5 server/createTokenGuard: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:createTokenGuard:value:e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a:482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0:e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a:482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0",
+  // 0.20.5 server/MuxAuthResult: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:MuxAuthResult:type:92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9:460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d:92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9:460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d",
+  // 0.20.5 server/MuxAuthSuccess: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:MuxAuthSuccess:type:7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40:10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43:7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40:10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43",
+  // 0.20.5 server/TmuxWsMux: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:TmuxWsMux:value:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+  // 0.20.5 server/TokenGuard: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.20.5:server:TokenGuard:type:1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630:39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4:1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630:39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4",
+  // 0.20.5 svelte/tmuxMux: Public v2 methods/nominal graph; .20.5 PromptsPanel also restores the released optional WJ surface.
+  "0.20.5:svelte:tmuxMux:value:1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1:20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919:1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1:20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919",
+  // 0.20.5 svelte/TmuxMux: Public v2 methods/nominal graph; .20.5 PromptsPanel also restores the released optional WJ surface.
+  "0.20.5:svelte:TmuxMux:value:10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336:ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1:10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336:ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1",
+  // 0.20.5 svelte/PromptsPanel: Public v2 methods/nominal graph; .20.5 PromptsPanel also restores the released optional WJ surface.
+  "0.20.5:svelte:PromptsPanel:component:eeabae3cbcca4ab135572967cb25dd554d6b1c26fd1bcc9657d253b58c0a6e0d:5bf24f6434b53337d1bf67321caa790d58b731f36fcb9561c322664620a6528f:a01d69dc347c3a26ab42fe661d95bbcd9fc74387a88c9b7dcb204feaa5f39a8e:62ff18e2aa2b7c89a0e0086e4700a7a2310856060ff16a7aa4e90fb48786bdf5",
+  // 0.20.5 app/AppAdapters: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:AppAdapters:type:5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0:07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b:5eec4498dd463722cf26d8dc6d44e35f123287fa62eed1bde57673b2ecabb2e0:07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b",
+  // 0.20.5 app/createSessionsStore: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:createSessionsStore:value:320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc:a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034:320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc:a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034",
+  // 0.20.5 app/EmbedView: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:EmbedView:component:b51656395a3b996f2c5b5bd70b2a38f8ec431acb4bb69d761f0e1a4a3194b86e:aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416:46f7f6c8a7bef4d8ed33468c252ad22b3180d78ed6896b4db2e2e915c5e7fcb7:bbe2fe42f25da707fdc00563c796de9e655c85225a355f8a270bd444c25b006d",
+  // 0.20.5 app/HubView: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:HubView:component:5924951958271059e63f1f738c90d335e0a624b572f986d6ebf99351190a3646:9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e:e98a99dfa1891ebef3e78dd26b6485c7687ccb44808042e23aac9ac9f4e8b702:3609341b43f82f78978aa132f92e0c01171f01a333ac1434e86c23a130c7d0a9",
+  // 0.20.5 app/SessionView: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:SessionView:component:be5f48e09dca94255ee8fcaa0497e147287450947c12ec4e68badc09d0631d60:b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675:e8a4c3c6399bbee28663b068d9572ece989d78ee7c89b3587fbbec40a33bbb8b:d8223970b90a41c6fa6650ded1c1a20183fd27ff3f4e2a43aef7d9ca93ff32cd",
+  // 0.20.5 app/ThumbmuxApp: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:ThumbmuxApp:component:9acd4c600929f4c9fa84f5716d124d184be5df10f8335dba720147f9e1385da5:071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f:6f6e2591a5f4154d627d630a21302dbdc22e385dcde546d9291759017c815c18:24e56e84869abefdab2302613f0265a96b3647ee247dc55fd7b7dc2ef54cc27b",
+  // 0.20.5 app/DEFAULT_APP_LABELS: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.20.5:app:DEFAULT_APP_LABELS:value:fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0:96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5:fcaf14520699415db6431bc8d934536ac4be7232184dd97f724849d4de0e71d0:96a4226e7ce0f26bff723516145368641512444fcd2119428305e31d726854e5",
+  // 0.21.0 core/MuxClientMessage: History request union addition; old inputs remain valid, exhaustive handlers may break.
+  "0.21.0:core:MuxClientMessage:type:11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08:95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c:11b80be731ac23950de4b40bc3d5366de4e5742a349597daacf4f266b3e9aa08:95541994b6b91a3de5cce4ced1bde641e72b80727ae5c4fee10a25f8d9bb8c8c",
+  // 0.21.0 core/MuxStrictClientMessage: History request union addition; old inputs remain valid, exhaustive handlers may break.
+  "0.21.0:core:MuxStrictClientMessage:type:51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7:b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8:51b53a06dce56e69bd5a46f2f79354403426c4cc70b24c06097fbd1aa849dca7:b11b2d2c76bef804cff2f2416dff74b0d9a6cea56f428be0dd96643bf05040b8",
+  // 0.21.0 server/AppRoutes: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:AppRoutes:type:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962:bf2781650331649829f6cd26221c47f86cef6c9b049cb4d92686bd7f22e25c33:5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+  // 0.21.0 server/AppRoutesOptions: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:AppRoutesOptions:type:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd:c42593b8bb94c0f8ca9c7ad55e42f5b508990f091467bc64c764bea96a5ef7a2:9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd",
+  // 0.21.0 server/createAppRoutes: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:createAppRoutes:value:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c:1d34d34dbbfb7c22edd28ae3145dc8de8590ce887de93e31a2fed79825da823a:5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+  // 0.21.0 server/createTokenGuard: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:createTokenGuard:value:e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a:482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0:e92f263a3649439f4de1b063251e5d6a9fc182405e27377d5838dcacdc8a441a:482980078f7898eddce045ed224d0a8768b9ce276bdccadb364de79c745548b0",
+  // 0.21.0 server/MuxAuthResult: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:MuxAuthResult:type:92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9:460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d:92afd799d24d279dda1e214fc8a95a27128e59717f738dfd4849177cec7d76e9:460fe9f1684fa9ee2b2994b5c42f2c5c693724466beea87860c8faa9c2478b3d",
+  // 0.21.0 server/MuxAuthSuccess: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:MuxAuthSuccess:type:7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40:10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43:7abfb5f990ed14b60cd2db4d8cefd5b04e519ef46e775a4788d84ee58acccb40:10f49452f67462cc015bba9d35fe35329a94079c4fbf8da6d6bee3afbe2c3b43",
+  // 0.21.0 server/TmuxWsMux: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:TmuxWsMux:value:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa:32d590ee6e9e014949d780b3709e93087d92e203f962e3c0d3b72b35f1daf7b8:6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+  // 0.21.0 server/TokenGuard: Mux geometry return/optional hooks and auth operation graph; see per-name compatibility notes in CHANGELOG.
+  "0.21.0:server:TokenGuard:type:1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630:39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4:1024637b6163694f89bd8accdf3bf5aaf12e0903f5659173fd243a711bb7b630:39cd8055efde9bd6824b774e73ecbb3154d02691796491a6b8a6718d432d3ea4",
+  // 0.21.0 svelte/tmuxMux: Public v2 methods/nominal graph; .20.5 PromptsPanel also restores the released optional WJ surface.
+  "0.21.0:svelte:tmuxMux:value:1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1:20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919:1498d12202be9d8d9568f782239b74969ebceecba90cddc5b47c2aad2bbb20d1:20bd012b7250b1fd6dd72c1e3fd23bc09684b3d2edb77c413a1077306e2b7919",
+  // 0.21.0 svelte/TmuxMux: Public v2 methods/nominal graph; .20.5 PromptsPanel also restores the released optional WJ surface.
+  "0.21.0:svelte:TmuxMux:value:10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336:ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1:10b84ceb2007aea4331aec0e0a49131f75c59ce62755c859e0fb769022258336:ef1ddeb06ad92c01c0f92b0dbd5b58a638981f57ba174dd2cd312fe8614a4ac1",
+  // 0.21.0 app/AppAdapters: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.21.0:app:AppAdapters:type:50d641bf27f09f0ae615e970bf8d7624989b114f622f72c11835cbfc4500198e:07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b:50d641bf27f09f0ae615e970bf8d7624989b114f622f72c11835cbfc4500198e:07b4ae6e154fce7a6e4860b9cfd0742968682dd1ad15ceea569052dcf858875b",
+  // 0.21.0 app/createSessionsStore: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.21.0:app:createSessionsStore:value:320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc:a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034:320b7698efd9586312a113ebdcfe0ffca1dcfff8b5af3c2cd67f04ed3b434afc:a6668e54536d49d154c9ab7b7d878cd22055e050bd447d00ce9766b7d1263034",
+  // 0.21.0 app/EmbedView: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.21.0:app:EmbedView:component:572213494862d88db6ea5007e2121c2dfd7864f6ac68141f6ceb36f8e8deabc5:aeba95b3b046ab33f58a67701e5dc45485eda9b32a3ae0acd9369ebab0bde416:9f335097a884f0bfb073318afef04337066a0177c83dc996ab5e8c4131c25655:bbe2fe42f25da707fdc00563c796de9e655c85225a355f8a270bd444c25b006d",
+  // 0.21.0 app/HubView: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.21.0:app:HubView:component:1ec52ee234f6d0360204fe9d6821d307ce835b9d8d983e979e4844c42bd4fbc2:9888a1a8adb079099c7f40c5cdcd5c7b74fe39024cad5436baa23e0d2b03193e:c6ba2b9c0d4e42ae2862eae8b1b66952526128b05e715eb0127d1cc330d66c2d:3609341b43f82f78978aa132f92e0c01171f01a333ac1434e86c23a130c7d0a9",
+  // 0.21.0 app/SessionView: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.21.0:app:SessionView:component:1eacff8aa9a25c47c4b3f6d8a1de9ce1c636b55bf8c823b31781c2dcdb1370dc:b02acd824f574311b3214456133d7392ec9a0857834e789561aee392ba8d6675:dedf0f63a9fe2a6025e41e1cc27a1f2f2bd7207cb210674e21a449b1f3c22859:d8223970b90a41c6fa6650ded1c1a20183fd27ff3f4e2a43aef7d9ca93ff32cd",
+  // 0.21.0 app/ThumbmuxApp: WJ optional adapters/labels plus reachable TmuxMux graph; .21 WJ declarations preserved.
+  "0.21.0:app:ThumbmuxApp:component:5c112b90f02054e06fed35a770bfc078f9820af0c4553058502693f54fd7806d:071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f:50b1fb4a24a6043109873a8c2159dca737cb7e88db3dfeed784e52941dd83b09:24e56e84869abefdab2302613f0265a96b3647ee247dc55fd7b7dc2ef54cc27b",
 ]);
 
-function isV0210MinorException(
+function isV0220MinorException(
   baselineVersion: string,
   currentVersion: string,
   subpath: PublicSubpackage,
@@ -1487,9 +1570,12 @@ function isV0210MinorException(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
 ): boolean {
-  if (baselineVersion !== "0.20.5" || currentVersion !== "0.21.0") return false;
-  const reviewed = `${subpath}:${name}:${baselineLive.compatibilitySignature ?? baselineLive.signature}:${currentLive.compatibilitySignature ?? currentLive.signature}`;
-  return V0210_REVIEWED_ADDITIONS.has(reviewed);
+  if (currentVersion !== "0.22.0" || (baselineVersion !== "0.20.5" && baselineVersion !== "0.21.0")) return false;
+  const reviewed = [baselineVersion, subpath, name, currentLive.kind,
+    baselineLive.signature, currentLive.signature,
+    baselineLive.compatibilitySignature ?? baselineLive.signature,
+    currentLive.compatibilitySignature ?? currentLive.signature].join(":");
+  return V0220_REVIEWED_SIGNATURES.has(reviewed);
 }
 
 function isMinorOptionalAddition(
@@ -1682,7 +1768,7 @@ export function evaluateBaseline(
           previousLive,
           nextLive,
         )
-        || isV0210MinorException(
+        || isV0220MinorException(
           baselineVersion,
           currentVersion,
           subpath,
@@ -1806,9 +1892,63 @@ export function evaluateBaseline(
   return { errors, warnings, summaries };
 }
 
+/** Narrow artifact guard for the optional runtime subpath. This does not turn
+ * the runtime's other exports into a new frozen manifest. Reading declarations
+ * and JS here is static; inertness is proved separately by the runner. */
+export function assertRuntimeDisplayExport(packageRoot = PACKAGE_ROOT): void {
+  const name = "NewarchV2Display";
+  const fail = (detail: string): never => { throw new Error(`runtime ${name}: ${detail}`); };
+  const pkg = JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf8")) as {
+    exports?: Record<string, { types?: string; import?: string }>;
+  };
+  const subpath = pkg.exports?.["./pipe-history-runtime"];
+  const artifactPath = (target: string | undefined, extension: string): string => {
+    if (typeof target !== "string") return fail(`public subpath lacks ${extension} target`);
+    const aggregate = target.replace(/^\.\/([^/]+)\/dist\//, "./git-dist/$1/");
+    if (aggregate !== `./git-dist/server/pipe-history-runtime.${extension}`) {
+      return fail(`unexpected public target ${target}`);
+    }
+    return resolve(packageRoot, aggregate);
+  };
+  for (const [path, javascript] of [
+    [artifactPath(subpath?.types, "d.ts"), false],
+    [artifactPath(subpath?.import, "js"), true],
+  ] as const) {
+    const program = ts.createProgram([path], { ...compilerOptions(), allowJs: javascript });
+    const source = program.getSourceFile(path);
+    if (!source) return fail(`missing built artifact ${path}`);
+    const checker = program.getTypeChecker();
+    const module = checker.getSymbolAtLocation(source);
+    const exported = module && checker.getExportsOfModule(module).find((symbol) => symbol.name === name);
+    if (!exported) return fail(`missing ${javascript ? "JS value" : "declaration"} export`);
+    const symbol = resolveAlias(checker, exported);
+    const location = symbol.valueDeclaration ?? symbol.declarations?.[0];
+    if (!location || !(symbol.flags & ts.SymbolFlags.Value)) return fail("export is not a value");
+    const value = checker.getTypeOfSymbolAtLocation(symbol, location);
+    const constructors = checker.getSignaturesOfType(value, ts.SignatureKind.Construct);
+    if (!constructors.length) return fail(`export is not constructible in ${path}`);
+    if (!javascript) {
+      if (!(symbol.flags & ts.SymbolFlags.Type)) return fail("missing instance type export");
+      const declared = checker.getDeclaredTypeOfSymbol(symbol);
+      if (declared.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return fail("unresolved instance type");
+      for (const ctor of constructors) {
+        const instance = checker.getReturnTypeOfSignature(ctor);
+        if (instance.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)
+          || !checker.isTypeAssignableTo(instance, declared)
+          || !checker.isTypeAssignableTo(declared, instance)) {
+          return fail("constructor result and exported instance type disagree");
+        }
+      }
+    }
+  }
+}
+
 /** Run the checked-in surface gate against a built package root. */
 export function checkContract(options: ContractCheckOptions = {}): ContractCheckResult {
   const packageRoot = resolve(options.packageRoot ?? PACKAGE_ROOT);
+  if (options.validateExportParity !== false && !options.baselinePackageRoot) {
+    throw new Error("contract check needs the immutable baseline");
+  }
   const subpackages = options.subpackages ?? CONTRACT_SUBPACKAGES;
   const pkg = JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf8")) as {
     version?: unknown;
@@ -1819,6 +1959,7 @@ export function checkContract(options: ContractCheckOptions = {}): ContractCheck
   const parity = options.validateExportParity === false
     ? undefined
     : assertGitDistExportParity(packageRoot, packageRoot);
+  if (options.validateExportParity !== false) assertRuntimeDisplayExport(packageRoot);
   const live = deriveGitDistReport(packageRoot, subpackages, parity);
   const manifests: Record<PublicSubpackage, ContractEntry[]> = {
     core: [],
@@ -1892,8 +2033,9 @@ function tierSummary(
  * printed the same "contract check passed" line as a full run. It has already
  * produced one false all-clear reported to a human.
  *
- * So a missing baseline is now an error, and skipping it takes a deliberate,
- * greppable opt-out that the success line then admits to.
+ * A missing baseline is an error. The old skip environment cannot authorize
+ * release acceptance; unit declaration fixtures opt out of artifact parity
+ * explicitly through the programmatic fixture option instead.
  */
 export function resolveBaselineMode(env: Record<string, string | undefined>): {
   baselinePackageRoot?: string;
@@ -1902,14 +2044,11 @@ export function resolveBaselineMode(env: Record<string, string | undefined>): {
 } {
   const baselinePackageRoot = env.THUMBMUX_CONTRACT_BASELINE_ROOT?.trim();
   if (baselinePackageRoot) return { baselinePackageRoot, skipped: false };
-  if (env.THUMBMUX_CONTRACT_BASELINE === "skip") return { skipped: true };
   return {
     skipped: false,
     error: "contract check needs the immutable baseline: set "
       + "THUMBMUX_CONTRACT_BASELINE_ROOT=<dir> (materialize one with "
-      + "`bun scripts/materialize-contract-baseline.ts <empty-dir>`), or state "
-      + "that you are skipping the frozen-surface half with "
-      + "THUMBMUX_CONTRACT_BASELINE=skip",
+      + "`bun scripts/materialize-contract-baseline.ts <empty-dir>`); skipping is not supported",
   };
 }
 
