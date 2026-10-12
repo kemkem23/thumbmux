@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { normalizeTmuxCaptureCells, TmuxCaptureDecoder, TMUX_STYLE_BITS } from '../src/tmux-capture-normalize';
 
 describe('tmux capture cell normalization', () => {
@@ -2350,16 +2352,19 @@ test('B1c decoder reads only consumed bytes plus one boundary byte and detaches 
 // root (`bun run typecheck` → ops/testing/typecheck-gate.ts, "PASS — no file
 // gained errors"), run outside the unit suite.
 test('B1c strict contract types compile',()=>{
-  const root=new URL('../../../../',import.meta.url).pathname;
+  const root=fileURLToPath(new URL('../../',import.meta.url));
+  const compiler=createRequire(new URL('../../package.json',import.meta.url)).resolve('typescript/bin/tsc');
   // The cage snapshots tracked sources, so regenerate the core package's
   // declaration output in its disposable COW tree before resolving exports.
-  const commands=[['node_modules/.bin/tsc','-p','packages/thumbmux/core/tsconfig.build.json'],
-    ['node_modules/.bin/tsc','--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
+  const commands=[[process.execPath,compiler,'-p','core/tsconfig.build.json'],
+    [process.execPath,compiler,'--noEmit','--strict','--noUncheckedIndexedAccess','--skipLibCheck',
     '--target','ESNext','--module','Preserve','--moduleResolution','bundler','--allowImportingTsExtensions',
-    'docs/tasks/newarch-stream/contract-fixture.ts']];
+    'server/tests/fixtures/newarch-contract-fixture.ts']];
   for(const command of commands){
     const run=spawnSync(command[0]!,command.slice(1),{cwd:root,encoding:'utf8',timeout:120000});
-    console.log('B1C_GATE',JSON.stringify({command,exit:run.status,stdout:run.stdout,stderr:run.stderr}));
+    console.log('B1C_GATE',JSON.stringify({cwd:root,compiler,fixture:join(root,'server/tests/fixtures/newarch-contract-fixture.ts'),
+      command,exit:run.status,error:run.error?.message??null,signal:run.signal,stdout:run.stdout,stderr:run.stderr}));
+    expect(run.error).toBeUndefined();expect(run.signal).toBeNull();
     expect(run.status).toBe(0);
   }
 },240000);
