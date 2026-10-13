@@ -478,6 +478,17 @@ export type MuxOwnedTaskInventory = {
   retainedCleanups: number;
 };
 
+// Private per-invocation disposition: never indexed or cleared by cause identity.
+class OwnedOperationalFailure {
+  done = false;
+  constructor(readonly kind: string, readonly cause: unknown, readonly release: () => void) {}
+}
+type OwnedHandling = {
+  failure: OwnedOperationalFailure;
+  tasks: Set<Promise<unknown>>;
+  parent: OwnedHandling | null;
+};
+
 type OwnedLifetime = {
   phase: "active" | "quiescing" | "drained" | "failed";
   tasks: Map<Promise<void>, { kind: string }>;
@@ -485,6 +496,8 @@ type OwnedLifetime = {
   drain: Promise<void> | null;
   cleanups: Set<() => unknown>;
   captureOwners: Map<Set<unknown>, number>;
+  raw: WeakMap<object, object>;
+  handling: OwnedHandling | null;
 };
 
 export class TmuxWsMux<
@@ -509,13 +522,14 @@ export class TmuxWsMux<
   }
 
   /** Observe returned promises while preserving dependency receivers. The independent ledger survives unsubscribe/rename/map deletion. */
-  private trackOwnedTask<T>(kind: string, result: T): T {
+  private trackOwnedTask<T>(kind: string, result: T, sticky = true): T {
     const owned = this.owned;
     if (!owned || !muxThenable(result)) return result;
     const completion = Promise.resolve(result);
+    owned.handling?.tasks.add(completion);
     const task = completion.then(
       () => { owned.tasks.delete(task); },
-      cause => { owned.failures.push({ kind, cause }); owned.tasks.delete(task); },
+      cause => { if (sticky) this.recordOwnedFailure(kind, cause); owned.tasks.delete(task); },
     );
     owned.tasks.set(task, { kind });
     // Normalize a lazy thenable once, so tracking cannot execute its work twice.
@@ -524,12 +538,81 @@ export class TmuxWsMux<
 
   private ownedCall<T>(kind: string, call: () => T): T {
     try { return this.trackOwnedTask(kind, call()); }
-    catch (cause) { this.owned?.failures.push({ kind, cause }); throw cause; }
+    catch (cause) { this.recordOwnedFailure(kind, cause); throw cause; }
+  }
+
+  private recordOwnedFailure(kind: string, cause: unknown): void {
+    const owned = this.owned;
+    if (!owned) return;
+    if (cause instanceof OwnedOperationalFailure) {
+      this.finishOwnedFailure(cause, false);
+      return;
+    }
+    if (owned.failures.length < 64) owned.failures.push({ kind, cause });
+    else if (owned.failures.length === 64) owned.failures.push({
+      kind: "failures.overflow", cause: new Error("mux failure details exceeded 64 records; retain host ownership"),
+    });
+  }
+
+  private rawOwned<T extends object>(dependency: T): T {
+    return (this.owned?.raw.get(dependency) as T | undefined) ?? dependency;
+  }
+
+  /** Only the explicit read/command/best-effort callsites below may create a
+   * ticket. Default wrappers remain sticky, including async void rejections. */
+  private operationalCall<T>(kind: string, call: () => T, asyncRead = false): T {
+    if (!this.owned) return call();
+    const failed = (cause: unknown): never => {
+      let release!: () => void;
+      const handling = new Promise<void>(resolve => { release = resolve; });
+      this.trackOwnedTask(`${kind}.handling`, handling);
+      throw new OwnedOperationalFailure(kind, cause, release);
+    };
+    let result: T;
+    try { result = call(); } catch (cause) { return failed(cause); }
+    if (asyncRead && muxThenable(result)) {
+      // One assimilation of a lazy thenable; the ticket owns disposition while
+      // this ledger entry still owns raw completion (including rejection).
+      return this.trackOwnedTask(kind, Promise.resolve(result).catch(failed), false) as T;
+    }
+    return this.trackOwnedTask(kind, result);
+  }
+
+  private finishOwnedFailure(failure: OwnedOperationalFailure, handled: boolean): void {
+    if (failure.done) return;
+    failure.done = true;
+    if (!handled || this.owned?.phase !== "active") this.recordOwnedFailure(failure.kind, failure.cause);
+    failure.release();
+  }
+
+  private beginOwnedHandling(cause: unknown): OwnedHandling | null {
+    const owned = this.owned;
+    if (!owned) return null;
+    if (!(cause instanceof OwnedOperationalFailure)) {
+      this.recordOwnedFailure("unhandled.catch", cause);
+      return null;
+    }
+    const scope: OwnedHandling = { failure: cause, tasks: new Set(), parent: owned.handling };
+    owned.handling = scope;
+    return scope;
+  }
+
+  private endOwnedHandling(scope: OwnedHandling | null, succeeded: boolean): void {
+    if (!scope) return;
+    this.owned!.handling = scope.parent;
+    if (!scope.tasks.size) { this.finishOwnedFailure(scope.failure, succeeded); return; }
+    // The ticket remains in the ledger until all returned handling work ends.
+    // A handler that overlaps quiesce can never dispose of its original error.
+    void Promise.allSettled(scope.tasks).then(results => {
+      this.finishOwnedFailure(scope.failure, succeeded && results.every(result => result.status === "fulfilled"));
+    });
   }
 
   private ownFunction<T extends (...args: any[]) => any>(kind: string, fn: T): T {
     if (!this.owned) return fn;
-    return ((...args: Parameters<T>) => this.ownedCall(kind, () => fn.apply(this, args))) as T;
+    const wrapper = ((...args: Parameters<T>) => this.ownedCall(kind, () => fn.apply(this, args))) as T;
+    this.owned.raw.set(wrapper, fn);
+    return wrapper;
   }
 
   /** Only owned instances wrap host dependencies. Void-returning TS hooks can
@@ -537,7 +620,7 @@ export class TmuxWsMux<
    * Sync value contracts (capture metadata, ingest, policy) remain synchronous. */
   private ownDependency<T extends object>(kind: string, dependency: T): T {
     if (!this.owned) return dependency;
-    return new Proxy({} as T, {
+    const wrapper = new Proxy({} as T, {
       get: (_target, key) => {
         const value = Reflect.get(dependency, key, dependency);
         return typeof value === "function"
@@ -545,6 +628,8 @@ export class TmuxWsMux<
           : value;
       },
     });
+    this.owned.raw.set(wrapper, dependency);
+    return wrapper;
   }
 
   /** Terminal, opt-in barrier. Revocation happens before this method returns.
@@ -620,7 +705,7 @@ export class TmuxWsMux<
   /** Send one frame; with compressFrames, opt into Bun's per-message deflate. */
   private wsSend(ws: any, data: string) {
     if (this.ownedRevoked) return 0;
-    if (this.owned) return this.ownedCall("socket.send", () => this.compressFrames ? ws.send(data, true) : ws.send(data));
+    if (this.owned) return this.operationalCall("socket.send", () => this.compressFrames ? ws.send(data, true) : ws.send(data));
     if (this.compressFrames) return ws.send(data, true);
     return ws.send(data);
   }
@@ -736,7 +821,7 @@ export class TmuxWsMux<
 
   constructor(opts: TmuxWsMuxOptions<WS, SessionRow>) {
     if (opts.ownedLifetime === true) {
-      this.owned = { phase: "active", tasks: new Map(), failures: [], drain: null, cleanups: new Set(), captureOwners: new Map() };
+      this.owned = { phase: "active", tasks: new Map(), failures: [], drain: null, cleanups: new Set(), captureOwners: new Map(), raw: new WeakMap(), handling: null };
     }
     this.compressFrames = opts.compressFrames === true;
     this.driver = this.ownDependency("driver", opts.driver);
@@ -788,7 +873,21 @@ export class TmuxWsMux<
     return () => provider().map((row) => {
       let selection: NewarchV2PaneSelection | null;
       try { selection = lookup(row.name); }
-      catch { selection = { kind: "owner-unavailable", retryAfterMs: 1000 }; }
+      catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
+        try {
+          selection = { kind: "owner-unavailable", retryAfterMs: 1000 };
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
+        }
+      }
       return selection ? { ...row, newarchV2: selection } : row;
     });
   }
@@ -800,7 +899,21 @@ export class TmuxWsMux<
     if (!this.newarchV2) return null;
     let selection: NewarchV2PaneSelection | null;
     try { selection = this.newarchV2(session); }
-    catch { return { reply: null }; }
+    catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        return { reply: null };
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
+    }
     if (!selection || selection.kind === "missing") return null;
     if (selection.kind === "selected") {
       const pane = selection.pane;
@@ -907,7 +1020,7 @@ export class TmuxWsMux<
   private unwatchProjection(session: string) {
     const off = this.projectionWatches.get(session);
     this.projectionWatches.delete(session);
-    try { if (off) this.owned ? this.ownedCleanup("projection.watch.off", off) : off(); } catch {}
+    try { if (off) this.owned ? this.ownedCleanup("projection.watch.off", off) : off(); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   /**
@@ -923,7 +1036,7 @@ export class TmuxWsMux<
     this.lastNewarch.delete(session);
     if (this.projection?.ownsPipe?.(session) && this.piped.delete(session)) {
       this.clearPipeCaptureTimers(session);
-      try { this.owned ? this.ownedCleanup("pipe.route.off", () => this.pipes?.stopPipe(session)) : this.pipes?.stopPipe(session); } catch {}
+      try { this.owned ? this.ownedCleanup("pipe.route.off", () => this.pipes?.stopPipe(session)) : this.pipes?.stopPipe(session); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
     }
     if (!viewers || viewers.size === 0) return;
     this.contents.delete(session);
@@ -1133,19 +1246,33 @@ export class TmuxWsMux<
     if (this.bpBufferedAmount) return this.bpBufferedAmount(ws);
     const any = ws as any;
     if (typeof any.getBufferedAmount === "function") {
-      try { return any.getBufferedAmount(); } catch { return undefined; }
+      try { return any.getBufferedAmount(); } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
+        try {
+          return undefined;
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
+        }
+      }
     }
     return undefined;
   }
 
   private closeSlowSocket(ws: WS, reason: string) {
     if (this.bpClose) {
-      try { this.bpClose(ws, reason); } catch {}
+      try { this.bpClose(ws, reason); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       return;
     }
     const any = ws as any;
     if (typeof any.close === "function") {
-      try { this.owned ? this.ownedCall("socket.close", () => any.close(1013, reason)) : any.close(1013, reason); } catch {}
+      try { this.owned ? this.ownedCall("socket.close", () => any.close(1013, reason)) : any.close(1013, reason); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
     }
   }
 
@@ -1262,12 +1389,25 @@ export class TmuxWsMux<
     if (!filter) return unfilteredJson;
     try {
       return JSON.stringify(filter(sessions, ws, client));
-    } catch (e: any) {
-      // Fail closed + surface the failure on the same channel subscribeSessions /
-      // broadcastSessionList already use. Message text only — never the payload.
-      const msg = e && typeof e.message === "string" ? e.message : String(e);
-      this.logError("[thumbmux-mux] filterSessionList threw:", msg);
-      return null;
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        const e: any = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        // Fail closed + surface the failure on the same channel subscribeSessions /
+        // broadcastSessionList already use. Message text only — never the payload.
+        const msg = e && typeof e.message === "string" ? e.message : String(e);
+        this.logError("[thumbmux-mux] filterSessionList threw:", msg);
+        return null;
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
   }
 
@@ -1293,7 +1433,7 @@ export class TmuxWsMux<
       } else if (status === -1) {
         this.markBlocked(ws);
       }
-    } catch {}
+    } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   /** Map a raw tmux cursor sample onto the content-anchored protocol
@@ -1393,12 +1533,29 @@ export class TmuxWsMux<
     };
     try {
       hook(session, frame);
-    } catch (cause: any) {
-      let message = "unknown error";
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
       try {
-        message = cause && typeof cause.message === "string" ? cause.message : String(cause);
-      } catch {}
-      try { this.logError("[thumbmux-mux] onOutput threw:", message); } catch {}
+        const cause: any = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        let message = "unknown error";
+        try {
+          message = cause && typeof cause.message === "string" ? cause.message : String(cause);
+        }
+        catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+        try {
+          (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, ["[thumbmux-mux] onOutput threw:", message])) : this.logError("[thumbmux-mux] onOutput threw:", message));
+        }
+        catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
   }
 
@@ -1673,9 +1830,21 @@ export class TmuxWsMux<
           } else if (status === -1) {
             this.markBlocked(ws);
           }
-        } catch {
-          this.requireFullOutput(session, ws);
-          ok = false;
+        } catch (caughtOwnedError) {
+          const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+          let ownedSucceeded = true;
+          try {
+            this.requireFullOutput(session, ws);
+            ok = false;
+          }
+          catch (handlingError) {
+            ownedSucceeded = false;
+            this.recordOwnedFailure("failure.handler", handlingError);
+            throw handlingError;
+          }
+          finally {
+            this.endOwnedHandling(ownedHandling, ownedSucceeded);
+          }
         }
         results.set(ws, ok);
         if (!ok) continue;
@@ -1753,9 +1922,21 @@ export class TmuxWsMux<
       }
       if (status === -1) this.markBlocked(ws);
       return true;
-    } catch {
-      this.requireFullOutput(session, ws);
-      return false;
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        this.requireFullOutput(session, ws);
+        return false;
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
   }
 
@@ -1785,21 +1966,34 @@ export class TmuxWsMux<
     if (opts.purgeArchive) {
       try {
         this.archive?.dropSession?.(session);
-      } catch (error: unknown) {
+      } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
         try {
-          const message = error instanceof Error ? error.message : String(error);
-          this.logError(`[thumbmux-mux] archive dropSession error for "${session}":`, message);
-        } catch {
-          // Archive purge is best effort. A throwing logger must not undo the
-          // already-completed viewer/session teardown.
+          const error: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+          try {
+            const message = error instanceof Error ? error.message : String(error);
+            (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] archive dropSession error for "${session}":`, message])) : this.logError(`[thumbmux-mux] archive dropSession error for "${session}":`, message));
+          }
+          catch (caughtOwnedError) { // Archive purge is best effort. A throwing logger must not undo the
+              // already-completed viewer/session teardown.
+this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
         }
       }
     }
     // These collaborators may invoke host-provided logging. Invalidation has
     // already detached the lifecycle, so housekeeping failures must not hide
     // the terminal frame or change the public return value.
-    try { this.maybeStopPolling(); } catch {}
-    try { this.refreshSessionListSchedule(); } catch {}
+    try { this.maybeStopPolling(); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+    try { this.refreshSessionListSchedule(); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
 
     const message = JSON.stringify({
       channel: session,
@@ -1810,7 +2004,7 @@ export class TmuxWsMux<
       try {
         const status = this.wsSend(ws, message);
         if (status === -1) this.markBlocked(ws);
-      } catch {}
+      } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
     }
     return viewers.length;
   }
@@ -1872,12 +2066,25 @@ export class TmuxWsMux<
       try {
         if (this.owned) this.ownedCleanup("pipe.session.off", () => this.pipes?.stopPipe(session));
         else this.pipes?.stopPipe(session);
-      } catch (error: unknown) {
+      } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
         try {
-          const message = error instanceof Error ? error.message : String(error);
-          this.logError(`[thumbmux-mux] stopPipe error for "${session}":`, message);
-        } catch {
-          // Pipe teardown is best effort; mux lifecycle teardown is not.
+          const error: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+          try {
+            const message = error instanceof Error ? error.message : String(error);
+            (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] stopPipe error for "${session}":`, message])) : this.logError(`[thumbmux-mux] stopPipe error for "${session}":`, message));
+          }
+          catch (caughtOwnedError) { // Pipe teardown is best effort; mux lifecycle teardown is not.
+this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
         }
       }
     }
@@ -1918,8 +2125,21 @@ export class TmuxWsMux<
       } else {
         this.lastSessionsJson = json;
       }
-    } catch (e: any) {
-      this.logError("[thumbmux-mux] subscribeSessions error:", e.message);
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        const e: any = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        this.logError("[thumbmux-mux] subscribeSessions error:", e.message);
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
     this.refreshSessionListSchedule();
   }
@@ -1961,9 +2181,9 @@ export class TmuxWsMux<
     try {
       const last = this.lastAppliedGeometry.get(session);
       if (last?.cols === cols && last.rows === rows) return null;
-      this.driver.resizeWindow(session, cols, rows);
+      (this.owned ? this.operationalCall("driver.resizeWindow", () => this.rawOwned(this.driver!).resizeWindow(session, cols, rows)) : this.driver.resizeWindow(session, cols, rows));
       this.lastAppliedGeometry.set(session, { cols, rows });
-      try { this.projection?.noteResize?.(session); } catch {}
+      try { this.projection?.noteResize?.(session); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       const generation = ++this.geometryGeneration;
       this.geometryGenerations.set(session, generation);
       this.pendingArchiveReflows.set(session, generation);
@@ -1981,15 +2201,29 @@ export class TmuxWsMux<
       );
       this.queueCapture(session, { fullHistory: false });
       this.refreshSessionListSchedule();
-    } catch (e: any) {
-      this.logError(`[thumbmux-mux] resize error for "${session}" to ${cols}x${rows}:`, e.message);
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
       try {
-        ws && this.wsSend(ws, JSON.stringify({
-          channel: session,
-          type: "error",
-          data: e.message ?? String(e),
-        } satisfies MuxServerMessage));
-      } catch {}
+        const e: any = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        this.logError(`[thumbmux-mux] resize error for "${session}" to ${cols}x${rows}:`, e.message);
+        try {
+          ws && this.wsSend(ws, JSON.stringify({
+            channel: session,
+            type: "error",
+            data: e.message ?? String(e),
+          } satisfies MuxServerMessage));
+        }
+        catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
     return null;
   }
@@ -1998,12 +2232,25 @@ export class TmuxWsMux<
     if (this.ownedRevoked) return;
     if (ws) this.hooks.onKeys?.(session, ws, client);
     try {
-      this.driver.sendKeys(session, data);
+      (this.owned ? this.operationalCall("driver.sendKeys", () => this.rawOwned(this.driver!).sendKeys(session, data)) : this.driver.sendKeys(session, data));
       if (this.piped.has(session) || this.projection?.owns(session)) return;
       this.enterBurst();
       this.scheduleImmediateCapture(session);
-    } catch (e: any) {
-      this.logError(`[thumbmux-mux] sendKeys error for "${session}":`, e.message);
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        const e: any = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        this.logError(`[thumbmux-mux] sendKeys error for "${session}":`, e.message);
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
   }
 
@@ -2014,12 +2261,11 @@ export class TmuxWsMux<
   ): void {
     try {
       const message = error instanceof Error ? error.message : String(error);
-      this.logError(`[thumbmux-mux] archive ${method} error for "${session}":`, message);
-    } catch {
-      // The archive failure is represented by a retryable wire reply below.
-      // Logging is observability-only; retrying or using another logger could
-      // throw recursively, so a logger failure must not replace that reply.
-    }
+      (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] archive ${method} error for "${session}":`, message])) : this.logError(`[thumbmux-mux] archive ${method} error for "${session}":`, message));
+    } catch (caughtOwnedError) { // The archive failure is represented by a retryable wire reply below.
+        // Logging is observability-only; retrying or using another logger could
+        // throw recursively, so a logger failure must not replace that reply.
+this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   private sendHistoryReadErrorBestEffort(session: string, ws: WS): void {
@@ -2032,7 +2278,7 @@ export class TmuxWsMux<
         request: "history_expand",
         retryable: true,
       }));
-    } catch {}
+    } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   private sendProjectedHistoryAsync(session: string, ws: WS, result: PromiseLike<unknown>): void {
@@ -2049,33 +2295,54 @@ export class TmuxWsMux<
     this.trackOwnedTask("history.projected.reply", Promise.resolve(result).then(page => {
       if (!current()) return;
       this.wsSend(ws, JSON.stringify({channel: session, type: 'history', data: JSON.stringify(boundProjectedHistoryPage(page))}));
-    }).catch(error => {
-      if (!current()) return;
-      this.reportArchiveReadErrorBestEffort('readBefore', session, error);
-      this.sendHistoryReadErrorBestEffort(session, ws);
+    }).catch(caughtOwnedError => {
+      const scope = this.beginOwnedHandling(caughtOwnedError);
+      let succeeded = true;
+      try {
+        const error = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        if (!current()) return;
+        this.reportArchiveReadErrorBestEffort('readBefore', session, error);
+        this.sendHistoryReadErrorBestEffort(session, ws);
+      } catch (error) {
+        succeeded = false;
+        this.recordOwnedFailure("failure.handler", error);
+        throw error;
+      } finally { this.endOwnedHandling(scope, succeeded); }
     }));
   }
 
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
     if (this.ownedRevoked) return;
     let history: unknown = EMPTY_HISTORY_PAGE;
-    let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        const result = this.projection.readBefore(session, beforeLine ?? null, limit);
+        const result = (this.owned ? this.operationalCall("projection.readBefore", () => this.rawOwned(this.projection!).readBefore(session, beforeLine ?? null, limit), true) : this.projection.readBefore(session, beforeLine ?? null, limit));
         if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
           this.sendProjectedHistoryAsync(session, ws, result as PromiseLike<unknown>);
           return;
         }
         history = boundProjectedHistoryPage(result);
-      } catch (e: unknown) {
-        this.reportArchiveReadErrorBestEffort("readBefore", session, e);
-        this.sendHistoryReadErrorBestEffort(session, ws);
-        return;
+      } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
+        try {
+          const e: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+          this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+          this.sendHistoryReadErrorBestEffort(session, ws);
+          return;
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
+        }
       }
       try {
         this.wsSend(ws, JSON.stringify({ channel: session, type: "history", data: JSON.stringify(history) } satisfies MuxServerMessage));
-      } catch {}
+      } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       return;
     }
     // SessionProfile.archive gates history_expand as well as capture feed
@@ -2090,24 +2357,48 @@ export class TmuxWsMux<
       let anchor = beforeLine ?? null;
       if (anchor === null && this.archive.liveStartLine) {
         try {
-          anchor = this.archive.liveStartLine(session) ?? null;
-        } catch (e: unknown) {
-          this.reportArchiveReadErrorBestEffort("liveStartLine", session, e);
-          readFailed = true;
+          anchor = (this.owned ? this.operationalCall("archive.liveStartLine", () => this.rawOwned(this.archive!).liveStartLine!(session)) : this.archive.liveStartLine(session)) ?? null;
+        } catch (caughtOwnedError) {
+          const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+          let ownedSucceeded = true;
+          try {
+            const e: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+            this.reportArchiveReadErrorBestEffort("liveStartLine", session, e);
+            this.sendHistoryReadErrorBestEffort(session, ws);
+            return;
+          }
+          catch (handlingError) {
+            ownedSucceeded = false;
+            this.recordOwnedFailure("failure.handler", handlingError);
+            throw handlingError;
+          }
+          finally {
+            this.endOwnedHandling(ownedHandling, ownedSucceeded);
+          }
         }
       }
-      if (!readFailed) {
+      {
         try {
-          history = this.archive.readBefore(session, anchor, limit);
-        } catch (e: unknown) {
-          this.reportArchiveReadErrorBestEffort("readBefore", session, e);
-          readFailed = true;
+          history = (this.owned ? this.operationalCall("archive.readBefore", () => this.rawOwned(this.archive!).readBefore(session, anchor, limit)) : this.archive.readBefore(session, anchor, limit));
+        } catch (caughtOwnedError) {
+          const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+          let ownedSucceeded = true;
+          try {
+            const e: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+            this.reportArchiveReadErrorBestEffort("readBefore", session, e);
+            this.sendHistoryReadErrorBestEffort(session, ws);
+            return;
+          }
+          catch (handlingError) {
+            ownedSucceeded = false;
+            this.recordOwnedFailure("failure.handler", handlingError);
+            throw handlingError;
+          }
+          finally {
+            this.endOwnedHandling(ownedHandling, ownedSucceeded);
+          }
         }
       }
-    }
-    if (readFailed) {
-      this.sendHistoryReadErrorBestEffort(session, ws);
-      return;
     }
     // A missing/disabled archive still answers with the established empty
     // page. Only an actual read failure is retryable and distinct from EOF.
@@ -2117,42 +2408,64 @@ export class TmuxWsMux<
         type: "history",
         data: JSON.stringify(history),
       } satisfies MuxServerMessage));
-    } catch {}
+    } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
     if (this.ownedRevoked) return;
     let history: unknown = EMPTY_HISTORY_PAGE;
-    let readFailed = false;
     if (this.projection?.owns(session)) {
       try {
-        const result = this.projection.readAfter(session, afterLine, limit);
+        const result = (this.owned ? this.operationalCall("projection.readAfter", () => this.rawOwned(this.projection!).readAfter!(session, afterLine, limit), true) : this.projection.readAfter(session, afterLine, limit));
         if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
           this.sendProjectedHistoryAsync(session, ws, result as PromiseLike<unknown>);
           return;
         }
         history = boundProjectedHistoryPage(result);
-      } catch (e: unknown) {
-        this.reportArchiveReadErrorBestEffort("readAfter", session, e);
-        this.sendHistoryReadErrorBestEffort(session, ws);
-        return;
+      } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
+        try {
+          const e: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+          this.reportArchiveReadErrorBestEffort("readAfter", session, e);
+          this.sendHistoryReadErrorBestEffort(session, ws);
+          return;
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
+        }
       }
       try {
         this.wsSend(ws, JSON.stringify({ channel: session, type: "history", data: JSON.stringify(history) } satisfies MuxServerMessage));
-      } catch {}
+      } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       return;
     }
     if (this.archive?.readAfter && this.profileOf(session).archive) {
       try {
-        history = this.archive.readAfter(session, afterLine, limit);
-      } catch (e: unknown) {
-        this.reportArchiveReadErrorBestEffort("readAfter", session, e);
-        readFailed = true;
+        history = (this.owned ? this.operationalCall("archive.readAfter", () => this.rawOwned(this.archive!).readAfter!(session, afterLine, limit)) : this.archive.readAfter(session, afterLine, limit));
+      } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
+        try {
+          const e: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+          this.reportArchiveReadErrorBestEffort("readAfter", session, e);
+          this.sendHistoryReadErrorBestEffort(session, ws);
+          return;
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
+        }
       }
-    }
-    if (readFailed) {
-      this.sendHistoryReadErrorBestEffort(session, ws);
-      return;
     }
     // A legacy archive without forward paging and a missing archive retain
     // the established empty-page wire response.
@@ -2162,7 +2475,7 @@ export class TmuxWsMux<
         type: "history",
         data: JSON.stringify(history),
       } satisfies MuxServerMessage));
-    } catch {}
+    } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   /** The v2 pane a request may read now, from the same owner account that
@@ -2172,7 +2485,21 @@ export class TmuxWsMux<
     | { kind: "wrong-pane" } | { kind: "none" } {
     if (!this.newarchV2) return { kind: "none" };
     let selection: NewarchV2PaneSelection | null;
-    try { selection = this.newarchV2(session); } catch { return { kind: "unavailable", retryAfterMs: V2_HISTORY_RETRY_MS }; }
+    try { selection = this.newarchV2(session); } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        return { kind: "unavailable", retryAfterMs: V2_HISTORY_RETRY_MS };
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
+    }
     if (!selection || selection.kind === "missing") return { kind: "none" };
     if (selection.kind === "owner-unavailable") return { kind: "unavailable", retryAfterMs: selection.retryAfterMs };
     const panes = selection.kind === "selected" ? [selection.pane] : selection.panes;
@@ -2227,19 +2554,55 @@ export class TmuxWsMux<
       if (now.kind === "none") return fail("unsupported");
       if (now.kind !== "selected") return fail("wrong-pane");
       let reply: NewarchV2HistoryReply;
-      try { reply = v2ReplyFromRead(message, result); } catch { return fail("owner-unavailable", V2_HISTORY_RETRY_MS); }
+      try { reply = v2ReplyFromRead(message, result); } catch (caughtOwnedError) {
+        const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+        let ownedSucceeded = true;
+        try {
+          return fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+        }
+        catch (handlingError) {
+          ownedSucceeded = false;
+          this.recordOwnedFailure("failure.handler", handlingError);
+          throw handlingError;
+        }
+        finally {
+          this.endOwnedHandling(ownedHandling, ownedSucceeded);
+        }
+      }
       this.sendV2Reply(ws, reply);
     };
     let result: Result<V2HistoryPage> | PromiseLike<Result<V2HistoryPage>>;
     const method = request.direction === "after" ? "readAfter" : "readBefore";
-    try { result = this.owned ? this.ownedCall("history.v2.read", () => reader(session, request)) : reader(session, request); } catch (error) {
-      this.reportArchiveReadErrorBestEffort(method, session, error);
-      return fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+    try { result = this.owned ? this.operationalCall("history.v2.read", () => reader(session, request), true) : reader(session, request); } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        const error: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        this.reportArchiveReadErrorBestEffort(method, session, error);
+        return fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
     if (result && typeof (result as PromiseLike<unknown>).then === "function") {
-      this.trackOwnedTask("history.v2.reply", Promise.resolve(result).then(finish, (error: unknown) => {
-        this.reportArchiveReadErrorBestEffort(method, session, error);
-        fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+      this.trackOwnedTask("history.v2.reply", Promise.resolve(result).then(finish, (caughtOwnedError: unknown) => {
+        const scope = this.beginOwnedHandling(caughtOwnedError);
+        let succeeded = true;
+        try {
+          const error = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+          this.reportArchiveReadErrorBestEffort(method, session, error);
+          fail("owner-unavailable", V2_HISTORY_RETRY_MS);
+        } catch (error) {
+          succeeded = false;
+          this.recordOwnedFailure("failure.handler", error);
+          throw error;
+        } finally { this.endOwnedHandling(scope, succeeded); }
       }));
       return;
     }
@@ -2247,7 +2610,7 @@ export class TmuxWsMux<
   }
 
   private sendV2Reply(ws: WS, reply: NewarchV2HistoryReply): void {
-    try { this.wsSend(ws, JSON.stringify(reply)); } catch {}
+    try { this.wsSend(ws, JSON.stringify(reply)); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
   }
 
   /** Route a parsed client message. Convenience for hosts whose WS handler
@@ -2261,7 +2624,7 @@ export class TmuxWsMux<
       return;
     }
     switch (msg.type) {
-      case "ping": try { this.owned ? this.wsSend(ws, '{"type":"pong"}') : ws.send('{"type":"pong"}'); } catch {} break;
+      case "ping": try { this.owned ? this.operationalCall("socket.send", () => ws.send('{"type":"pong"}')) : ws.send('{"type":"pong"}'); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); } break;
       case "client_info": this.hooks.onClientInfo?.(ws, msg.client); break;
       case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client, { tail: msg.tail, delta: msg.delta }); break;
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
@@ -2408,19 +2771,19 @@ export class TmuxWsMux<
         if (!ownsLifecycle()) return;
         this.piped.delete(session);
         this.queueCapture(session);
-        try { this.log(`[thumbmux-mux] Pipe broken for "${session}" — resuming poll fallback`); } catch {}
+        try { (this.owned ? this.operationalCall("log", () => this.rawOwned(this.log).apply(this, [`[thumbmux-mux] Pipe broken for "${session}" — resuming poll fallback`])) : this.log(`[thumbmux-mux] Pipe broken for "${session}" — resuming poll fallback`)); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       },
       // onRestarted: pipe recovered → just re-add to piped set
       () => {
         if (!ownsLifecycle()) return;
         this.piped.add(session);
-        try { this.log(`[thumbmux-mux] Pipe restarted for "${session}"`); } catch {}
+        try { (this.owned ? this.operationalCall("log", () => this.rawOwned(this.log).apply(this, [`[thumbmux-mux] Pipe restarted for "${session}"`])) : this.log(`[thumbmux-mux] Pipe restarted for "${session}"`)); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       },
     );
 
     if (started && ownsLifecycle()) {
       this.piped.add(session);
-      try { this.log(`[thumbmux-mux] Pipe active for "${session}" — using as change trigger`); } catch {}
+      try { (this.owned ? this.operationalCall("log", () => this.rawOwned(this.log).apply(this, [`[thumbmux-mux] Pipe active for "${session}" — using as change trigger`])) : this.log(`[thumbmux-mux] Pipe active for "${session}" — using as change trigger`)); } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
     }
   }
 
@@ -2611,12 +2974,28 @@ export class TmuxWsMux<
       if (useArchive) {
         try {
           boundaryBeforeCapture = this.sampleArchiveBoundary(session);
-        } catch (archiveCause) {
-          this.owned?.failures.push({ kind: "capture.archive", cause: archiveCause });
-          const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
-          try { this.logError(`[thumbmux-mux] archive boundary error for "${session}":`, message); } catch {}
-          if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
-          return;
+        } catch (caughtOwnedError) {
+          const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+          let ownedSucceeded = true;
+          try {
+            const archiveCause: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+            const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
+            try {
+              (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] archive boundary error for "${session}":`, message])) : this.logError(`[thumbmux-mux] archive boundary error for "${session}":`, message));
+            }
+            catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+            if (opts.fullHistory)
+              this.queuedCapturesFullHistory.add(session);
+            return;
+          }
+          catch (handlingError) {
+            ownedSucceeded = false;
+            this.recordOwnedFailure("failure.handler", handlingError);
+            throw handlingError;
+          }
+          finally {
+            this.endOwnedHandling(ownedHandling, ownedSucceeded);
+          }
         }
       }
       const captureOpts = profile.currentPaneOnly ? { currentPaneOnly: true } : { startLine };
@@ -2627,7 +3006,7 @@ export class TmuxWsMux<
       let rawScreen: MuxPaneScreen | null | undefined = undefined;
       let archiveCaptureToken: string | undefined;
       if (this.driver.captureWithCursor) {
-        const combined = await this.driver.captureWithCursor(session, captureOpts);
+        const combined = await (this.owned ? this.operationalCall("driver.captureWithCursor", () => this.rawOwned(this.driver!).captureWithCursor!(session, captureOpts), true) : this.driver.captureWithCursor(session, captureOpts));
         content = combined.content;
         rawCursor = combined.cursor;
         trailingBlanks = combined.trailingBlanks;
@@ -2637,7 +3016,7 @@ export class TmuxWsMux<
         }
         archiveCaptureToken = combined.archiveCaptureToken;
       } else {
-        content = await this.driver.capturePane(session, captureOpts);
+        content = await (this.owned ? this.operationalCall("driver.capturePane", () => this.rawOwned(this.driver!).capturePane(session, captureOpts), true) : this.driver.capturePane(session, captureOpts));
       }
       if (!this.ownsSessionLifecycle(session, viewers)) return;
       if (this.projection && (this.projection.owns(session) || this.projection.routeGeneration(session) !== routeGeneration)) return;
@@ -2679,15 +3058,30 @@ export class TmuxWsMux<
             this.queueCapture(session, { fullHistory: !!opts.fullHistory });
             return;
           }
-        } catch (archiveCause) {
-          this.owned?.failures.push({ kind: "capture.archive", cause: archiveCause });
-          if (!this.ownsSessionLifecycle(session, viewers)) return;
-          const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
+        } catch (caughtOwnedError) {
+          const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+          let ownedSucceeded = true;
           try {
-            this.logError(`[thumbmux-mux] archive ingest error for "${session}":`, message);
-          } catch {}
-          if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
-          return;
+            const archiveCause: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+            if (!this.ownsSessionLifecycle(session, viewers))
+              return;
+            const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
+            try {
+              (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] archive ingest error for "${session}":`, message])) : this.logError(`[thumbmux-mux] archive ingest error for "${session}":`, message));
+            }
+            catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+            if (opts.fullHistory)
+              this.queuedCapturesFullHistory.add(session);
+            return;
+          }
+          catch (handlingError) {
+            ownedSucceeded = false;
+            this.recordOwnedFailure("failure.handler", handlingError);
+            throw handlingError;
+          }
+          finally {
+            this.endOwnedHandling(ownedHandling, ownedSucceeded);
+          }
         }
       }
       // The synchronous ingest returned successfully. Only now consume the
@@ -2832,9 +3226,21 @@ export class TmuxWsMux<
       // pair is non-atomic anyway; don't pay a tmux call per idle tick).
       if (!this.driver.captureWithCursor && this.driver.getCursor) {
         try {
-          rawCursor = await this.driver.getCursor(session);
-        } catch {
-          rawCursor = null; // a cursor sampling failure must not kill the content frame
+          rawCursor = await (this.owned ? this.operationalCall("driver.getCursor", () => this.rawOwned(this.driver!).getCursor!(session), true) : this.driver.getCursor(session));
+        } catch (caughtOwnedError) {
+          const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+          let ownedSucceeded = true;
+          try {
+            rawCursor = null; // a cursor sampling failure must not kill the content frame
+          }
+          catch (handlingError) {
+            ownedSucceeded = false;
+            this.recordOwnedFailure("failure.handler", handlingError);
+            throw handlingError;
+          }
+          finally {
+            this.endOwnedHandling(ownedHandling, ownedSucceeded);
+          }
         }
         trailingBlanks = this.countTrailingBlanks(content);
       }
@@ -2862,18 +3268,35 @@ export class TmuxWsMux<
         );
       }
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);
-    } catch (cause) {
-      this.owned?.failures.push({ kind: "capture", cause });
-      if (!this.ownsSessionLifecycle(session, viewers)) return;
-      // Driver / outer failure — established wire contract for an unreachable
-      // pane. Archive failures are handled above and never reach here (A3-4).
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
       try {
-        const message = cause instanceof Error ? cause.message : String(cause);
-        this.logError(`[thumbmux-mux] capture error for "${session}":`, message);
-      } catch {}
-      const errMsg = JSON.stringify({ channel: session, type: "error", data: "Session not found" } satisfies MuxServerMessage);
-      for (const ws of viewers) {
-        try { this.wsSend(ws, errMsg); } catch {}
+        const cause: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        if (!this.ownsSessionLifecycle(session, viewers))
+          return;
+        // Driver / outer failure — established wire contract for an unreachable
+        // pane. Archive failures are handled above and never reach here (A3-4).
+        try {
+          const message = cause instanceof Error ? cause.message : String(cause);
+          (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] capture error for "${session}":`, message])) : this.logError(`[thumbmux-mux] capture error for "${session}":`, message));
+        }
+        catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+        const errMsg = JSON.stringify({ channel: session, type: "error", data: "Session not found" } satisfies MuxServerMessage);
+        for (const ws of viewers) {
+          try {
+            this.wsSend(ws, errMsg);
+          }
+          catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+        }
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
       }
     }
   }
@@ -2888,9 +3311,25 @@ export class TmuxWsMux<
     let snapshot: MuxProjectionSnapshot | null;
     try {
       snapshot = this.projection!.snapshot(session);
-    } catch (cause) {
-      try { this.logError(`[thumbmux-mux] projection snapshot error for "${session}":`, cause instanceof Error ? cause.message : String(cause)); } catch {}
-      return;
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        const cause: unknown = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        try {
+          (this.owned ? this.operationalCall("logError", () => this.rawOwned(this.logError).apply(this, [`[thumbmux-mux] projection snapshot error for "${session}":`, cause instanceof Error ? cause.message : String(cause)])) : this.logError(`[thumbmux-mux] projection snapshot error for "${session}":`, cause instanceof Error ? cause.message : String(cause)));
+        }
+        catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
+        return;
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
     if (!snapshot) return;
     // A projection has no archive reflow to wait for.
@@ -3114,7 +3553,7 @@ export class TmuxWsMux<
           } else {
             anyAccounted = true;
           }
-        } catch {}
+        } catch (caughtOwnedError) { this.endOwnedHandling(this.beginOwnedHandling(caughtOwnedError), true); }
       };
       for (const ws of this.sessionListSubscribers) {
         trySend(ws, this.sessionListClients.get(ws));
@@ -3125,8 +3564,21 @@ export class TmuxWsMux<
       }
       // Unfiltered provider result only — never a filtered projection.
       if (anyAccounted) this.lastSessionsJson = json;
-    } catch (e: any) {
-      this.logError("[thumbmux-mux] broadcastSessionList error:", e.message);
+    } catch (caughtOwnedError) {
+      const ownedHandling = this.beginOwnedHandling(caughtOwnedError);
+      let ownedSucceeded = true;
+      try {
+        const e: any = caughtOwnedError instanceof OwnedOperationalFailure ? caughtOwnedError.cause : caughtOwnedError;
+        this.logError("[thumbmux-mux] broadcastSessionList error:", e.message);
+      }
+      catch (handlingError) {
+        ownedSucceeded = false;
+        this.recordOwnedFailure("failure.handler", handlingError);
+        throw handlingError;
+      }
+      finally {
+        this.endOwnedHandling(ownedHandling, ownedSucceeded);
+      }
     }
   }
 }
