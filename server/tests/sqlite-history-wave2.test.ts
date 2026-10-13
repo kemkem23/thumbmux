@@ -663,44 +663,119 @@ test('newarch D11: a malformed frame is refused alone; the queued frame stays li
  }finally{await s.close();rmSync(root,{recursive:true,force:true});}
 },30000);
 
-test('I2 FIX1 A-B4: hot pane 20000 rows/s beside 21 panes: backpressure on the hot pane only, no loss issue, store never stopped',async()=>{
+test('I2 FIX1 A-B4: hot pane 20000 rows/s plus deterministic burst beside 21 panes: backpressure on the hot pane only, no loss issue, store never stopped',async()=>{
  const root=mkdtempSync(join(tmpdir(),'na-debt2-hot-'));
  const s=createProjectionStore({historyRoot:root,mode:'create'});
  const keys=Array.from({length:21},(_,i)=>({serverIdentity:'hot20k',paneId:`%${i}`,birthGeneration:1}));
  const hot={serverIdentity:'hot20k',paneId:'%hot',birthGeneration:1};
  const cell=(g:string)=>({grapheme:g,width:1 as const,continuation:false,fg:null,bg:null,style:0});
  const jobs=new Set<Promise<unknown>>(),statusSeen=new Set<string>();
+ const burstRows=12000,refusedBurst:number[]=[],acceptedHot=new Map<number,string>();
  let produced=0,hotProduced=0,hotOk=0,hotRefused=0,hotLost=0,normalRefused=0,frameRefused=0,lastFrame=-1e9,fseq=0;
+ let normalOk=0,frameOk=0,framesOffered=0,rateHotOk=0,rateHotRefused=0,rateHotLost=0;
+ let burstOffered=0,burstOk=0,burstRefused=0,burstLost=0,wrongScope=0,retryOffered=0,retryOk=0;
+ let burstTurnNormalOffered=0,burstTurnNormalOk=0,burstTurnFrameOffered=0,burstTurnFrameOk=0;
  const track=(p:Promise<unknown>)=>{jobs.add(p);void p.finally(()=>jobs.delete(p));};
+ const sampleHealth=()=>{const health=s.health();statusSeen.add(health.status);expect(health.status).not.toBe('stopped');return health;};
+ const burstEvent=(n:number,receiveSeq=n+1)=>{const text=`b:${n}`.padEnd(80,' ');return {paneKey:hot,sourceEpoch:1,geometryGeneration:1,
+  receiveSeq,softWrap:false,physicalRow:{text,cells:[...text].map(cell)}};};
+ const checkScope=(r:{reason:string;scope:string})=>{if(r.reason!=='capacity-pressure'||r.scope!=='pane')wrongScope++;};
+ const readHot=()=>{
+  const token=s.token(hot);let at=0,read=0,mismatches=0,burstCellWrong=0;
+  while(at<token.nextLineId){const page=s.readPage(token,at,2000);expect(page.nextAnchor).toBeGreaterThan(at);
+   for(const line of page.lines){const text=acceptedHot.get(line.lineId);if(text!==line.text)mismatches++;
+    if(text?.startsWith('b:') && (line.cells.length!==80 || line.cells.some((c,i)=>c.grapheme!==text[i]
+      || c.width!==1 || c.continuation!==false || c.fg!==null || c.bg!==null || c.style!==0)))burstCellWrong++;
+    read++;}at=page.nextAnchor;}
+  expect(mismatches).toBe(0);expect(burstCellWrong).toBe(0);expect(read).toBe(acceptedHot.size);expect(read).toBe(token.nextLineId);return read;
+ };
  const originalError=console.error;console.error=()=>{};
  try {
+  let burstHealth:ReturnType<typeof s.health>|undefined;
   const start=performance.now();
   while(performance.now()-start<10000) {
-   const now=performance.now()-start;
-   for(const due=Math.floor(now/10);produced<due;produced++)for(let i=0;i<21;i++){const t=`${i}:${produced}`.padEnd(80,' ');
-    track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(r=>{if(isProjectionRefusal(r))normalRefused++;},()=>{normalRefused++;}));}
-   for(const due=Math.floor(now*20);hotProduced<due;hotProduced++){const t=`h:${hotProduced}`.padEnd(80,' ');
-    track(s.appendScroll({paneKey:hot,sourceEpoch:1,geometryGeneration:1,receiveSeq:hotProduced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(r=>{if(isProjectionRefusal(r))hotRefused++;else hotOk++;},()=>{hotLost++;}));}
-   if(now-lastFrame>=100){lastFrame=now;fseq++;for(const k of [...keys,hot])
-    track(s.replaceScreen({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:fseq,cols:80,rows:24,kind:'normal',cells:textFrame(cell,80,24,fseq,false),cursor:null}).then(r=>{if(isProjectionRefusal(r))frameRefused++;},()=>{frameRefused++;}));}
-   statusSeen.add(s.health().status);
+   const now=performance.now()-start,dueNormal=Math.floor(now/10);
+   const burstTurn=burstOffered===0 && dueNormal>produced;
+   for(;produced<dueNormal;produced++)for(let i=0;i<21;i++){const t=`${i}:${produced}`.padEnd(80,' ');
+    if(burstTurn)burstTurnNormalOffered++;
+    track(s.appendScroll({paneKey:keys[i],sourceEpoch:1,geometryGeneration:1,receiveSeq:produced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(r=>{
+     if(isProjectionRefusal(r))normalRefused++;else{normalOk++;if(burstTurn)burstTurnNormalOk++;}
+    },()=>{normalRefused++;}));}
+   if(burstTurn){
+    // All 21 normal panes joined the roster before this synchronous burst.
+    // ADMIT_MAX=16*1024*1024-64*1024=16711680; roster=22 (+1 spare):
+    // floor(ADMIT_MAX/2/23)+floor((ADMIT_MAX/2)/2)=363297+4177920=4541217.
+    // 12000*(80+512)=7104000 minimum reserved bytes > that pane quota.
+    // No await/flush here: the queued burst cannot be pumped before this turn yields.
+    for(let n=0;n<burstRows;n++){
+     burstOffered++;const event=burstEvent(n);
+     track(s.appendScroll(event).then(r=>{
+      if(isProjectionRefusal(r)){burstRefused++;hotRefused++;refusedBurst.push(n);checkScope(r);}
+      else{burstOk++;hotOk++;acceptedHot.set(r.nextLineId-1,event.physicalRow.text);}
+     },()=>{burstLost++;hotLost++;}));
+    }
+    burstHealth=sampleHealth();
+   }
+   // The burst never advances hotProduced: every timed row remains due.
+   // Start hot traffic after the first normal turn/burst, catching up all due
+   // timed rows then; burst and timed receiveSeq domains cannot run backwards.
+   if(burstOffered>0)for(const due=Math.floor(now*20);hotProduced<due;hotProduced++){const t=`h:${hotProduced}`.padEnd(80,' ');
+    track(s.appendScroll({paneKey:hot,sourceEpoch:1,geometryGeneration:1,receiveSeq:burstRows+hotProduced+1,softWrap:false,physicalRow:{text:t,cells:[...t].map(cell)}}).then(r=>{
+     if(isProjectionRefusal(r)){rateHotRefused++;hotRefused++;checkScope(r);}
+     else{rateHotOk++;hotOk++;acceptedHot.set(r.nextLineId-1,t);}
+    },()=>{rateHotLost++;hotLost++;}));}
+   // Start the unchanged 10/s cadence with the first normal rows/burst, so
+   // those 22 frames exercise admission in the very same pressured turn.
+   if(produced>0 && now-lastFrame>=100){lastFrame=now;fseq++;for(const k of [...keys,hot]){
+    framesOffered++;if(burstTurn)burstTurnFrameOffered++;
+    track(s.replaceScreen({paneKey:k,sourceEpoch:1,geometryGeneration:1,receiveSeq:fseq,cols:80,rows:24,kind:'normal',cells:textFrame(cell,80,24,fseq,false),cursor:null}).then(r=>{
+     if(isProjectionRefusal(r))frameRefused++;else{frameOk++;if(burstTurn)burstTurnFrameOk++;}
+    },()=>{frameRefused++;}));}}
+   sampleHealth();
    await Bun.sleep(10);
   }
-  await Promise.all(jobs);s.flush();
+  await Promise.all(jobs);s.flush();sampleHealth();
   let missing=0,wrong=0;
   for(let i=0;i<21;i++){const page=s.readPage(s.token(keys[i]),null,2000);missing+=produced-page.lines.length;
    wrong+=page.lines.filter((l,n)=>l.text!==`${i}:${n}`.padEnd(80,' ')).length;}
+  expect(normalRefused).toBe(0);expect(frameRefused).toBe(0);expect(missing+wrong).toBe(0);
+  expect(hotRefused).toBeGreaterThan(0);expect(hotLost).toBe(0);expect(statusSeen.has('stopped')).toBe(false);
+  expect(burstOffered).toBe(burstRows);expect(burstOk).toBeGreaterThan(0);expect(burstRefused).toBeGreaterThan(0);
+  expect(burstHealth).toBeDefined();expect(wrongScope).toBe(0);
+  expect(burstTurnNormalOffered).toBeGreaterThanOrEqual(21);expect(burstTurnNormalOk).toBe(burstTurnNormalOffered);
+  expect(burstTurnFrameOffered).toBe(22);expect(burstTurnFrameOk).toBe(burstTurnFrameOffered);
+  expect(burstOk+burstRefused+burstLost).toBe(burstOffered);
+  expect(rateHotOk+rateHotRefused+rateHotLost).toBe(hotProduced);
+  expect(hotOk+hotRefused+hotLost).toBe(hotProduced+burstOffered);
+  expect(normalOk+normalRefused).toBe(produced*21);expect(frameOk+frameRefused).toBe(framesOffered);
+  expect(s.token(hot).nextLineId).toBe(hotOk);
+  const beforeRetryRead=readHot();
+  // Re-offer the same refused burst text/cells after drain, with a fresh
+  // receiveSeq domain after timed traffic (RAM rejects stale receiveSeq).
+  // Bounded batches keep retry admission separate from initial pressure.
+  await s.drained(hot);
+  for(let at=0;at<refusedBurst.length;at+=256){
+   const batch=refusedBurst.slice(at,at+256);
+   const receipts=await Promise.all(batch.map(n=>{retryOffered++;return s.appendScroll(burstEvent(n,burstRows+hotProduced+retryOffered));}));
+   for(let i=0;i<receipts.length;i++){const r=receipts[i]!;expect(isProjectionRefusal(r)).toBe(false);
+    if(isProjectionRefusal(r))throw Error(`burst retry refused: ${r.scope}`);
+    retryOk++;acceptedHot.set(r.nextLineId-1,burstEvent(batch[i]!).physicalRow.text);}
+   s.flush();sampleHealth();
+  }
+  expect(retryOffered).toBe(burstRefused);expect(retryOk).toBe(retryOffered);
+  expect(s.token(hot).nextLineId).toBe(hotOk+retryOk);
+  expect(hotOk+retryOk+hotRefused+hotLost).toBe(hotProduced+burstOffered+retryOffered);
+  const afterRetryRead=readHot();
   const disk=new Database(s.file,{readonly:true});
   let issues:any;
   try {issues=disk.query("SELECT count(*) AS n,coalesce(sum(missing_count),0) AS missing FROM na_issue WHERE kind='ingest-oversize'").get();}finally{disk.close();}
-  console.error=originalError;
-  console.log('NA_DEBT2_HOT20K',JSON.stringify({durationMs:10000,hotRate:20000,normalPanes:21,normalRate:100,produced,hotProduced,hotOk,hotPressure:hotRefused,hotLost,normalRefused,frameRefused,missing,wrong,statusSeen:[...statusSeen],issues}));
-  expect(normalRefused).toBe(0);expect(frameRefused).toBe(0);expect(missing+wrong).toBe(0);
-  expect(hotRefused).toBeGreaterThan(0);expect(hotLost).toBe(0);expect(statusSeen.has('stopped')).toBe(false);
-  // Backpressure on the hot pane is not loss: no capacity issue is written at all.
+  // Backpressure on the hot pane is not loss, including the retry phase.
   expect(issues).toEqual({n:0,missing:0});
-  // Every hot row the store accepted is readable (the fixture producer ignores pause, so no order oracle here).
-  expect(s.token(hot).nextLineId).toBe(hotOk);
+  console.error=originalError;
+  console.log('NA_DEBT2_HOT20K',JSON.stringify({durationMs:10000,hotRate:20000,normalPanes:21,normalRate:100,produced,hotProduced,
+   hotOk,hotPressure:hotRefused,hotLost,rateHotOk,rateHotRefused,rateHotLost,burstOffered,burstOk,burstRefused,burstLost,wrongScope,
+   burstMinimumBytes:7104000,paneQuotaUpperBytes:4541217,burstHealth,burstTurnNormalOffered,burstTurnNormalOk,burstTurnFrameOffered,burstTurnFrameOk,
+   retryOffered,retryOk,beforeRetryRead,afterRetryRead,normalOk,normalRefused,framesOffered,frameOk,frameRefused,missing,wrong,statusSeen:[...statusSeen],issues}));
  }finally{console.error=originalError;await s.close();rmSync(root,{recursive:true,force:true});}
 },60000);
 
