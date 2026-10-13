@@ -1845,6 +1845,24 @@ describe("WS-LIFETIME owned package barrier", () => {
     } finally { held.resolve(); await observeLifetime(mux).outcome; }
   });
 
+  test("WSL-HANDLED-NESTED-SYNC-DRAINS: completed nested best-effort handler has no artificial phase race", async () => {
+    const failure = new Error("handled archive read"), loggerFailure = new Error("handled logger");
+    let read = false, logged = false;
+    const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver(),
+      archive: { ingestSnapshot: (_s, content) => ({ liveContent: content }), renameSession: () => {},
+        readBefore: () => { read = true; throw failure; } },
+      logError: () => { logged = true; throw loggerFailure; },
+    });
+    try {
+      const ws = new FakeWS(); mux.expandHistory("owned", ws);
+      expect(read).toBe(true); expect(logged).toBe(true);
+      expect(ws.errorFrames("owned")[0].code).toBe("history_temporarily_unavailable");
+      // No setup await/turn: both real handlers already finished synchronously.
+      await fulfilledLifetime(mux, "WSL-HANDLED-NESTED-SYNC-DRAINS");
+      expect(mux.getOwnedTaskInventory().failures).toEqual([]);
+    } finally { await observeLifetime(mux).outcome; }
+  });
+
   test("WSL-HANDLER-PHASE-RACE: read rejects active but returned error handling overlaps quiesce", async () => {
     const handled = deferred();
     const failure = new Error("active read, unfinished handler");

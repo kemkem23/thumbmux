@@ -522,11 +522,16 @@ export class TmuxWsMux<
   }
 
   /** Observe returned promises while preserving dependency receivers. The independent ledger survives unsubscribe/rename/map deletion. */
-  private trackOwnedTask<T>(kind: string, result: T, sticky = true): T {
+  private trackOwnedTask<T>(kind: string, result: T, sticky = true, handlerWork = true): T {
     const owned = this.owned;
     if (!owned || !muxThenable(result)) return result;
     const completion = Promise.resolve(result);
-    owned.handling?.tasks.add(completion);
+    // Real handling work belongs to every enclosing handler. Internal ticket
+    // markers are not async collaborator work: a nested synchronous catch can
+    // finish active without an artificial microtask changing its disposition.
+    if (handlerWork) {
+      for (let scope = owned.handling; scope; scope = scope.parent) scope.tasks.add(completion);
+    }
     const task = completion.then(
       () => { owned.tasks.delete(task); },
       cause => { if (sticky) this.recordOwnedFailure(kind, cause); owned.tasks.delete(task); },
@@ -565,7 +570,7 @@ export class TmuxWsMux<
     const failed = (cause: unknown): never => {
       let release!: () => void;
       const handling = new Promise<void>(resolve => { release = resolve; });
-      this.trackOwnedTask(`${kind}.handling`, handling);
+      this.trackOwnedTask(`${kind}.handling`, handling, true, false);
       throw new OwnedOperationalFailure(kind, cause, release);
     };
     let result: T;
