@@ -1,13 +1,47 @@
 # Changelog
 
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
-scripts): `thumbmux@github:<owner>/<repo>#v0.20.5-dist`.
+scripts): `thumbmux@github:<owner>/<repo>#v0.22.0-dist`.
 
-## v0.22.0 — unreleased
+## v0.23.0 — release preparation
 
-This candidate combines the NEWARCH v2 additions below with the WJ consumer
+- server: opt in with `ownedLifetime: true` at construction, before starting
+  work. Public `TmuxWsMux.quiesceAndDrain(): Promise<void>` revokes admission
+  and joins owned work and its successors. An unresolved dependency keeps the
+  barrier pending; there is no timeout success. Repeated calls return the same
+  promise. A successful generation is terminal: create a new mux to restart.
+- `getOwnedTaskInventory(): MuxOwnedTaskInventory` (new public type, tier S) is
+  a copied diagnostic snapshot, never a drain certificate. Empty counts, closed
+  sockets and inspected error kinds do not authorize resource release.
+- Failure joins remaining work, rejects with `AggregateError`, and retains
+  failed cleanup ownership. The host must retain its DB/lock and resources;
+  another drain call cannot clear failure or retry into success.
+- Absent/false opt-in preserves the legacy path. A drain request rejects without
+  disabling legacy operation. `stop(): void` remains void; in owned mode it
+  begins revocation, so callers must still await `quiesceAndDrain()`.
+- Host ingress, pollers, registries, DB/locks and detached work remain the host's
+  responsibility. Async adapters must return their completion promises. The
+  host must integrate this API after its SEAM checkpoint and installed-package
+  handoff; this release does not certify host restart/off or production ON.
+- Compatibility: existing public names and tiers remain. The WS class and its
+  transitive route declarations gain the owned API; custom subclasses with
+  colliding method names may need changes. Nominal instances from different
+  releases must not be mixed. This is not a compatibility promise for every
+  consumer or custom subclass.
+- TM-01/02/03 resolves package-local Playwright by default and preserves the
+  `PLAYWRIGHT_FROM` override. The current source no longer embeds a private
+  installation path; historical blobs are unchanged. Module-resolution checks
+  do not certify WebKit/browser semantics.
+- Validation: typecheck/build and artifact inventory are preparation only.
+  Contract/runtime tests await paired review and the dedicated runner.
+
+## v0.22.0 — 2026-10-13
+
+This release combines the NEWARCH v2 additions below with the WJ consumer
 surface already released in v0.21.0. It does not enable stream-first operation.
-Root/UI consumer pins remain v0.21.0-dist until PUB and R-PIN finish the release.
+Published source `c47aa9d58a7719616ae8e7c727785118988f5a19` and immutable
+`v0.22.0-dist` (`551dc3b27b6dd8c77327c1accdd8916da35a77e7`) have a
+RELEASE-READY receipt. Root/UI consumers now pin v0.22.0-dist.
 
 - app: preserve public `SubmissionReceipt` / `PromptEntry`, optional
   `submitText` / `promptEntries`, and the four optional labels. Semantic COMPOSE
@@ -19,9 +53,10 @@ Root/UI consumer pins remain v0.21.0-dist until PUB and R-PIN finish the release
   `thumbmux/pipe-history-runtime`, using aliases for the Bun barrel workaround.
 - contract: compare separately against immutable .20.5 and .21 declarations.
   The return-type edge below affects both baselines: void-returning overrides
-  must be adapted. Representative consumer and artifact assertions are written
-  but await review and runner execution; build/typecheck are not that proof.
-- validation debt: T, RF01, monitoring/integration and public CI remain open.
+  must be adapted. Representative consumer and artifact assertions passed the required public
+  release lanes recorded in RELEASE-READY .22; that evidence belongs to .22.
+- validation debt: T, RF01 and monitoring/integration remain open.
+  Required public CI and release lanes completed for the immutable .22 tuple.
   History continuity, fresh flag-off behavior, existing-owner compatibility and
   exact-runtime receipts remain gates before ON; this release work grants no ON.
 
@@ -29,7 +64,7 @@ Root/UI consumer pins remain v0.21.0-dist until PUB and R-PIN finish the release
 - server: history page() v2 measures page bytes once per entry (linear); payloadBytes and the byte cut are unchanged byte for byte.
 - server: NewarchV2Display checks v2 page order the way H writes it: rotated segments whose digest sorts lower and a stop incident at its frontier row are no longer integrity errors; rows back or repeated inside a segment, a return to a segment already left, a misplaced incident and a repeated incident are still refused.
 
-NEWARCH v2 is included in this candidate, not in 0.20.5 or 0.21.0.
+NEWARCH v2 is included in this release, not in 0.20.5 or 0.21.0.
 Flag-on is not production-ready.
 
 ### Compatibility — 0.x breaking edges
@@ -46,8 +81,8 @@ The 0.22 minor deliberately accepts these exact declaration changes from both
   (return `null` on the legacy path). `AppRoutes`, `AppRoutesOptions` and
   `createAppRoutes` inherit the mux graph change; their own declarations are
   unchanged. Optional owner/history hooks do not require existing hosts to
-  supply them. Discarded-return callers and void callbacks have pending
-  baseline/current compilation fixtures, not an executed compatibility claim.
+  supply them. Representative discarded-return callers and void callbacks
+  passed baseline/current compilation in the .22 release lanes.
 - `TmuxMux` / `tmuxMux` add `newarchV2Pane`, `requestHistoryV2` and
   `cancelHistoryV2`, with private request state. Existing methods retain their
   declarations. Subclasses with colliding method names can break; mixing
@@ -79,7 +114,7 @@ local entry, UTF-8 and bounds helpers remain unexported.
 - **Compatibility note:** `TmuxWsMux.handleResize` and `applyGeometry` now
   return `NewarchV2GeometryReply | null` (was `void`). Callers that ignore the
   result, store the method in a `void`-returning slot, or subclass without
-  overriding have baseline/current compilation fixtures awaiting the runner. A
+  overriding passed the .22 baseline/current compilation fixtures. A
   subclass that overrides either method with a `: void` return type no longer
   type-checks and must return `null`.
 - `TermView` gains optional `fixedGeometry`, `fitWidth` and `v2StatusText`

@@ -1578,6 +1578,37 @@ function isV0220MinorException(
   return V0220_REVIEWED_SIGNATURES.has(reviewed);
 }
 
+// WS-LIFETIME .22 -> .23 only. Immutable baseline: v0.22.0-dist,
+// 551dc3b27b6dd8c77327c1accdd8916da35a77e7. Emitted ws-mux.d.ts adds
+// owned state and two public methods; AppRoutes.mux and createAppRoutes's
+// result reach that nominal class. AppRoutesOptions/TmuxWsMuxOptions instead
+// have the existing structural optional-addition proof and need no exception.
+// No removal, narrowing or default drift is authorized here. Subclass name
+// collisions / cross-version nominal instances are not universally compatible.
+const V0230_REVIEWED_SIGNATURES = new Set([
+  "0.22.0:0.23.0:server:AppRoutes:type:type:5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962:faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d:5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962:faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d",
+  "0.22.0:0.23.0:server:createAppRoutes:value:value:5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c:4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d:5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c:4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d",
+  "0.22.0:0.23.0:server:TmuxWsMux:value:value:6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa:393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4:6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa:393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4",
+]);
+
+function isV0230MinorException(
+  baselineVersion: string,
+  currentVersion: string,
+  subpath: PublicSubpackage,
+  name: string,
+  baselineLive: LiveContractEntry,
+  currentLive: LiveContractEntry,
+): boolean {
+  if (baselineVersion !== "0.22.0" || currentVersion !== "0.23.0") return false;
+  return V0230_REVIEWED_SIGNATURES.has([
+    baselineVersion, currentVersion, subpath, name,
+    baselineLive.kind, currentLive.kind,
+    baselineLive.signature, currentLive.signature,
+    baselineLive.compatibilitySignature ?? baselineLive.signature,
+    currentLive.compatibilitySignature ?? currentLive.signature,
+  ].join(":"));
+}
+
 function isMinorOptionalAddition(
   baselineLive: LiveContractEntry,
   currentLive: LiveContractEntry,
@@ -1769,6 +1800,14 @@ export function evaluateBaseline(
           nextLive,
         )
         || isV0220MinorException(
+          baselineVersion,
+          currentVersion,
+          subpath,
+          previous.name,
+          previousLive,
+          nextLive,
+        )
+        || isV0230MinorException(
           baselineVersion,
           currentVersion,
           subpath,

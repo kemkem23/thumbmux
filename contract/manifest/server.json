@@ -14,13 +14,13 @@
   {
     "name": "AppRoutes",
     "kind": "type",
-    "signature": "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+    "signature": "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d",
     "tier": "S"
   },
   {
     "name": "AppRoutesOptions",
     "kind": "type",
-    "signature": "9e69f0be331dac06b210d91862ef15bfe645727e483e0813e1f2d179c5e0e8bd",
+    "signature": "288eab3b125ab2ea77ac0a35f6eac6dc00fdcbb36fe22d7409bb380685fdd5d8",
     "tier": "S"
   },
   {
@@ -38,7 +38,7 @@
   {
     "name": "createAppRoutes",
     "kind": "value",
-    "signature": "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+    "signature": "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d",
     "tier": "S"
   },
   {
@@ -276,6 +276,12 @@
     "tier": "F"
   },
   {
+    "name": "MuxOwnedTaskInventory",
+    "kind": "type",
+    "signature": "69e64d185e85ccdd57ecd17cbeebd79b251108a3b087095b7badf3340837f82f",
+    "tier": "S"
+  },
+  {
     "name": "MuxTimeHooks",
     "kind": "type",
     "signature": "21d3003caaf3377fd2c46b1487a6a561eb6168f0c1b3f2096fa7ae2a4534d320",
@@ -452,13 +458,13 @@
   {
     "name": "TmuxWsMux",
     "kind": "value",
-    "signature": "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+    "signature": "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4",
     "tier": "F"
   },
   {
     "name": "TmuxWsMuxOptions",
     "kind": "type",
-    "signature": "ca02f48f366f176ddd31bbd2774350a4446871359accdbe3a7c04889abb19c2e",
+    "signature": "ae588b37c27bd91afbbc3ba3920d21bfbe872860bf411b5b6b1813981545d947",
     "tier": "F"
   },
   {

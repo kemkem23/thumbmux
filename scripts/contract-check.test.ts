@@ -5,6 +5,9 @@ import { join, resolve } from "node:path";
 import ts from "typescript";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { prepareReleasePackage } from "./prepare-release-package";
 import { assertReleaseVersion } from "./check-release-version";
 import {
   assertRuntimeDisplayExport,
@@ -1570,13 +1573,14 @@ class LegacyOverride extends TmuxWsMux {
 `;
 
 function pArtifactFixture(): string {
-  const root = fixture("0.22.0");
+  const root = fixture("0.23.0");
   const packageRoot = resolve(import.meta.dir, "..");
   cpSync(join(packageRoot, "git-dist"), join(root, "git-dist"), { recursive: true });
+  cpSync(join(packageRoot, "contract/manifest"), join(root, "contract/manifest"), { recursive: true });
   const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
   // Match the release map transformation, using the actual public map as input.
   const exports = JSON.parse(JSON.stringify(pkg.exports).replace(/\.\/([^/" ]+)\/dist\//g, "./git-dist/$1/"));
-  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "thumbmux", type: "module", version: "0.22.0", exports }));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "thumbmux", type: "module", version: pkg.version, exports }));
   return root;
 }
 
@@ -1679,12 +1683,12 @@ describe("P runtime barrel and dual consumer guards", () => {
   });
 });
 
-describe("P 0.22 release metadata and WJ manifests", () => {
+describe("P 0.23 release metadata and WJ manifests", () => {
   const packageRoot = resolve(import.meta.dir, "..");
   const releaseManifests = ["package.json", "core/package.json", "server/package.json", "svelte/package.json", "app/package.json"];
 
-  test("the five releases are .22, demo stays private .1, source export layout stays intact", () => {
-    expect(assertReleaseVersion("v0.22.0", packageRoot)).toBe("0.22.0");
+  test("the five releases are .23, demo stays private .1, source export layout stays intact", () => {
+    expect(assertReleaseVersion("v0.23.0", packageRoot)).toBe("0.23.0");
     const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
     expect(pkg.private).toBe(true);
     expect(pkg.exports["./pipe-history-runtime"]).toEqual({
@@ -1696,18 +1700,18 @@ describe("P 0.22 release metadata and WJ manifests", () => {
 
   test("every wrong package version and every wrong internal range is rejected separately", () => {
     for (const path of releaseManifests) {
-      const root = fixture("0.22.0");
+      const root = fixture("0.23.0");
       for (const manifest of releaseManifests) {
         mkdirSync(resolve(root, manifest, ".."), { recursive: true });
         cpSync(join(packageRoot, manifest), join(root, manifest));
       }
       const current = JSON.parse(readFileSync(join(root, path), "utf8"));
       writeFileSync(join(root, path), JSON.stringify({ ...current, version: "0.21.0" }));
-      expect(() => assertReleaseVersion("v0.22.0", root)).toThrow(`${path}: version 0.21.0 != 0.22.0`);
+      expect(() => assertReleaseVersion("v0.23.0", root)).toThrow(`${path}: version 0.21.0 != 0.23.0`);
       writeFileSync(join(root, path), JSON.stringify(current));
       for (const key of Object.keys(current.dependencies ?? {}).filter((name) => name.startsWith("@thumbmux/"))) {
         writeFileSync(join(root, path), JSON.stringify({ ...current, dependencies: { ...current.dependencies, [key]: "^0.21.0" } }));
-        expect(() => assertReleaseVersion("v0.22.0", root)).toThrow(`${path}: ${key}`);
+        expect(() => assertReleaseVersion("v0.23.0", root)).toThrow(`${path}: ${key}`);
         writeFileSync(join(root, path), JSON.stringify(current));
       }
     }
@@ -1743,7 +1747,7 @@ describe("P 0.22 release metadata and WJ manifests", () => {
 });
 
 test("P release checkContract requires a baseline before reading current artifacts", () => {
-  expect(() => checkContract({ packageRoot: fixture("0.22.0") })).toThrow("immutable baseline");
+  expect(() => checkContract({ packageRoot: fixture("0.23.0") })).toThrow("immutable baseline");
 });
 
 // P amendment: independent literal oracle from immutable .20.5/.21 and
@@ -1826,6 +1830,87 @@ const P_AMENDED_MANIFEST_ROWS = [
   ["app", "ThumbmuxApp", "component", "S", "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f"],
 ] as const;
 
+// P2: literal .23 inventory from emitted declarations, independent of the
+// exception table; the .22 P_AMENDED_MANIFEST_ROWS above remains historical.
+const P2_WS_MANIFEST_ROWS = [
+  [
+    "server",
+    "AppRoutes",
+    "type",
+    "S",
+    "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d"
+  ],
+  [
+    "server",
+    "AppRoutesOptions",
+    "type",
+    "S",
+    "288eab3b125ab2ea77ac0a35f6eac6dc00fdcbb36fe22d7409bb380685fdd5d8"
+  ],
+  [
+    "server",
+    "createAppRoutes",
+    "value",
+    "S",
+    "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d"
+  ],
+  [
+    "server",
+    "MuxOwnedTaskInventory",
+    "type",
+    "S",
+    "69e64d185e85ccdd57ecd17cbeebd79b251108a3b087095b7badf3340837f82f"
+  ],
+  [
+    "server",
+    "TmuxWsMux",
+    "value",
+    "F",
+    "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4"
+  ],
+  [
+    "server",
+    "TmuxWsMuxOptions",
+    "type",
+    "F",
+    "ae588b37c27bd91afbbc3ba3920d21bfbe872860bf411b5b6b1813981545d947"
+  ]
+] as const;
+
+// Only these three class-graph changes lack structural optional-addition proof.
+const P2_WS_SIGNATURES = [
+  [
+    "0.22.0",
+    "server",
+    "AppRoutes",
+    "type",
+    "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+    "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d",
+    "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+    "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d"
+  ],
+  [
+    "0.22.0",
+    "server",
+    "createAppRoutes",
+    "value",
+    "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+    "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d",
+    "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+    "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d"
+  ],
+  [
+    "0.22.0",
+    "server",
+    "TmuxWsMux",
+    "value",
+    "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+    "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4",
+    "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+    "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4"
+  ]
+] as const;
+
 function pReleaseComparison(row: readonly string[], change: {
   from?: string; to?: string; subpath?: "core" | "server" | "svelte" | "app";
   name?: string; oldSignature?: string; newSignature?: string;
@@ -1870,10 +1955,23 @@ describe("P exact .20.5/.21 to .22 artifact signatures", () => {
     });
   }
 
-  test("every individually authorized manifest row has its declared kind, tier and artifact digest", () => {
+  test("historical .22 fixture retains the emitted digests used by its exact exceptions", () => {
+    for (const [, subpath, name, kind, , signature] of P_RELEASE_SIGNATURES) {
+      const historical = P_AMENDED_MANIFEST_ROWS.find(row => row[0] === subpath && row[1] === name);
+      expect(historical).toBeDefined();
+      expect(historical![2]).toBe(kind);
+      expect(historical![4]).toBe(signature);
+    }
+  });
+
+  test("current .23 inventory preserves historical names/tiers and uses current artifact digests", () => {
     const root = resolve(import.meta.dir, "..");
     const live = deriveGitDistReport(root);
-    for (const [subpath, name, kind, tier, signature] of P_AMENDED_MANIFEST_ROWS) {
+    const currentRows = [
+      ...P_AMENDED_MANIFEST_ROWS.filter(row => !P2_WS_MANIFEST_ROWS.some(next => next[0] === row[0] && next[1] === row[1])),
+      ...P2_WS_MANIFEST_ROWS,
+    ];
+    for (const [subpath, name, kind, tier, signature] of currentRows) {
       const entries = JSON.parse(readFileSync(join(root, `contract/manifest/${subpath}.json`), "utf8")) as ContractEntry[];
       expect(entries.find((entry) => entry.name === name)).toEqual({ name, kind, tier, signature });
       expect(live[subpath].find((entry) => entry.name === name)).toMatchObject({ name, kind, signature });
@@ -1903,5 +2001,249 @@ describe("P exact .20.5/.21 to .22 artifact signatures", () => {
     const errors = pCompileConsumer(consumer, { "thumbmux/server": resolve(import.meta.dir, "../git-dist/server/index.d.ts") });
     expect(errors.map((error) => error.code)).toEqual([2345]);
     expect(errors[0]!.text).toContain("history_expand_v2");
+  });
+});
+
+// P2 tests are for the separately reviewed runner. No tmux, host DB, browser,
+// installed workspace alias or WS task/failure harness is used here (A3 owns it).
+const P2_WS_CONSUMER = `
+import { TmuxWsMux, type TmuxWsMuxOptions, type MuxOwnedTaskInventory } from "thumbmux/server";
+declare const driver: TmuxWsMuxOptions["driver"];
+const absent: TmuxWsMuxOptions = { driver };
+const disabled: TmuxWsMuxOptions = { driver, ownedLifetime: false };
+const owned: TmuxWsMuxOptions = { driver, ownedLifetime: true };
+const mux = new TmuxWsMux(owned);
+const drain: Promise<void> = mux.quiesceAndDrain();
+const inventory: MuxOwnedTaskInventory = mux.getOwnedTaskInventory();
+const phase: "legacy" | "active" | "quiescing" | "drained" | "failed" = inventory.phase;
+const tasks: readonly { kind: string }[] = inventory.tasks;
+const failures: readonly { kind: string; cause: unknown }[] = inventory.failures;
+const retained: number = inventory.retainedCleanups;
+const legacyStop: void = new TmuxWsMux(absent).stop();
+const falseStop: void = new TmuxWsMux(disabled).stop();
+void [drain, phase, tasks, failures, retained, legacyStop, falseStop];
+`;
+
+function p2CompilePublic(root: string, source = P2_WS_CONSUMER) {
+  const entry = join(root, "consumer.ts");
+  // The real package export map resolves the import; no TS paths alias.
+  writeFileSync(entry, source);
+  const options: ts.CompilerOptions = {
+    strict: true, noEmit: true, skipLibCheck: true, types: [],
+    target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+  };
+  const resolution = ts.resolveModuleName("thumbmux/server", entry, options, ts.sys)
+    .resolvedModule?.resolvedFileName;
+  const errors = ts.getPreEmitDiagnostics(ts.createProgram([entry], options)).map(d => ({
+    code: d.code, text: ts.flattenDiagnosticMessageText(d.messageText, "\n"),
+  }));
+  return { resolution, errors };
+}
+
+function p2AssertPublicTypes(root: string) {
+  const result = p2CompilePublic(root);
+  expect(result.resolution).toBe(join(root, "git-dist/server/index.d.ts"));
+  expect(result.errors).toEqual([]);
+}
+
+function p2WsRuntime(root: string) {
+  const script = `
+    import { mock } from "bun:test";
+    import * as child from "node:child_process";
+    import * as fs from "node:fs";
+    const forbidden = () => { throw Error("P2 forbidden host effect"); };
+    mock.module("bun:sqlite", () => ({ Database: class { constructor() { forbidden(); } } }));
+    mock.module("node:child_process", () => ({ ...child, spawn: forbidden, spawnSync: forbidden, exec: forbidden, execSync: forbidden, execFile: forbidden, execFileSync: forbidden, fork: forbidden }));
+    mock.module("node:fs", () => ({ ...fs, openSync: forbidden, writeFileSync: forbidden, mkdirSync: forbidden, rmSync: forbidden }));
+    globalThis.setTimeout = forbidden;
+    globalThis.setInterval = forbidden;
+    const { TmuxWsMux } = await import("thumbmux/server");
+    const driver = { listSessions: () => [], capturePane: async () => "", sendKeys() {},
+      getSessionActivity: () => new Map(), getHistoryLimit: () => 2000,
+      setSessionHistoryLimit() {}, resizeWindow() {}, hash: x => x };
+    const mux = new TmuxWsMux({ driver, ownedLifetime: true });
+    console.log("P2 imported and constructed");
+    if (typeof mux.quiesceAndDrain !== "function") throw Error("P2 missing drain method");
+    const drain = mux.quiesceAndDrain();
+    if (!(drain instanceof Promise)) throw Error("P2 drain must return Promise");
+    if (mux.quiesceAndDrain() !== drain) throw Error("P2 drain promise identity");
+    await drain;
+    if (mux.getOwnedTaskInventory().phase !== "drained") throw Error("P2 empty drain failed");
+    if (mux.quiesceAndDrain() !== drain) throw Error("P2 settled drain promise identity");
+    for (const options of [{ driver }, { driver, ownedLifetime: false }]) {
+      const legacy = new TmuxWsMux(options);
+      let rejection;
+      try { await legacy.quiesceAndDrain(); } catch (error) { rejection = error; }
+      if (!rejection?.message.includes("ownedLifetime")) throw Error("P2 legacy must reject");
+      const sent = [];
+      legacy.handleMessage({ type: "ping" }, { send: frame => { sent.push(frame); return 1; } });
+      if (sent.length !== 1 || JSON.parse(sent[0]).type !== "pong") throw Error("P2 legacy unusable");
+      if (legacy.getOwnedTaskInventory().phase !== "legacy") throw Error("P2 legacy state changed");
+      if (legacy.stop() !== undefined) throw Error("P2 stop must remain void");
+    }
+    console.log("P2 public owned and legacy API passed");
+  `;
+  return spawnSync(process.execPath, ["--eval", script], { cwd: root, encoding: "utf8" });
+}
+
+function p2AssertPublicRuntime(root: string) {
+  const result = p2WsRuntime(root);
+  expect({ error: result.error?.message, status: result.status, stderr: result.stderr })
+    .toEqual({ error: undefined, status: 0, stderr: "" });
+  expect(result.stdout).toContain("P2 imported and constructed");
+  expect(result.stdout).toContain("P2 public owned and legacy API passed");
+}
+
+function p2PackedArtifact(): string {
+  const root = pArtifactFixture();
+  prepareReleasePackage(root);
+  const packed = spawnSync(process.execPath, ["pm", "pack", "--ignore-scripts", "--filename", "public.tgz"], {
+    cwd: root, encoding: "utf8", env: { ...process.env,
+      BUN_INSTALL_CACHE_DIR: join(root, "bun-cache"), npm_config_cache: join(root, "npm-cache"), TMPDIR: root },
+  });
+  expect({ error: packed.error?.message, status: packed.status }).toEqual({ error: undefined, status: 0 });
+  const unpacked = join(root, "unpacked");
+  mkdirSync(unpacked);
+  const unpack = spawnSync("tar", ["-xf", join(root, "public.tgz"), "-C", unpacked], { encoding: "utf8" });
+  expect({ error: unpack.error?.message, status: unpack.status }).toEqual({ error: undefined, status: 0 });
+  const pkg = join(unpacked, "package");
+  for (const file of ["server/index.js", "server/index.d.ts", "server/ws-mux.d.ts", "core/index.js"]) {
+    expect(readFileSync(join(pkg, "git-dist", file))).toEqual(readFileSync(join(root, "git-dist", file)));
+  }
+  return pkg;
+}
+
+// Full .22 artifact is supplied by the runner's immutable baseline materializer.
+// Never substitute current declarations, a missing baseline, or .21 silently.
+function p2BaselineRoot(): string {
+  const root = process.env.THUMBMUX_CONTRACT_BASELINE_ROOT;
+  if (!root) throw Error("P2 requires immutable v0.22.0-dist baseline");
+  expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe("0.22.0");
+  return root;
+}
+
+function p2ArtifactComparison(root: string) {
+  const baselineRoot = p2BaselineRoot();
+  const before = deriveGitDistReport(baselineRoot, ["server"]).server;
+  for (const [, , name, kind, oldSignature, , oldCompatibility] of P2_WS_SIGNATURES) {
+    expect(before.find(row => row.name === name)).toMatchObject({ kind, signature: oldSignature, compatibilitySignature: oldCompatibility });
+  }
+  // Run the same artifact oracle for positives and mutants. Manifest checking
+  // also catches loss of the newly exported inventory type (absent from .22).
+  return checkContract({ packageRoot: root, baselinePackageRoot: baselineRoot,
+    subpackages: ["server"], validateExportParity: false });
+}
+
+function p2Replace(file: string, before: string, after: string) {
+  const original = readFileSync(file, "utf8");
+  expect(original.split(before)).toHaveLength(2);
+  writeFileSync(file, original.replace(before, after));
+}
+
+describe("P2 public built and packed WS API", () => {
+  for (const [label, make] of [["built", pArtifactFixture], ["packed", p2PackedArtifact]] as const) {
+    test(`${label}: actual public imports compile owned/legacy and execute empty drain`, () => {
+      const root = make();
+      p2AssertPublicTypes(root);
+      p2AssertPublicRuntime(root);
+      expect(p2ArtifactComparison(root).errors).toEqual([]);
+    });
+  }
+
+  test("copied actual JS without drain imports/constructs before the positive runtime oracle rejects it", () => {
+    const root = pArtifactFixture();
+    p2AssertPublicTypes(root);
+    p2AssertPublicRuntime(root);
+    p2Replace(join(root, "git-dist/server/index.js"), "  quiesceAndDrain() {", "  removedDrain() {");
+    const result = p2WsRuntime(root);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("P2 imported and constructed");
+    expect(result.stderr).toContain("P2 missing drain method");
+    expect(result.stderr).not.toContain("Cannot find");
+  });
+
+  for (const [label, before, after, code, text] of [
+    ["removed drain", "    quiesceAndDrain(): Promise<void>;", "", 2339, "quiesceAndDrain"],
+    ["narrowed return", "    quiesceAndDrain(): Promise<void>;", "    quiesceAndDrain(): void;", 2322, "void"],
+    ["required option", "    ownedLifetime?: boolean;", "    ownedLifetime: boolean;", 2741, "ownedLifetime"],
+    ["removed legacy member", "    stop(): void;", "", 2339, "stop"],
+    ["missing inventory type", "export type MuxOwnedTaskInventory =", "type MuxOwnedTaskInventory =", 2305, "MuxOwnedTaskInventory"],
+  ] as const) {
+    test(`actual copied declarations reject ${label} after positive setup`, () => {
+      const root = pArtifactFixture();
+      p2AssertPublicTypes(root);
+      p2AssertPublicRuntime(root);
+      expect(p2ArtifactComparison(root).errors).toEqual([]);
+      p2Replace(join(root, "git-dist/server/ws-mux.d.ts"), before, after);
+      const negative = p2CompilePublic(root);
+      expect(negative.resolution).toBe(join(root, "git-dist/server/index.d.ts"));
+      expect(negative.errors.some(d => d.code === code && d.text.includes(text))).toBe(true);
+      expect(negative.errors.some(d => d.code === 2307 || d.code === 1005)).toBe(false);
+      // The real public JS still imports/runs: parse/setup failure is not RED.
+      p2AssertPublicRuntime(root);
+      expect(p2ArtifactComparison(root).errors.some(d => d.name === "TmuxWsMux"
+        || d.name === "TmuxWsMuxOptions" || d.name === "MuxOwnedTaskInventory")).toBe(true);
+    });
+  }
+
+  test("workspace export escape is rejected by the same public resolution oracle", () => {
+    const root = pArtifactFixture();
+    p2AssertPublicTypes(root);
+    p2AssertPublicRuntime(root);
+    const path = join(root, "package.json");
+    const pkg = JSON.parse(readFileSync(path, "utf8"));
+    pkg.exports["./server"] = { types: "../../server/src/index.ts", import: "../../server/src/index.ts" };
+    writeFileSync(path, JSON.stringify(pkg));
+    const result = p2CompilePublic(root);
+    expect(result.resolution).toBeUndefined();
+    expect(result.errors.some(d => d.code === 2307 && d.text.includes("thumbmux/server"))).toBe(true);
+  });
+});
+
+describe("P2 exact .22 to .23 class graph tuples", () => {
+  for (const row of P2_WS_SIGNATURES) {
+    test(`${row[2]}: exact versions, spelling, kind and both digest pairs`, () => {
+      expect(pReleaseComparison(row, { to: "0.23.0" }).errors).toEqual([]);
+      for (const mutation of [
+        { from: "0.21.0" }, { from: "0.22.1" }, { to: "0.23.1" }, { to: "0.24.0" },
+        { name: `${row[2]}Unreviewed` }, { subpath: "core" as const }, { wrongKind: true },
+        { oldSignature: "1".repeat(64) }, { newSignature: "2".repeat(64) },
+        { oldCompatibility: "3".repeat(64) }, { newCompatibility: "4".repeat(64) },
+      ]) {
+        expect(pReleaseComparison(row, { to: "0.23.0", ...mutation }).errors
+          .some(d => d.code === "baseline-signature-change")).toBe(true);
+      }
+      // Changing BOTH kinds must also miss the tuple (not just kindChanged).
+      const changed = [...row];
+      changed[3] = row[3] === "type" ? "value" : "type";
+      expect(pReleaseComparison(changed, { to: "0.23.0" }).errors
+        .some(d => d.code === "baseline-signature-change")).toBe(true);
+    });
+  }
+});
+
+describe("P2 TM0103 module resolution only (no browser semantics)", () => {
+  test("package-local fallback and explicit override resolve independent fixture installations", () => {
+    const script = readFileSync(resolve(import.meta.dir, "../svelte/tests/tm-01-03-webkit-red.mjs"), "utf8");
+    expect(script).not.toMatch(/\/home\/|\/Users\/|webkit-\d+/);
+    const expression = script.match(/const require = (createRequire\([\s\S]*?\));/)?.[1];
+    expect(expression).toBe("createRequire(process.env.PLAYWRIGHT_FROM ?? import.meta.url)");
+    const root = fixture();
+    const local = join(root, "local");
+    const override = join(root, "override");
+    for (const [dir, id] of [[local, "local"], [override, "override"]]) {
+      const packageDir = join(dir!, "node_modules/@playwright/test");
+      mkdirSync(packageDir, { recursive: true });
+      writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@playwright/test", main: "index.cjs" }));
+      writeFileSync(join(packageDir, "index.cjs"), `module.exports = ${JSON.stringify(id)};`);
+    }
+    // Evaluate only the extracted resolver expression with fixture-local inputs.
+    const resolveFrom = new Function("createRequire", "process", "moduleUrl",
+      `return ${expression!.replace("import.meta.url", "moduleUrl")};`);
+    const moduleUrl = pathToFileURL(join(local, "probe.mjs")).href;
+    expect(resolveFrom(createRequire, { env: {} }, moduleUrl)("@playwright/test")).toBe("local");
+    expect(resolveFrom(createRequire, { env: { PLAYWRIGHT_FROM: join(override, "package.json") } }, moduleUrl)("@playwright/test")).toBe("override");
   });
 });
