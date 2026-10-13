@@ -637,7 +637,12 @@ async function measureProjectionLoad(cols:number,rows:number) {
     const cpu=process.cpuUsage(cpuStart);
     const result={diskTotalMs:stats(diskTotal),diskWriteMs:stats(diskWrite),diskCommitMs:stats(diskCommit),timings,cpuMs:(cpu.user+cpu.system)/1000,rssStart,panes:21,ratePerPane:100,historyCols:80,cols,rows,producerMs,producedRows:produced*21,accepted,refused,screenRefused,frames,
       pendingBytes:stats(pending),flushAgeMs:stats(ages),screenResolveMs:stats(screens),rssBytes:stats(rss),healthSampleGapMs:stats(sampleGaps),missing,extra,wrong};
-    console.log('NA_OPEN_LOOP',JSON.stringify(result));return result;
+    console.log('NA_OPEN_LOOP',JSON.stringify(result));
+    // Serialize the existing samples only after CPU/producer/row accounting.
+    console.log('NA_OPEN_LOOP_TRACE',JSON.stringify({schemaVersion:1,cols,rows,
+      bunVersion:Bun.version,revision:Bun.revision,platform:process.platform,arch:process.arch,
+      rssBytes:rss,pendingBytes:pending,sampleGapsMs:sampleGaps}));
+    return result;
    }finally{await s.close();}
  }finally{rmSync(root,{recursive:true,force:true});}
 }
@@ -654,6 +659,16 @@ test('newarch L1: open loop 21 panes x100 rows/s for 60 real seconds, both geome
   console.log(out);if(err)console.error(err);expect(exit).toBe(0);
   const line=out.split('\n').find(l=>l.startsWith('NA_OPEN_LOOP '));expect(line).toBeDefined();
   results.push(JSON.parse(line!.slice('NA_OPEN_LOOP '.length)));
+  const result=results.at(-1);
+  const traceLine=out.split('\n').find(l=>l.startsWith('NA_OPEN_LOOP_TRACE '));expect(traceLine).toBeDefined();
+  const trace=JSON.parse(traceLine!.slice('NA_OPEN_LOOP_TRACE '.length));
+  expect(trace.cols).toBe(cols);expect(trace.rows).toBe(rows);
+  expect(trace.rssBytes.length).toBe(trace.pendingBytes.length);expect(trace.rssBytes.length).toBe(trace.sampleGapsMs.length);
+  for(const [values,summary] of [[trace.rssBytes,result.rssBytes],[trace.pendingBytes,result.pendingBytes],[trace.sampleGapsMs,result.healthSampleGapMs]]) {
+    expect(Array.isArray(values)).toBe(true);expect(values.length).toBeGreaterThan(0);expect(values.length).toBe(summary.n);
+    expect(values.every((value:unknown)=>typeof value==='number'&&Number.isFinite(value))).toBe(true);
+    expect(values.reduce((max:number,value:number)=>Math.max(max,value),-Infinity)).toBe(summary.max);
+  }
  }
   for(const r of results) {
     expect(r.refused).toBe(0);expect(r.screenRefused).toBe(0);expect(r.accepted).toBe(126000);

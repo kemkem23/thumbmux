@@ -3,7 +3,7 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.22.0-dist`.
 
-## v0.23.0
+## v0.23.0 — Owned WebSocket lifetime
 
 - server: opt in with `ownedLifetime: true` at construction, before starting
   work. Public `TmuxWsMux.quiesceAndDrain(): Promise<void>` revokes admission
