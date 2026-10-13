@@ -11,6 +11,7 @@ import {
   TmuxWsMux,
   installMuxTimeHooksForTests,
   type HistoryArchiveLike,
+  type MuxProjectionSource,
   type TmuxDriver,
 } from "../src/ws-mux";
 
@@ -961,5 +962,1003 @@ describe("A3-10 closeSession preserves timestamp guard", () => {
     const recovered = await journal2.recoverSession(session);
     expect(recovered.recordCount).toBe(2);
     expect(recovered.lastAt).toBeGreaterThanOrEqual(20);
+  });
+});
+
+
+// WS-LIFETIME package oracles. No host, tmux, DB, process or network fixture.
+// These cases must be run as this WHOLE FILE by the runner after paired review.
+function lifetimeDriver(overrides: Partial<TmuxDriver> = {}): TmuxDriver {
+  return {
+    listSessions: () => [sessionListItem("owned")],
+    capturePane: async () => "owned-output",
+    sendKeys: () => {}, getSessionActivity: () => new Map([["owned", 1]]),
+    getHistoryLimit: () => 2000, setSessionHistoryLimit: () => {},
+    resizeWindow: () => {}, hash: content => content, ...overrides,
+  };
+}
+
+function lifetimeProjection(overrides: Partial<MuxProjectionSource> = {}): MuxProjectionSource {
+  return {
+    owns: () => true, snapshot: () => null, routeGeneration: () => 1,
+    watch: () => () => {}, onRouteChange: () => () => {},
+    readBefore: () => ({ lines: [], startLine: null, hasMore: false }),
+    readAfter: () => ({ lines: [], startLine: null, hasMore: false }), ...overrides,
+  };
+}
+
+// Yield one event-loop turn, allowing all runnable promise reactions to finish.
+// A held gate (not elapsed time) is the reason drain must still be pending.
+const lifetimeTurn = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+function assertLifetimeBlocked(completed: boolean, assertion: string): void {
+  if (completed) throw new Error(assertion);
+}
+
+function observeLifetime(mux: TmuxWsMux<any>) {
+  const drain = mux.quiesceAndDrain();
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+  const state = { settled: false };
+  const outcome = drain.then(
+    () => { state.settled = true; return { ok: true as const }; },
+    error => { state.settled = true; return { ok: false as const, error }; },
+  );
+  return { drain, state, outcome };
+}
+async function fulfilledLifetime(mux: TmuxWsMux<any>, name: string) {
+  const result = await observeLifetime(mux).outcome;
+  if (!result.ok) throw new Error(`${name}: ${String(result.error)}; ${mux.getOwnedTaskInventory().failures.map(f => f.kind).join(",")}`);
+}
+async function idleLifetime(mux: TmuxWsMux<any>) {
+  await until(() => mux.getOwnedTaskInventory().tasks.length === 0);
+}
+
+describe("WS-LIFETIME owned package barrier", () => {
+  test("positive: empty owned mux revokes synchronously and drain is idempotent", async () => {
+    let calls = 0;
+    const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver({ sendKeys: () => { calls++; } }) });
+    try {
+      const ws = new FakeWS();
+      const drain = mux.quiesceAndDrain();
+      void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      expect(mux.getOwnedTaskInventory().phase).toBe("quiescing");
+      mux.handleMessage({ type: "ping" }, ws);
+      mux.subscribe("owned", ws);
+      mux.subscribeSessions(ws);
+      mux.handleKeys("owned", "forbidden", ws);
+      mux.handleResize("owned", 100, 30, ws);
+      mux.applyGeometry("owned", 100, 30, ws);
+      mux.handleDrain(ws);
+      expect(mux.quiesceAndDrain()).toBe(drain);
+      await drain;
+      expect(calls).toBe(0);
+      expect(ws.sent).toEqual([]);
+      expect((mux as any).wsSend(ws, "revoked")).toBe(0);
+      expect(mux.isBackpressured(ws)).toBe(true);
+      expect((mux as any).interval).toBeNull();
+      expect((mux as any).blockedTimeouts.size).toBe(0);
+      expect(mux.getOwnedTaskInventory()).toEqual({ phase: "drained", tasks: [], failures: [], retainedCleanups: 0 });
+
+    } finally {  await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-CAPTURE-CLOSE: socket close preserves the admitted archival capture until its actual completion", async () => {
+    const gate = deferred<string>();
+    let captureFinished = false, drained = false;
+    const ingested: string[] = [];
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, pollNormalMs: 60_000,
+      driver: lifetimeDriver({ capturePane: async () => {
+        const content = await gate.promise; captureFinished = true; return content;
+      } }),
+      archive: {
+        ingestSnapshot: (_session, content) => { ingested.push(content); return { liveContent: content }; },
+        readBefore: () => ({}), renameSession: () => {},
+      },
+    });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      mux.unsubscribeAll(ws); // actual package close path; the viewer detaches immediately
+      expect((mux as any).subscribers.get("owned").size).toBe(0);
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+      void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, "WSL-CAPTURE-CLOSE");
+        expect(captureFinished).toBe(false);
+        expect(mux.getOwnedTaskInventory().tasks.some(task => task.kind === "capture.queue")).toBe(true);
+        gate.resolve("late");
+        await drain;
+        expect(captureFinished).toBe(true);
+        expect(ingested).toEqual(["late"]);
+        expect((mux as any).subscribers.size).toBe(0);
+        expect(ws.outputFrames("owned")).toHaveLength(0);
+      } finally { gate.resolve("cleanup"); await drain.catch(() => {}); }
+
+    } finally { gate.resolve("cleanup"); await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-INVALIDATE: removing session maps cannot remove the independent task obligation", async () => {
+    const gate = deferred<string>();
+    let drained = false;
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, pollNormalMs: 60_000,
+      driver: lifetimeDriver({ capturePane: () => gate.promise }),
+    });
+    try {
+    mux.subscribe("owned", new FakeWS());
+    mux.invalidateSession("owned"); // explicit identity invalidation, unlike disconnect
+    expect((mux as any).queuedCaptureTails.size).toBe(0);
+    const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+    try {
+      await lifetimeTurn();
+      assertLifetimeBlocked(drained, "WSL-INVALIDATE");
+      expect(mux.getOwnedTaskInventory().tasks.map(task => task.kind)).toContain("capture.queue");
+      gate.resolve("invalidated"); await drain;
+    } finally { gate.resolve("cleanup"); await drain.catch(() => {}); }
+
+    } finally { gate.resolve("cleanup"); await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-SUCCESSOR: drain waits for resize successor created by the admitted capture", async () => {
+    const first = deferred<string>(), second = deferred<string>();
+    const ingested: string[] = [];
+    let captures = 0, drained = false;
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, pollNormalMs: 60_000,
+      driver: lifetimeDriver({ capturePane: () => ++captures === 1 ? first.promise : second.promise }),
+      archive: {
+        ingestSnapshot: (_session, content) => { ingested.push(content); return { liveContent: content }; },
+        readBefore: () => ({}), renameSession: () => {},
+      },
+    });
+    try {
+    mux.subscribe("owned", new FakeWS());
+    mux.applyGeometry("owned", 120, 40); // coalesced pending intent while first is held
+    const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+    try {
+      first.resolve("stale-geometry");
+      await until(() => captures === 2);
+      assertLifetimeBlocked(drained, "WSL-SUCCESSOR");
+      expect(ingested).toEqual([]);
+      second.resolve("current-geometry");
+      await drain;
+      expect(ingested).toEqual(["current-geometry"]);
+      expect(mux.getOwnedTaskInventory().tasks).toEqual([]);
+    } finally { first.resolve("cleanup"); second.resolve("cleanup"); await drain.catch(() => {}); }
+
+    } finally { first.resolve("cleanup"); second.resolve("cleanup"); await observeLifetime(mux).outcome; }
+  });
+
+  for (const oldFirst of [false, true]) {
+    test(`WSL-RENAME-${oldFirst}: closing a renamed viewer preserves the current capture owner`, async () => {
+      const old = deferred<string>(), current = deferred<string>();
+      let captures = 0, drained = false;
+      const ingested: string[] = [];
+      const mux = new TmuxWsMux({
+        ownedLifetime: true, pollNormalMs: 60_000,
+        driver: lifetimeDriver({ capturePane: () => ++captures === 1 ? old.promise : current.promise }),
+        archive: {
+          ingestSnapshot: (session, content) => { ingested.push(`${session}:${content}`); return { liveContent: content }; },
+          readBefore: () => ({}), renameSession: () => {},
+        },
+      });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      mux.handleSessionRename("owned", "renamed");
+      expect(captures).toBe(2);
+      mux.unsubscribeAll(ws);
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        if (oldFirst) old.resolve("old"); else current.resolve("new");
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, `WSL-RENAME-${oldFirst}`);
+        if (oldFirst) current.resolve("new"); else old.resolve("old");
+        await drain;
+        expect(ingested.length).toBeGreaterThan(0);
+        expect(ingested.every(value => value === "renamed:new")).toBe(true);
+        expect((mux as any).subscribers.size).toBe(0);
+        expect(mux.getOwnedTaskInventory().tasks).toEqual([]);
+      } finally { old.resolve("cleanup"); current.resolve("cleanup"); await drain.catch(() => {}); }
+
+    } finally { old.resolve("cleanup"); current.resolve("cleanup"); await observeLifetime(mux).outcome; }
+  });
+  }
+
+  test("WSL-POLL: an actual admitted poll stays owned through its queue tail", async () => {
+    const gate = deferred<string>();
+    let n = 0, drained = false;
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, pollNormalMs: 60_000, pollReconcileMs: 0,
+      driver: lifetimeDriver({ capturePane: () => ++n === 1 ? Promise.resolve("boot") : gate.promise }),
+    });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      await until(() => ws.outputFrames("owned").length === 1 && !(mux as any).queuedCapturesInFlight.size);
+      const poll = (mux as any).poll() as Promise<void>;
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+      void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, "WSL-POLL");
+        expect(mux.getOwnedTaskInventory().tasks.some(task => task.kind === "poll")).toBe(true);
+        gate.resolve("poll-output");
+        await Promise.all([poll, drain]);
+        expect((mux as any).inFlight).toBe(false);
+        expect((mux as any).interval).toBeNull();
+      } finally { gate.resolve("cleanup"); await drain.catch(() => {}); }
+
+    } finally { gate.resolve("cleanup"); await observeLifetime(mux).outcome; }
+  });
+
+  for (const direction of ["before", "after"] as const) {
+    test(`WSL-HISTORY-${direction}: closed projected reader still owns its pending work`, async () => {
+      const gate = deferred<unknown>();
+      let finished = false, drained = false;
+      const read = async () => { const page = await gate.promise; finished = true; return page; };
+      const mux = new TmuxWsMux({
+        ownedLifetime: true, driver: lifetimeDriver(), pollNormalMs: 60_000,
+        projection: lifetimeProjection({ readBefore: read, readAfter: read }),
+      });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      if (direction === "before") mux.expandHistory("owned", ws);
+      else mux.expandHistoryAfter("owned", ws, null);
+      mux.unsubscribeAll(ws);
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, `WSL-HISTORY-${direction}`);
+        expect(finished).toBe(false);
+        expect(mux.getOwnedTaskInventory().tasks.some(task => task.kind === "history.projected.reply")).toBe(true);
+        gate.resolve({ lines: ["durable"], startLine: 0, hasMore: false });
+        await drain;
+        expect(finished).toBe(true);
+        expect(ws.historyPages("owned")).toEqual([]);
+      } finally { gate.resolve({}); await drain.catch(() => {}); }
+
+    } finally { gate.resolve({}); await observeLifetime(mux).outcome; }
+  });
+  }
+
+  test("WSL-V2-HISTORY: the v2 reader and reply continuation remain owned after close", async () => {
+    const gate = deferred();
+    let entered = false, finished = false, drained = false;
+    const pane = { serverIdentity: "owned-server", paneId: "%1", birthGeneration: 1 };
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, driver: lifetimeDriver(),
+      newarchV2: () => ({ kind: "selected", pane: {
+        schema: "newarch-v2", session: { serverIdentity: pane.serverIdentity, sessionId: "session" },
+        pane, windowId: "window", owner: "capture-engine", birthOperationId: "birth", state: "active",
+        geometry: { policy: "fixed-at-birth", columns: 80, rows: 24, configVersion: "1", panesPerWindow: 1 },
+      } }),
+      newarchV2History: async () => {
+        entered = true; await gate.promise; finished = true;
+        return { status: "ok", value: {
+          schema: "newarch-v2", pane, revision: 1, payloadBytes: 2,
+          entries: [], states: [], before: { kind: "end" }, after: { kind: "end" },
+        } };
+      },
+    });
+    try {
+      const ws = new FakeWS();
+      mux.handleMessage({ type: "history_expand_v2", session: "owned", requestId: "request", request: {
+        schema: "newarch-v2", pane, cursor: null, direction: "before", maxEntries: 10, maxBytes: 4096,
+      } }, ws);
+      expect(entered).toBe(true);
+      mux.unsubscribeAll(ws);
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+      void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, "WSL-V2-HISTORY");
+        expect(mux.getOwnedTaskInventory().tasks.map(task => task.kind)).toContain("history.v2.reply");
+        gate.resolve(); await drain;
+        expect(finished).toBe(true);
+        expect(ws.sent).toEqual([]);
+      } finally { gate.resolve(); await drain.catch(() => {}); }
+
+    } finally { gate.resolve(); await observeLifetime(mux).outcome; }
+  });
+
+  for (const atomic of [false, true]) {
+    test(`WSL-CURSOR-${atomic}: capture waits for ${atomic ? "atomic capture" : "legacy cursor"}`, async () => {
+      const gate = deferred();
+      let entered = false, drained = false;
+      const cursor = async () => { entered = true; await gate.promise; return null; };
+      const mux = new TmuxWsMux({
+        ownedLifetime: true, pollNormalMs: 60_000,
+        driver: lifetimeDriver(atomic
+          ? { captureWithCursor: async () => ({ content: "atomic", cursor: await cursor(), trailingBlanks: 0 }) }
+          : { getCursor: cursor }),
+      });
+    try {
+      mux.subscribe("owned", new FakeWS());
+      await until(() => entered);
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, `WSL-CURSOR-${atomic}`);
+        gate.resolve(); await drain;
+        expect(mux.getOwnedTaskInventory().tasks).toEqual([]);
+      } finally { gate.resolve(); await drain.catch(() => {}); }
+
+    } finally { gate.resolve(); await observeLifetime(mux).outcome; }
+  });
+  }
+
+  test("WSL-THENABLE: a lazy projected read executes exactly once under tracking", async () => {
+    let starts = 0;
+    const page = { lines: ["one"], startLine: 0, hasMore: false };
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, driver: lifetimeDriver(), pollNormalMs: 60_000,
+      projection: lifetimeProjection({ readBefore: () => ({ then: (resolve: (value: unknown) => void) => {
+        starts++; resolve(page);
+      } }) }),
+    });
+    try {
+      const ws = new FakeWS();
+      try {
+        mux.subscribe("owned", ws);
+        mux.expandHistory("owned", ws);
+        await until(() => ws.historyPages("owned").length === 1);
+        expect(ws.historyPages("owned")).toEqual([page]);
+        expect(starts).toBe(1);
+      } finally { await mux.quiesceAndDrain(); }
+
+    } finally {  await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-REJECTION: async hook and async disposer failures cannot become successful drain", async () => {
+    const hook = deferred(), off = deferred();
+    const hookFailure = new Error("hook flush failed"), offFailure = new Error("pipe close failed");
+    let entered = false;
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, driver: lifetimeDriver(), pollNormalMs: 60_000,
+      hooks: { onOutput: () => { entered = true; return hook.promise; } },
+      pipes: { startPipe: () => true, stopPipe: () => off.promise, handleRename: () => {} },
+    });
+    try {
+    mux.subscribe("owned", new FakeWS());
+    await until(() => entered);
+    const drain = mux.quiesceAndDrain();
+    void drain.catch(() => {}); // observe rejection at creation, including setup failures
+    const outcome = drain.catch(error => error);
+    hook.reject(hookFailure); off.reject(offFailure);
+    const error = await outcome;
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error.errors).toContain(hookFailure);
+    expect(error.errors).toContain(offFailure);
+    expect(mux.getOwnedTaskInventory().phase).toBe("failed");
+
+    } finally { hook.resolve(); off.resolve(); await observeLifetime(mux).outcome; }
+  });
+
+  for (const keysFirst of [true, false]) {
+    test(`WSL-INPUT-${keysFirst}: each remaining obligation blocks alone`, async () => {
+      const keys = deferred(), closed = deferred();
+      const entered: string[] = [], finished: string[] = [];
+      const mux = new TmuxWsMux({
+        ownedLifetime: true, driver: lifetimeDriver({ sendKeys: async () => {
+          entered.push("keys"); await keys.promise; finished.push("keys");
+        } }), hooks: { onSocketClose: async () => {
+          entered.push("close"); await closed.promise; finished.push("close");
+        } },
+      });
+      try {
+        const ws = new FakeWS();
+        mux.handleKeys("owned", "key", ws); mux.unsubscribeAll(ws);
+        expect(entered).toEqual(["keys", "close"]);
+        const observed = observeLifetime(mux);
+        (keysFirst ? keys : closed).resolve();
+        await until(() => finished.length === 1);
+        await lifetimeTurn();
+        assertLifetimeBlocked(observed.state.settled, keysFirst ? "WSL-SOCKET-CLOSE-BLOCKED" : "WSL-KEYS-BLOCKED");
+        expect(finished).toEqual([keysFirst ? "keys" : "close"]);
+        (keysFirst ? closed : keys).resolve();
+        expect((await observed.outcome).ok).toBe(true);
+        expect(finished).toEqual(keysFirst ? ["keys", "close"] : ["close", "keys"]);
+      } finally { keys.resolve(); closed.resolve(); await observeLifetime(mux).outcome; }
+    });
+  }
+
+  test("WSL-CLEANUP-FAILURE: all disposers run, rejection waits for other work and forbids host release", async () => {
+    const watch = deferred(), history = deferred<unknown>();
+    const failure = new Error("actual route disposer failed");
+    const called: string[] = [];
+    let released = false, settled = false;
+    let route: (session: string) => void = () => {};
+    let dirty: (session: string) => void = () => {};
+    let change: () => void = () => {};
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, driver: lifetimeDriver(), pollNormalMs: 60_000,
+      projection: lifetimeProjection({
+        watch: (_session, callback) => { change = callback; return () => { called.push("watch"); return watch.promise; }; },
+        onRouteChange: callback => { route = callback; return () => { called.push("route"); throw failure; }; },
+        onLegacyDirty: callback => { dirty = callback; return () => { called.push("dirty"); }; },
+        readBefore: () => history.promise,
+      }),
+    });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      mux.expandHistory("owned", ws);
+      const drain = mux.quiesceAndDrain();
+      void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      const outcome = drain.then(() => { released = true; settled = true; return null; }, error => { settled = true; return error; });
+      try {
+        expect(called).toEqual(["watch", "route", "dirty"]);
+        // Saved callbacks cannot create replacement producers even when off failed.
+        route("owned"); dirty("owned"); change();
+        await lifetimeTurn();
+        expect(settled).toBe(false);
+        watch.resolve();
+        await lifetimeTurn();
+        expect(settled).toBe(false);
+        history.resolve({ lines: [], startLine: null, hasMore: false });
+        const error = await outcome;
+        expect(error).toBeInstanceOf(AggregateError);
+        expect(error.errors).toContain(failure);
+        expect(released).toBe(false);
+        expect(mux.getOwnedTaskInventory().phase).toBe("failed");
+        expect(mux.getOwnedTaskInventory().retainedCleanups).toBe(1);
+        expect(mux.quiesceAndDrain()).toBe(drain);
+        expect(mux.getOwnedTaskInventory().tasks).toEqual([]);
+      } finally { watch.resolve(); history.resolve({}); await outcome; }
+
+    } finally { watch.resolve(); history.resolve({}); await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-PIPE: pipe teardown promise is awaited and saved callbacks are revoked", async () => {
+    const stop = deferred();
+    let data: (data: string) => void = () => {}, broken = () => {}, restarted = () => {};
+    let stops = 0, captures = 0, drained = false;
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, pollNormalMs: 60_000,
+      driver: lifetimeDriver({ capturePane: async () => { captures++; return "pipe-output"; } }),
+      pipes: {
+        startPipe: (_session, a, b, c) => { data = a; broken = b; restarted = c; return true; },
+        stopPipe: () => { stops++; return stop.promise; }, handleRename: () => {},
+      },
+    });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      await until(() => ws.outputFrames("owned").length === 1);
+      data("dirty"); // pending debounce is revoked synchronously
+      const drain = mux.quiesceAndDrain().then(() => { drained = true; }, error => { drained = true; throw error; });
+      void drain.catch(() => {}); // observe rejection at creation, including setup failures
+      try {
+        const before = captures;
+        data("late"); broken(); restarted();
+        await lifetimeTurn();
+        assertLifetimeBlocked(drained, "WSL-PIPE");
+        expect(stops).toBe(1);
+        expect(captures).toBe(before);
+        expect((mux as any).pipeDebounceTimers.size).toBe(0);
+        expect((mux as any).piped.size).toBe(0);
+        stop.resolve(); await drain;
+      } finally { stop.resolve(); await drain.catch(() => {}); }
+
+    } finally { stop.resolve(); await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-HANDLED-CAPTURE-DRAINS: active error wire and actual tail complete before drain", async () => {
+    const failure = new Error("pane read failed");
+    const logged: unknown[][] = [];
+    const mux = new TmuxWsMux({
+      ownedLifetime: true, pollNormalMs: 60_000, logError: (...args) => { logged.push(args); },
+      driver: lifetimeDriver({ capturePane: async () => { throw failure; } }),
+    });
+    try {
+      const ws = new FakeWS();
+      mux.subscribe("owned", ws);
+      const tail = (mux as any).queuedCaptureTails.get("owned") as Promise<void>;
+      expect(tail).toBeDefined(); await tail;
+      expect(ws.errorFrames("owned")).toHaveLength(1);
+      expect(logged.length).toBeGreaterThan(0);
+      expect(mux.getOwnedTaskInventory().phase).toBe("active");
+      await fulfilledLifetime(mux, "WSL-HANDLED-CAPTURE-DRAINS");
+      expect(mux.getOwnedTaskInventory().failures).toEqual([]);
+    } finally { await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-OUTPUT-HOOK-BLOCKED: late hook escapes capture tail; positive then loaded omission", async () => {
+    async function scenario(omit: boolean) {
+      const capture = deferred<string>(), hook = deferred();
+      const entered = deferred(), hookFinished = deferred();
+      const archived: string[] = [], durable: string[] = [];
+      let didEnter = false;
+      let tail: Promise<void> | undefined;
+      let observed: ReturnType<typeof observeLifetime> | undefined;
+      const mux = new TmuxWsMux({
+        ownedLifetime: true, driver: lifetimeDriver({ capturePane: () => capture.promise }), pollNormalMs: 60_000,
+        archive: {
+          ingestSnapshot: (_session, content) => { archived.push(content); return { liveContent: content }; },
+          readBefore: () => ({}), renameSession: () => {},
+        },
+        hooks: { onOutput: async (_session, frame) => {
+          didEnter = true; entered.resolve();
+          try { await hook.promise; durable.push(frame.data); } finally { hookFinished.resolve(); }
+        } },
+      });
+      const loaded = mux as any, original = loaded.trackOwnedTask;
+      try {
+        if (omit) loaded.trackOwnedTask = function(kind: string, result: unknown, ...rest: unknown[]) {
+          return kind === "hooks.onOutput" ? result : original.call(this, kind, result, ...rest);
+        };
+        const ws = new FakeWS();
+        mux.subscribe("owned", ws);
+        tail = loaded.queuedCaptureTails.get("owned");
+        expect(tail).toBeDefined();
+        mux.unsubscribeAll(ws);
+        observed = observeLifetime(mux);
+        await lifetimeTurn();
+        assertLifetimeBlocked(observed.state.settled, "WSL-CAPTURE-PENDING");
+        capture.resolve("late-durable-output");
+        await entered.promise;
+        await tail; // actual original chain ends; hook completion is independent
+        expect(archived).toEqual(["late-durable-output"]);
+        expect(durable).toEqual([]);
+        expect(ws.outputFrames("owned")).toEqual([]);
+        await lifetimeTurn();
+        assertLifetimeBlocked(observed.state.settled, "WSL-OUTPUT-HOOK-BLOCKED");
+        hook.resolve(); await hookFinished.promise;
+        expect((await observed.outcome).ok).toBe(true);
+        expect(durable).toEqual(["late-durable-output"]);
+      } finally {
+        try {
+          capture.resolve("cleanup"); hook.resolve();
+          await tail?.catch(() => {});
+          if (didEnter) await hookFinished.promise;
+          await (observed ?? observeLifetime(mux)).outcome;
+        } finally { loaded.trackOwnedTask = original; }
+      }
+    }
+    await scenario(false);
+    await expect(scenario(true)).rejects.toThrow("WSL-OUTPUT-HOOK-BLOCKED");
+  });
+
+  test("WSL-PIPE-RENAME: actual old-session rename completion is owned", async () => {
+    const gate = deferred();
+    const entered: string[] = [], finished: string[] = [];
+    const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver(), pipes: {
+      startPipe: () => true, stopPipe: () => {}, handleRename: async old => {
+        entered.push(old); await gate.promise; finished.push(old);
+      },
+    } });
+    try {
+      mux.handleSessionRename("owned", "renamed");
+      expect(entered).toEqual(["owned"]);
+      const observed = observeLifetime(mux);
+      await lifetimeTurn(); assertLifetimeBlocked(observed.state.settled, "WSL-PIPE-RENAME");
+      expect(finished).toEqual([]);
+      gate.resolve(); expect((await observed.outcome).ok).toBe(true);
+      expect(finished).toEqual(["owned"]);
+    } finally { gate.resolve(); await observeLifetime(mux).outcome; }
+  });
+
+  // Each fixture dispatches a real public callsite; only its selected void
+  // completion is held. Sync policies/factories never masquerade as async.
+  for (const channel of [
+    "driver.resizeWindow", "hooks.onClientInfo", "hooks.onSubscribe", "hooks.onUnsubscribe",
+    "hooks.onKeys", "hooks.onResizeTelemetry", "hooks.onBackpressure",
+    "archive.renameSession", "archive.dropSession", "projection.setViewers",
+    "projection.fullReady", "projection.noteResize", "socket.send", "socket.close",
+    "backpressure.close", "log", "logError",
+  ]) {
+    test(`WSL-CHANNEL-${channel}: public dispatch owns actual completion`, async () => {
+      const gate = deferred();
+      let entered = 0, finished = 0, armed = true;
+      const work = async () => { if (!armed) return; entered++; await gate.promise; finished++; };
+      const ws = new FakeWS();
+      const options: ConstructorParameters<typeof TmuxWsMux<FakeWS>>[0] = {
+        ownedLifetime: true, pollNormalMs: 60_000, driver: lifetimeDriver(), log: () => {}, logError: () => {},
+      };
+      let dispatch: (mux: TmuxWsMux<FakeWS>) => void = () => {};
+      let setup: (mux: TmuxWsMux<FakeWS>) => Promise<void> = async () => {};
+      switch (channel) {
+        case "driver.resizeWindow":
+          options.driver = lifetimeDriver({ resizeWindow: work }); dispatch = mux => { mux.applyGeometry("owned", 100, 30, ws); }; break;
+        case "hooks.onClientInfo":
+          options.hooks = { onClientInfo: work }; dispatch = mux => mux.handleMessage({ type: "client_info", client: {} }, ws); break;
+        case "hooks.onSubscribe":
+          options.hooks = { onSubscribe: work }; dispatch = mux => mux.subscribe("owned", ws); break;
+        case "hooks.onUnsubscribe":
+          options.hooks = { onUnsubscribe: work };
+          setup = async mux => { mux.subscribe("owned", ws); await idleLifetime(mux); };
+          dispatch = mux => mux.unsubscribe("owned", ws); break;
+        case "hooks.onKeys":
+          options.hooks = { onKeys: work }; dispatch = mux => mux.handleKeys("owned", "key", ws); break;
+        case "hooks.onResizeTelemetry":
+          options.hooks = { onResizeTelemetry: work }; dispatch = mux => mux.handleResize("owned", 100, 30, ws); break;
+        case "hooks.onBackpressure":
+          options.hooks = { onBackpressure: work }; ws.backpressuredSends = 1;
+          dispatch = mux => mux.subscribeSessions(ws); break;
+        case "archive.renameSession":
+          options.archive = { ingestSnapshot: (_s, content) => ({ liveContent: content }), readBefore: () => ({}), renameSession: work };
+          dispatch = mux => mux.handleSessionRename("owned", "renamed"); break;
+        case "archive.dropSession":
+          options.archive = { ingestSnapshot: (_s, content) => ({ liveContent: content }), readBefore: () => ({}), renameSession: () => {}, dropSession: work };
+          dispatch = mux => mux.invalidateSession("owned", { purgeArchive: true }); break;
+        case "projection.setViewers":
+          options.projection = lifetimeProjection({ setViewers: work }); dispatch = mux => mux.subscribe("owned", ws); break;
+        case "projection.fullReady":
+          options.projection = lifetimeProjection({ fullReady: work, snapshot: () => ({
+            content: "projected-durable", cursor: null, screen: null,
+            boundary: { generation: "generation", liveStartLine: 0, walSequence: "1", walOffset: 1 },
+            newarch: { v: "newarch-frame-v1", paneKey: { serverIdentity: "server", paneId: "%1", birthGeneration: 1 },
+              sourceEpoch: 1, geometryGeneration: 1, routeGeneration: 1, cols: 80, rows: 24,
+              revision: 1, durableRevision: 1, nextLineId: 1, liveStartLine: 0, displaySource: "pipe", degraded: false, markers: [] },
+          }) }); dispatch = mux => mux.subscribe("owned", ws); break;
+        case "projection.noteResize":
+          options.projection = lifetimeProjection({ noteResize: work }); dispatch = mux => { mux.applyGeometry("owned", 100, 30, ws); }; break;
+        case "socket.send":
+          options.compressFrames = true;
+          ws.send = ((...args: unknown[]) => { expect(args).toEqual(['{"type":"pong"}']); return work(); }) as any;
+          dispatch = mux => mux.handleMessage({ type: "ping" }, ws); break;
+        case "socket.close":
+          ws.close = work; ws.bufferedAmount = 100; ws.backpressuredSends = 1;
+          options.backpressure = { maxBufferedBytes: 1 };
+          dispatch = mux => mux.subscribeSessions(ws); break;
+        case "backpressure.close":
+          ws.bufferedAmount = 100; ws.backpressuredSends = 1;
+          options.backpressure = { maxBufferedBytes: 1, close: work };
+          dispatch = mux => mux.subscribeSessions(ws); break;
+        case "log": options.log = work; dispatch = mux => mux.subscribe("owned", ws); break;
+        case "logError":
+          options.logError = work; options.driver = lifetimeDriver({ sendKeys: () => { throw new Error("handled command"); } });
+          dispatch = mux => mux.handleKeys("owned", "key", ws); break;
+      }
+      const mux = new TmuxWsMux(options);
+      try {
+        await setup(mux); dispatch(mux);
+        expect(entered).toBe(1);
+        // Complete unrelated captures/replies, without using the ledger as the
+        // proof that the selected obligation entered or finished.
+        const tail = (mux as any).queuedCaptureTails.get("owned") as Promise<void> | undefined;
+        await tail; await lifetimeTurn();
+        expect(finished).toBe(0);
+        const observed = observeLifetime(mux);
+        await lifetimeTurn(); assertLifetimeBlocked(observed.state.settled, `WSL-CHANNEL-${channel}`);
+        gate.resolve();
+        const outcome = await observed.outcome;
+        // logError is a deliberately unfinished operational error handler at
+        // quiesce: its original command cause must become sticky.
+        expect(outcome.ok).toBe(channel !== "logError");
+        expect(finished).toBe(1);
+      } finally { armed = false; gate.resolve(); await observeLifetime(mux).outcome; }
+    });
+  }
+
+  for (const ownedLifetime of [undefined, false, true]) {
+    test(`WSL-PONG-PARITY-${ownedLifetime}: compressed mode still uses one raw pong argument`, async () => {
+      const calls: unknown[][] = [];
+      const mux = new TmuxWsMux({ driver: lifetimeDriver(), ownedLifetime, compressFrames: true });
+      const ws = new FakeWS();
+      try {
+        ws.send = ((...args: unknown[]) => { calls.push(args); return 15; }) as any;
+        mux.handleMessage({ type: "ping" }, ws);
+        expect(calls).toEqual([['{"type":"pong"}']]);
+      } finally { if (ownedLifetime) await observeLifetime(mux).outcome; else mux.stop(); }
+    });
+  }
+
+  for (const operation of ["keys", "resize", "cursor", "atomic-capture", "send", "caught-log", "caught-error-log", "archive-before", "archive-after", "archive-anchor"]) {
+    test(`WSL-HANDLED-${operation.toUpperCase()}-DRAINS: allowed active handler completes`, async () => {
+      const failure = new Error(`operational ${operation}`);
+      const logs: unknown[][] = [];
+      let entered = false;
+      const fail = () => { entered = true; throw failure; };
+      const options: ConstructorParameters<typeof TmuxWsMux<FakeWS>>[0] = {
+        ownedLifetime: true, pollNormalMs: 60_000, driver: lifetimeDriver(), logError: (...args) => { logs.push(args); },
+      };
+      if (operation === "keys") options.driver = lifetimeDriver({ sendKeys: fail });
+      if (operation === "resize") options.driver = lifetimeDriver({ resizeWindow: fail });
+      if (operation === "cursor") options.driver = lifetimeDriver({ getCursor: async () => fail() });
+      if (operation === "atomic-capture") options.driver = lifetimeDriver({ captureWithCursor: async () => fail() });
+      if (operation.startsWith("archive-")) options.archive = {
+        ingestSnapshot: (_s, content) => ({ liveContent: content }), renameSession: () => {},
+        readBefore: operation === "archive-before" ? fail : () => ({}),
+        readAfter: operation === "archive-after" ? fail : () => ({}),
+        liveStartLine: operation === "archive-anchor" ? fail : () => 0,
+      };
+      if (operation === "caught-error-log") {
+        options.archive = { ingestSnapshot: (_s, content) => ({ liveContent: content }), renameSession: () => {}, readBefore: () => { throw new Error("handled read"); } };
+        options.logError = fail;
+      }
+      if (operation === "caught-log") {
+        options.log = (...args) => { if (String(args[0]).includes("Pipe active")) fail(); else logs.push(args); };
+        options.pipes = { startPipe: () => true, stopPipe: () => {}, handleRename: () => {} };
+      }
+      const mux = new TmuxWsMux(options), ws = new FakeWS();
+      try {
+        if (operation === "keys") mux.handleKeys("owned", "key", ws);
+        else if (operation === "resize") mux.applyGeometry("owned", 100, 30, ws);
+        else if (operation === "send") { ws.send = fail; mux.handleMessage({ type: "ping" }, ws); }
+        else if (operation === "archive-after") mux.expandHistoryAfter("owned", ws, null);
+        else if (operation.startsWith("archive-") || operation === "caught-error-log") mux.expandHistory("owned", ws);
+        else mux.subscribe("owned", ws);
+        await idleLifetime(mux);
+        expect(entered).toBe(true);
+        if (["keys", "resize"].includes(operation)) expect(logs.length).toBeGreaterThan(0);
+        if (operation.startsWith("archive-") || operation === "caught-error-log") expect(ws.errorFrames("owned")[0].code).toBe("history_temporarily_unavailable");
+        if (operation === "atomic-capture") expect(ws.errorFrames("owned")).toHaveLength(1);
+        if (operation === "cursor") expect(ws.outputFrames("owned")[0].cursor).toBeNull();
+        if (operation === "caught-log") expect(ws.outputFrames("owned")).toHaveLength(1);
+        await fulfilledLifetime(mux, `WSL-HANDLED-${operation.toUpperCase()}-DRAINS`);
+      } finally { await observeLifetime(mux).outcome; }
+    });
+  }
+
+  for (const direction of ["before", "after"] as const) for (const asynchronous of [false, true]) {
+    test(`WSL-HANDLED-PROJECTED-${direction}-${asynchronous}-DRAINS`, async () => {
+      let entered = false;
+      const failure = new Error("projected read failed");
+      const read = () => { entered = true; if (asynchronous) return Promise.reject(failure); throw failure; };
+      const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver(), pollNormalMs: 60_000,
+        logError: () => {}, projection: lifetimeProjection({ readBefore: read, readAfter: read }),
+      });
+      try {
+        const ws = new FakeWS(); mux.subscribe("owned", ws);
+        if (direction === "before") mux.expandHistory("owned", ws); else mux.expandHistoryAfter("owned", ws, null);
+        await idleLifetime(mux);
+        expect(entered).toBe(true);
+        expect(ws.errorFrames("owned")[0].code).toBe("history_temporarily_unavailable");
+        await fulfilledLifetime(mux, `WSL-HANDLED-PROJECTED-${direction}-${asynchronous}-DRAINS`);
+      } finally { await observeLifetime(mux).outcome; }
+    });
+  }
+
+  for (const asynchronous of [false, true]) {
+    test(`WSL-HANDLED-V2-DRAINS-${asynchronous}: actual owner-unavailable reply completes`, async () => {
+      let entered = false;
+      const failure = new Error("v2 read failed");
+      const pane = { serverIdentity: "server", paneId: "%1", birthGeneration: 1 };
+      const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver(), logError: () => {},
+        newarchV2: () => ({ kind: "selected", pane: {
+          schema: "newarch-v2", session: { serverIdentity: "server", sessionId: "session" }, pane,
+          windowId: "window", owner: "capture-engine", birthOperationId: "birth", state: "active",
+          geometry: { policy: "fixed-at-birth", columns: 80, rows: 24, configVersion: "1", panesPerWindow: 1 },
+        } }),
+        newarchV2History: () => { entered = true; if (asynchronous) return Promise.reject(failure); throw failure; },
+      });
+      try {
+        const ws = new FakeWS();
+        mux.handleMessage({ type: "history_expand_v2", session: "owned", requestId: "request", request: {
+          schema: "newarch-v2", pane, cursor: null, direction: "before", maxEntries: 10, maxBytes: 4096,
+        } }, ws);
+        await idleLifetime(mux);
+        expect(entered).toBe(true);
+        expect(ws.allFrames()[0]).toMatchObject({ type: "history_v2", status: "error", code: "owner-unavailable", requestId: "request" });
+        await fulfilledLifetime(mux, "WSL-HANDLED-V2-DRAINS");
+      } finally { await observeLifetime(mux).outcome; }
+    });
+  }
+
+  for (const operation of ["capture", "history"] as const) {
+    test(`WSL-QUIESCE-FAILURE-STICKY-${operation}: reject after revoke waits for unrelated work`, async () => {
+      const read = deferred<any>(), other = deferred();
+      const failure = new Error(`late ${operation}`);
+      let entered = false, released = false;
+      const mux = new TmuxWsMux({ ownedLifetime: true, pollNormalMs: 60_000, logError: () => {},
+        driver: lifetimeDriver(operation === "capture" ? { capturePane: () => { entered = true; return read.promise; } } : {}),
+        projection: operation === "history" ? lifetimeProjection({ readBefore: () => { entered = true; return read.promise; } }) : undefined,
+        hooks: { onKeys: () => other.promise },
+      });
+      try {
+        const ws = new FakeWS(); mux.subscribe("owned", ws);
+        if (operation === "history") mux.expandHistory("owned", ws);
+        mux.handleKeys("owned", "key", ws);
+        expect(entered).toBe(true);
+        const observed = observeLifetime(mux);
+        void observed.drain.then(() => { released = true; }, () => {});
+        read.reject(failure); await lifetimeTurn();
+        assertLifetimeBlocked(observed.state.settled, "WSL-QUIESCE-FAILURE-STICKY");
+        other.resolve();
+        const outcome = await observed.outcome;
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) expect(outcome.error.errors).toContain(failure);
+        expect(released).toBe(false); expect(mux.quiesceAndDrain()).toBe(observed.drain);
+      } finally { read.resolve("cleanup"); other.resolve(); await observeLifetime(mux).outcome; }
+    });
+  }
+
+  for (const operation of ["ingest", "boundary", "output-sync", "output-async", "keys-async", "resize-async", "send-async", "log-async", "unknown", "socket-close", "custom-close", "socket-close-hook", "archive-rename", "archive-drop"]) {
+    test(`WSL-ACTIVE-${["ingest", "boundary"].includes(operation) ? "ARCHIVE" : operation.startsWith("output-") ? "OUTPUT" : "INTEGRITY"}-STICKY-${operation}: active handling never erases integrity/unhandled failures`, async () => {
+      const failure = new Error(`integrity ${operation}`);
+      let entered = false;
+      const fail = () => { entered = true; throw failure; };
+      const reject = () => { entered = true; return Promise.reject(failure); };
+      const options: ConstructorParameters<typeof TmuxWsMux<FakeWS>>[0] = {
+        ownedLifetime: true, driver: lifetimeDriver(), pollNormalMs: 60_000, logError: () => {},
+      };
+      if (operation === "ingest" || operation === "boundary") options.archive = {
+        ingestSnapshot: operation === "ingest" ? fail : (_s, content) => ({ liveContent: content }),
+        boundary: operation === "boundary" ? fail : undefined, readBefore: () => ({}), renameSession: () => {},
+      };
+      if (operation.startsWith("output-")) options.hooks = { onOutput: operation === "output-sync" ? fail : reject };
+      if (operation === "keys-async") options.driver = lifetimeDriver({ sendKeys: reject });
+      if (operation === "resize-async") options.driver = lifetimeDriver({ resizeWindow: reject });
+      if (operation === "log-async") options.log = reject;
+      if (operation === "unknown") options.driver = lifetimeDriver({ getHistoryLimit: fail });
+      if (operation === "socket-close-hook") options.hooks = { onSocketClose: reject };
+      if (operation === "custom-close") options.backpressure = { maxBufferedBytes: 1, close: reject };
+      if (operation === "socket-close") options.backpressure = { maxBufferedBytes: 1 };
+      if (operation.startsWith("archive-")) options.archive = {
+        ingestSnapshot: (_s, content) => ({ liveContent: content }), readBefore: () => ({}),
+        renameSession: operation === "archive-rename" ? reject : () => {}, dropSession: operation === "archive-drop" ? reject : undefined,
+      };
+      const mux = new TmuxWsMux(options), ws = new FakeWS();
+      try {
+        if (operation === "keys-async") mux.handleKeys("owned", "key", ws);
+        else if (operation === "resize-async") mux.applyGeometry("owned", 100, 30, ws);
+        else if (operation === "send-async") { ws.send = reject as any; mux.handleMessage({ type: "ping" }, ws); }
+        else if (operation === "socket-close-hook") mux.unsubscribeAll(ws);
+        else if (operation === "archive-rename") mux.handleSessionRename("owned", "renamed");
+        else if (operation === "archive-drop") mux.invalidateSession("owned", { purgeArchive: true });
+        else if (operation.endsWith("close")) {
+          if (operation === "socket-close") ws.close = reject;
+          ws.bufferedAmount = 100; ws.backpressuredSends = 1; mux.subscribeSessions(ws);
+        } else mux.subscribe("owned", ws);
+        await idleLifetime(mux); expect(entered).toBe(true);
+        expect(mux.getOwnedTaskInventory().phase).toBe("active");
+        const observed = observeLifetime(mux), outcome = await observed.outcome;
+        expect(outcome.ok).toBe(false);
+        if (!outcome.ok) expect(outcome.error.errors).toContain(failure);
+        expect(mux.quiesceAndDrain()).toBe(observed.drain);
+      } finally { await observeLifetime(mux).outcome; }
+    });
+  }
+
+  test("WSL-ACTIVE-CLEANUP-STICKY / WSL-MIXED-DISPOSITION: same Error, distinct invocations, retained closure", async () => {
+    const failure = new Error("shared cause identity");
+    const held = deferred(); let offs = 0, logs = 0, released = false;
+    const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver({ sendKeys: () => { throw failure; } }),
+      logError: () => { logs++; }, pollNormalMs: 60_000,
+      projection: lifetimeProjection({ watch: () => () => { offs++; throw failure; } }),
+      hooks: { onClientInfo: () => held.promise },
+    });
+    try {
+      const ws = new FakeWS(); mux.handleKeys("owned", "key", ws);
+      expect(logs).toBe(1); expect(mux.getOwnedTaskInventory().failures).toEqual([]);
+      mux.subscribe("owned", ws); mux.unsubscribe("owned", ws);
+      expect(offs).toBe(1); expect(mux.getOwnedTaskInventory().retainedCleanups).toBe(1);
+      mux.handleMessage({ type: "client_info", client: {} }, ws);
+      const observed = observeLifetime(mux);
+      void observed.drain.then(() => { released = true; }, () => {});
+      await lifetimeTurn(); assertLifetimeBlocked(observed.state.settled, "WSL-MIXED-DISPOSITION");
+      held.resolve(); const outcome = await observed.outcome;
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.error.errors).toContain(failure);
+      expect(released).toBe(false); expect(offs).toBe(1);
+      expect(mux.getOwnedTaskInventory().retainedCleanups).toBe(1);
+    } finally { held.resolve(); await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-HANDLED-NESTED-SYNC-DRAINS: completed nested best-effort handler has no artificial phase race", async () => {
+    const failure = new Error("handled archive read"), loggerFailure = new Error("handled logger");
+    let read = false, logged = false;
+    const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver(),
+      archive: { ingestSnapshot: (_s, content) => ({ liveContent: content }), renameSession: () => {},
+        readBefore: () => { read = true; throw failure; } },
+      logError: () => { logged = true; throw loggerFailure; },
+    });
+    try {
+      const ws = new FakeWS(); mux.expandHistory("owned", ws);
+      expect(read).toBe(true); expect(logged).toBe(true);
+      expect(ws.errorFrames("owned")[0].code).toBe("history_temporarily_unavailable");
+      // No setup await/turn: both real handlers already finished synchronously.
+      await fulfilledLifetime(mux, "WSL-HANDLED-NESTED-SYNC-DRAINS");
+      expect(mux.getOwnedTaskInventory().failures).toEqual([]);
+    } finally { await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-HANDLER-PHASE-RACE: read rejects active but returned error handling overlaps quiesce", async () => {
+    const handled = deferred();
+    const failure = new Error("active read, unfinished handler");
+    let entered = false, finished = false;
+    const mux = new TmuxWsMux({ ownedLifetime: true, pollNormalMs: 60_000,
+      driver: lifetimeDriver({ capturePane: async () => { throw failure; } }),
+      logError: async () => { entered = true; await handled.promise; finished = true; },
+    });
+    try {
+      const ws = new FakeWS(); mux.subscribe("owned", ws);
+      const tail = (mux as any).queuedCaptureTails.get("owned");
+      await tail; expect(entered).toBe(true);
+      expect(ws.errorFrames("owned")).toHaveLength(1);
+      expect(mux.getOwnedTaskInventory().phase).toBe("active");
+      const observed = observeLifetime(mux);
+      await lifetimeTurn(); assertLifetimeBlocked(observed.state.settled, "WSL-HANDLER-PHASE-RACE");
+      expect(finished).toBe(false);
+      handled.resolve(); const result = await observed.outcome;
+      expect(finished).toBe(true); expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.errors).toContain(failure);
+    } finally { handled.resolve(); await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-TYPED-REFUSAL: protocol refusal is a successful dispatch, not a rejected task", async () => {
+    let selected = false;
+    const pane = { serverIdentity: "server", paneId: "%1", birthGeneration: 1 };
+    const mux = new TmuxWsMux({ ownedLifetime: true, driver: lifetimeDriver(),
+      newarchV2: () => { selected = true; return { kind: "owner-unavailable", retryAfterMs: 1000 }; },
+      newarchV2History: () => { throw new Error("must not read unavailable owner"); },
+    });
+    try {
+      const ws = new FakeWS();
+      mux.handleMessage({ type: "history_expand_v2", session: "owned", requestId: "request", request: {
+        schema: "newarch-v2", pane, cursor: null, direction: "before", maxEntries: 10, maxBytes: 4096,
+      } }, ws);
+      expect(selected).toBe(true);
+      expect(ws.allFrames()[0]).toMatchObject({ status: "error", code: "owner-unavailable" });
+      await fulfilledLifetime(mux, "WSL-TYPED-REFUSAL");
+    } finally { await observeLifetime(mux).outcome; }
+  });
+
+  test("WSL-FAILURES-BOUNDED: 64 original records plus overflow; no operational accumulation or disposer cap", async () => {
+    const first = new Error("first original sticky cause");
+    let operational = 0, sticky = 0, offs = 0;
+    const mux = new TmuxWsMux({ ownedLifetime: true, pollNormalMs: 60_000,
+      driver: lifetimeDriver({ sendKeys: () => { operational++; throw new Error("handled"); } }), logError: () => {},
+      hooks: { onOutput: () => { if (++sticky === 1) throw first; throw new Error(`hook-${sticky}`); } },
+      projection: lifetimeProjection({ owns: session => session.startsWith("cleanup-"), watch: () => () => { offs++; throw new Error("off"); } }),
+    });
+    try {
+      const ws = new FakeWS();
+      for (let n = 0; n < 100; n++) mux.handleKeys("owned", "key", ws);
+      expect(operational).toBe(100); expect(mux.getOwnedTaskInventory().failures).toEqual([]);
+      for (let n = 0; n < 80; n++) {
+        const viewer = new FakeWS(); mux.subscribe(`owned-${n}`, viewer);
+        await idleLifetime(mux);
+        mux.subscribe(`cleanup-${n}`, new FakeWS());
+      }
+      expect(sticky).toBe(80);
+      const failures = mux.getOwnedTaskInventory().failures;
+      expect(failures).toHaveLength(65); expect(failures[0].cause).toBe(first);
+      expect(failures[64].kind).toBe("failures.overflow"); expect(failures[64].cause).toBeInstanceOf(Error);
+      const observed = observeLifetime(mux), outcome = await observed.outcome;
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.error.errors).toContain(first);
+      expect(mux.quiesceAndDrain()).toBe(observed.drain);
+      expect(mux.getOwnedTaskInventory().tasks).toEqual([]);
+      // Every real watch closure remains retained, independently of record cap.
+      expect(offs).toBe(80); expect(mux.getOwnedTaskInventory().retainedCleanups).toBe(80);
+    } finally { await observeLifetime(mux).outcome; }
+  });
+
+  test("legacy absent/false: no ledger or dependency wrappers, stop then reconnect still resumes", async () => {
+    for (const ownedLifetime of [undefined, false]) {
+      let captures = 0;
+      const driver = lifetimeDriver({ capturePane: async () => `legacy-${++captures}` });
+      const mux = new TmuxWsMux({ driver, ownedLifetime, pollNormalMs: 60_000 });
+      const ws = new FakeWS();
+      try {
+        expect((mux as any).owned).toBeNull();
+        expect((mux as any).driver).toBe(driver);
+        expect(mux.getOwnedTaskInventory().phase).toBe("legacy");
+        await expect(mux.quiesceAndDrain()).rejects.toThrow("ownedLifetime must be enabled at construction");
+        mux.subscribe("owned", ws);
+        await until(() => ws.outputFrames("owned").length > 0);
+        mux.stop();
+        expect((mux as any).interval).toBeNull();
+        const before = captures;
+        mux.unsubscribeAll(ws);
+        const fresh = new FakeWS();
+        mux.subscribe("owned", fresh);
+        await until(() => fresh.outputFrames("owned").length > 0 && captures > before);
+        expect(fresh.outputFrames("owned")[0].data).toBe(`legacy-${captures}`);
+        expect((mux as any).interval).not.toBeNull();
+        expect((mux as any).owned).toBeNull();
+      } finally { mux.stop(); }
+    }
   });
 });

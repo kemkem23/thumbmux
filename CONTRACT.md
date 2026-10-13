@@ -487,3 +487,124 @@ lockfile remain outside it.
   Hosts may set `cookieName` explicitly now. `server/tests/token-guard.test.ts`
   pins the current default; the documented-default rule makes an earlier change
   breaking.
+
+
+## Opt-in owned mux lifetime (WS-LIFETIME)
+
+`new TmuxWsMux({ ...options, ownedLifetime: true })` opts in **before the first
+producer or dispatch**. `quiesceAndDrain(): Promise<void>` is a terminal barrier;
+`getOwnedTaskInventory(): MuxOwnedTaskInventory` is a copied diagnostic snapshot,
+not an idle certificate. The existing `thumbmux/server` barrel exports this API.
+No extra import, task ledger, dependency proxy or drain promise is created when
+`ownedLifetime` is absent or false. A legacy instance rejects a drain request
+without changing its state: work that was never tracked cannot be certified
+retroactively.
+
+Calling the barrier synchronously revokes new public dispatch (including direct
+subscribe, input, resize, history, list, reset, rename and backpressure entry
+points), timer scheduling, saved pipe callbacks and projection notifications.
+It cancels timers and invokes every owned dirty-pipe/watch/route/dirty disposer,
+even if another disposer fails. A disposer must synchronously revoke its producer;
+it may return a promise for completion. The mux guards saved callbacks as well.
+Network sends are suppressed after revocation. Already admitted captures keep
+their archive/output-hook work; closing the last viewer in owned mode detaches
+that viewer but retains an in-flight capture's lifecycle through its queued
+successors, then drops its unused state. Explicit session invalidation still
+revokes the old session identity. Reconnects never receive frames on the old
+socket.
+
+Drain awaits a separate ledger of actual promises to a fixed point: capture
+queues and successors (including archive-boundary/geometry requeues), complete
+poll continuations, projected before/after history replies, v2 history reads and
+replies, returned async driver/input/hook/socket operations, and disposer
+completion. The ledger is independent of subscription/capture-tail maps. Tasks
+registered by admitted continuations during draining are included. There is no
+timeout success, snapshot-count success, or caller-provided `drained` proof.
+An unresolved dependency keeps the barrier pending.
+
+Owned dependency wrappers preserve method receivers and normalize a returned
+thenable once. A void hook/driver/disposer that starts async work must **return
+its completion promise**, including all its child work. Detached work, external
+host pollers, retention lanes, journal flushes whose hooks return only a boolean,
+listener/request registries, DB handles, locks, provider processes and durable
+collectors remain the host owner's responsibility. Value-returning policy,
+archive ingest/boundary, projection snapshot/selection and geometry contracts
+remain synchronous; this option does not turn those contracts into async APIs.
+The option must not be used to certify opaque fire-and-forget adapters.
+
+Task ownership and error disposition are independent. Every admitted promise
+is joined, including a rejected raw read and its handling continuation. Only
+these **individual invocations** may finish as handled operational errors, and
+only after their established handler/fallback and returned handling work have
+completed while the owned phase is still `active`:
+
+| Invocation | Required existing handling |
+|---|---|
+| `driver.capturePane/captureWithCursor` | Capture error wire/log; the read supplied no snapshot to persist |
+| `driver.getCursor` | Null-cursor fallback; the remaining content/archive pipeline is still owned |
+| Projected `readBefore/readAfter`, v2 history reader | Retryable/owner-unavailable reply or completed stale-consumer discard |
+| Synchronous archive `readBefore/readAfter/liveStartLine` | Retryable history reply |
+| Synchronous `driver.sendKeys/resizeWindow` throw | Existing command error log/reply finishes |
+| Synchronous socket send or log/logError throw | Explicit callsite best-effort/drop handler finishes |
+
+This is not a general exemption for drivers, catches, telemetry, or work admitted
+while active. Returned async rejection of a void command, send, or logger has
+no equivalent synchronous handler and remains sticky. If the error or any of
+its returned handling work completes after quiesce begins, the original cause
+is sticky even if admission/rejection happened earlier. A successful typed
+protocol refusal is not itself a task rejection. Disposition uses a private
+per-invocation ticket; reusing the same Error object in another operation cannot
+clear that operation's failure. No public caller-proof override is accepted.
+
+Archive ingest, boundary validation, rename/drop, `onOutput` (including journal
+writers), all cleanup/disposers, default/custom socket close, `onSocketClose`,
+and unknown/unhandled failures are **always sticky**, even when active and
+caught/logged. A later retry cannot certify that the earlier snapshot was
+persisted. These guarantees preserve the history integrity barrier; host
+journals/collectors whose adapters do not return completion are still host work.
+
+Sticky diagnostics retain the first **64 records**, then one `failures.overflow`
+sentinel with an Error cause (at most 65 records); subsequent causes are not
+accumulated. This bounds record count, not arbitrary Error byte size. The first
+original cause is preserved; duplicate owning boundaries may record it more
+than once. Overflow still rejects. Actual pending tasks and failed disposer
+closures are never truncated to meet this diagnostic cap.
+
+Drain joins all remaining work before rejecting with `AggregateError` and phase
+`failed`. Failed teardown closures remain retained (`retainedCleanups`); cleanup
+attempts every owner. A repeated drain returns the **same** promise, does not
+clear failures or retry into success. The host must retain its DB/lock and
+resource ownership on rejection. Neither a closed socket, an empty task list,
+nor inspection of failure kinds permits release. On success the phase is
+`drained`; construct a new instance for the next owned generation.
+
+For callers with no opt-in, `stop(): void`, subscription/reconnect resume,
+protocol frames, hook isolation and default producer behavior retain their
+previous semantics. On an **owned** instance `stop()` starts terminal revocation
+but remains void; callers must await `quiesceAndDrain()` to obtain the result.
+`handleDrain(ws)` remains a backpressure callback, never a lifetime barrier.
+Calling `quiesceAndDrain()` without opt-in rejects and leaves the legacy mux
+usable; it is not a successful no-op. Revoked owned sends return `0` without
+sending and `isBackpressured(ws)` returns `true`: terminal admission signals,
+not a resumable socket backlog. No public call can restart owned producers.
+Pong keeps the raw one-argument `ws.send('{"type":"pong"}')` shape even with
+`compressFrames: true`, in legacy and owned modes; owned mode additionally
+joins a returned send completion. Default/false mode retains the original
+dependency identity and creates no owned ledger, wrappers or tracking reactions.
+
+`WS-PROXY-REFLECTION` is a deferred maintainer concern: owned wrappers preserve
+receivers and dynamic method lookup but do not promise `in`, spread/ownKeys,
+property-descriptor reflection, or stable method identity. The Proxy target
+remains separate from the dependency. A future fix must cover original
+receivers, frozen dependencies, and dynamic replacement together. Release
+manifest/public-surface accounting belongs to P before PUB/R-PIN; this change
+alone does not certify that release gate.
+
+The package neither closes host DB/locks nor retires long-lived collectors.
+For restart/off the host must stop its own ingress/producers, await this barrier
+and all host work, close the old host, then release its old DB/lock while keeping
+the verified pane/provider/collector available for adoption. Final retirement
+additionally waits for the actual owners of those resources. These are distinct
+host lifecycles; package drain alone is not a host handoff receipt or ON proof.
+Release metadata, public artifact provenance, consumer pins, host wiring and
+installed-runtime verification must follow in their owning lots.

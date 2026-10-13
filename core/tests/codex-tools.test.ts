@@ -476,7 +476,7 @@ describe('Codex completed tool detector', () => {
   test('collapses real Waited multiline prompt with internal empty lines and soft-wrapped rows into a single block (fixture 174-190)', () => {
     const fixture174to190 = [
       '',
-      "\x1b[1m• Waited for background terminal\x1b[0;2m · /home/kemkem23/kemcortex/topics/hs-server/.agents/skills/exec/exec.sh codex luna 'Resume the same direct Campaign 5 Fix1 evidence and idempotency review. Root\x1b[0m",
+      "\x1b[1m• Waited for background terminal\x1b[0;2m · /work/fixtures/example-project/session123/.agents/skills/exec/exec.sh codex luna 'Resume the same direct Campaign 5 Fix1 evidence and idempotency review. Root\x1b[0m",
       '\x1b[2morchestration is satisfied. Direct local exec_command for read-only checks and apply_patch for your report/receipt are permitted. Do not call exec skill, LLMs, agents, delegation, tmux, remote,\x1b[0m',
       '\x1b[2mnetwork, or read AGENTS.md/fleet.md.\x1b[0m',
       '',
@@ -490,7 +490,7 @@ describe('Codex completed tool detector', () => {
       '\x1b[2m.claude/reports/campaign-5-cfix7-s7-fix1-review-evidence-idempotency-20260903.md mode 0600 and atomically finalize existing receipt mode 0600 with exact counts and hashes. LGTM only P0=0\x1b[0m',
       '\x1b[2mP1=0.\x1b[0m',
       "\x1b[2mEnd exactly: C5_S7_FIX1_REVIEW_EVIDENCE <LGTM|CHANGES_REQUIRED|BLOCKED> P0=<n> P1=<n> P2=<n> hash=84b05f612863 live_mutated=no next=<BATCH_RECONCILE|FIX_LOOP>.' --resume\x1b[0m",
-      '\x1b[2m01a066c5-aecd-7210-98e7-d650865e34f4 --cd /tmp --add-dir /home/kemkem23/kemcortex/topics/hs-server --write --yolo --effort max --timeout 900 --quiet\x1b[0m',
+      '\x1b[2m01a066c5-aecd-7210-98e7-d650865e34f4 --cd /tmp --add-dir /work/fixtures/example-project/session123 --write --yolo --effort max --timeout 900 --quiet\x1b[0m',
       '',
     ];
 
@@ -515,7 +515,7 @@ describe('Codex completed tool detector', () => {
   test('collapses Waited block even when SGR faint is reset at the end of row [183] before row [184]', () => {
     const fixture174to190 = [
       '',
-      "\x1b[1m• Waited for background terminal\x1b[0;2m · /home/kemkem23/kemcortex/topics/hs-server/.agents/skills/exec/exec.sh codex luna 'Resume the same direct Campaign 5 Fix1 evidence and idempotency review. Root\x1b[0m",
+      "\x1b[1m• Waited for background terminal\x1b[0;2m · /work/fixtures/example-project/session123/.agents/skills/exec/exec.sh codex luna 'Resume the same direct Campaign 5 Fix1 evidence and idempotency review. Root\x1b[0m",
       '\x1b[2morchestration is satisfied. Direct local exec_command for read-only checks and apply_patch for your report/receipt are permitted. Do not call exec skill, LLMs, agents, delegation, tmux, remote,\x1b[0m',
       '\x1b[2mnetwork, or read AGENTS.md/fleet.md.\x1b[0m',
       '',
@@ -531,7 +531,7 @@ describe('Codex completed tool detector', () => {
       '\x1b[2m.claude/reports/campaign-5-cfix7-s7-fix1-review-evidence-idempotency-20260903.md mode 0600 and atomically finalize existing receipt mode 0600 with exact counts and hashes. LGTM only P0=0\x1b[0m',
       '\x1b[2mP1=0.\x1b[0m',
       "\x1b[2mEnd exactly: C5_S7_FIX1_REVIEW_EVIDENCE <LGTM|CHANGES_REQUIRED|BLOCKED> P0=<n> P1=<n> P2=<n> hash=84b05f612863 live_mutated=no next=<BATCH_RECONCILE|FIX_LOOP>.' --resume\x1b[0m",
-      '\x1b[2m01a066c5-aecd-7210-98e7-d650865e34f4 --cd /tmp --add-dir /home/kemkem23/kemcortex/topics/hs-server --write --yolo --effort max --timeout 900 --quiet\x1b[0m',
+      '\x1b[2m01a066c5-aecd-7210-98e7-d650865e34f4 --cd /tmp --add-dir /work/fixtures/example-project/session123 --write --yolo --effort max --timeout 900 --quiet\x1b[0m',
       '',
     ];
 

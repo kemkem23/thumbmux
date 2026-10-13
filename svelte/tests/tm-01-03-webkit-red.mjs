@@ -18,12 +18,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Prefer brain-ui's Playwright (1.58.x → webkit-2248). thumbmux pins 1.61
-// which wants webkit-2311 (not installed on this host).
-const require = createRequire(
-  process.env.PLAYWRIGHT_FROM
-    ?? "/home/kemkem23/kemcortex/cortex-orchestrator/brain-ui/package.json",
-);
+// Resolve package-local Playwright by default; callers may select another installation.
+const require = createRequire(process.env.PLAYWRIGHT_FROM ?? import.meta.url);
 const { webkit, devices } = require("@playwright/test");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -296,7 +292,7 @@ try {
   const { findings: dom, log } = await webkitDomContracts(browser);
   const all = [...src, ...dom];
   let failed = 0;
-  console.log("=== TM-01/02/03 WebKit iPhone 13 probe (webkit-2248) ===");
+  console.log("=== TM-01/02/03 WebKit iPhone 13 probe ===");
   for (const f of all) {
     const mark = f.ok ? "PASS" : "FAIL";
     if (!f.ok) failed += 1;

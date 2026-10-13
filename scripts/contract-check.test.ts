@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import ts from "typescript";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { prepareReleasePackage } from "./prepare-release-package";
 import { assertReleaseVersion } from "./check-release-version";
 import {
   assertRuntimeDisplayExport,
@@ -1570,13 +1573,14 @@ class LegacyOverride extends TmuxWsMux {
 `;
 
 function pArtifactFixture(): string {
-  const root = fixture("0.22.0");
+  const root = fixture("0.23.0");
   const packageRoot = resolve(import.meta.dir, "..");
   cpSync(join(packageRoot, "git-dist"), join(root, "git-dist"), { recursive: true });
+  cpSync(join(packageRoot, "contract/manifest"), join(root, "contract/manifest"), { recursive: true });
   const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
   // Match the release map transformation, using the actual public map as input.
   const exports = JSON.parse(JSON.stringify(pkg.exports).replace(/\.\/([^/" ]+)\/dist\//g, "./git-dist/$1/"));
-  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "thumbmux", type: "module", version: "0.22.0", exports }));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ name: "thumbmux", type: "module", version: pkg.version, exports }));
   return root;
 }
 
@@ -1679,12 +1683,12 @@ describe("P runtime barrel and dual consumer guards", () => {
   });
 });
 
-describe("P 0.22 release metadata and WJ manifests", () => {
+describe("P 0.23 release metadata and WJ manifests", () => {
   const packageRoot = resolve(import.meta.dir, "..");
   const releaseManifests = ["package.json", "core/package.json", "server/package.json", "svelte/package.json", "app/package.json"];
 
-  test("the five releases are .22, demo stays private .1, source export layout stays intact", () => {
-    expect(assertReleaseVersion("v0.22.0", packageRoot)).toBe("0.22.0");
+  test("the five releases are .23, demo stays private .1, source export layout stays intact", () => {
+    expect(assertReleaseVersion("v0.23.0", packageRoot)).toBe("0.23.0");
     const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
     expect(pkg.private).toBe(true);
     expect(pkg.exports["./pipe-history-runtime"]).toEqual({
@@ -1696,18 +1700,18 @@ describe("P 0.22 release metadata and WJ manifests", () => {
 
   test("every wrong package version and every wrong internal range is rejected separately", () => {
     for (const path of releaseManifests) {
-      const root = fixture("0.22.0");
+      const root = fixture("0.23.0");
       for (const manifest of releaseManifests) {
         mkdirSync(resolve(root, manifest, ".."), { recursive: true });
         cpSync(join(packageRoot, manifest), join(root, manifest));
       }
       const current = JSON.parse(readFileSync(join(root, path), "utf8"));
       writeFileSync(join(root, path), JSON.stringify({ ...current, version: "0.21.0" }));
-      expect(() => assertReleaseVersion("v0.22.0", root)).toThrow(`${path}: version 0.21.0 != 0.22.0`);
+      expect(() => assertReleaseVersion("v0.23.0", root)).toThrow(`${path}: version 0.21.0 != 0.23.0`);
       writeFileSync(join(root, path), JSON.stringify(current));
       for (const key of Object.keys(current.dependencies ?? {}).filter((name) => name.startsWith("@thumbmux/"))) {
         writeFileSync(join(root, path), JSON.stringify({ ...current, dependencies: { ...current.dependencies, [key]: "^0.21.0" } }));
-        expect(() => assertReleaseVersion("v0.22.0", root)).toThrow(`${path}: ${key}`);
+        expect(() => assertReleaseVersion("v0.23.0", root)).toThrow(`${path}: ${key}`);
         writeFileSync(join(root, path), JSON.stringify(current));
       }
     }
@@ -1743,7 +1747,7 @@ describe("P 0.22 release metadata and WJ manifests", () => {
 });
 
 test("P release checkContract requires a baseline before reading current artifacts", () => {
-  expect(() => checkContract({ packageRoot: fixture("0.22.0") })).toThrow("immutable baseline");
+  expect(() => checkContract({ packageRoot: fixture("0.23.0") })).toThrow("immutable baseline");
 });
 
 // P amendment: independent literal oracle from immutable .20.5/.21 and
@@ -1826,6 +1830,87 @@ const P_AMENDED_MANIFEST_ROWS = [
   ["app", "ThumbmuxApp", "component", "S", "071191bd20d7c304b10c7dfecec48e8b5ab638d794bab611fe127199e0f8242f"],
 ] as const;
 
+// P2: literal .23 inventory from emitted declarations, independent of the
+// exception table; the .22 P_AMENDED_MANIFEST_ROWS above remains historical.
+const P2_WS_MANIFEST_ROWS = [
+  [
+    "server",
+    "AppRoutes",
+    "type",
+    "S",
+    "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d"
+  ],
+  [
+    "server",
+    "AppRoutesOptions",
+    "type",
+    "S",
+    "288eab3b125ab2ea77ac0a35f6eac6dc00fdcbb36fe22d7409bb380685fdd5d8"
+  ],
+  [
+    "server",
+    "createAppRoutes",
+    "value",
+    "S",
+    "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d"
+  ],
+  [
+    "server",
+    "MuxOwnedTaskInventory",
+    "type",
+    "S",
+    "69e64d185e85ccdd57ecd17cbeebd79b251108a3b087095b7badf3340837f82f"
+  ],
+  [
+    "server",
+    "TmuxWsMux",
+    "value",
+    "F",
+    "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4"
+  ],
+  [
+    "server",
+    "TmuxWsMuxOptions",
+    "type",
+    "F",
+    "ae588b37c27bd91afbbc3ba3920d21bfbe872860bf411b5b6b1813981545d947"
+  ]
+] as const;
+
+// Only these three class-graph changes lack structural optional-addition proof.
+const P2_WS_SIGNATURES = [
+  [
+    "0.22.0",
+    "server",
+    "AppRoutes",
+    "type",
+    "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+    "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d",
+    "5dea581f65f6b4a5d633d4ea4ee3ea6deb29cd4a085978c2eb09d7078b870962",
+    "faed5511bfccc48eb9d48aa38b78982c6a839dc2228d5166adb05152968e4c5d"
+  ],
+  [
+    "0.22.0",
+    "server",
+    "createAppRoutes",
+    "value",
+    "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+    "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d",
+    "5734a338d1cd7c00bd7d43881dd87bbe220f4402e86699ace520d36ad772b24c",
+    "4d7d7fae77e6d4e55d43a8c0ccc2154a8718a2c43fc0df8a7fcd5915fb573b4d"
+  ],
+  [
+    "0.22.0",
+    "server",
+    "TmuxWsMux",
+    "value",
+    "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+    "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4",
+    "6967c1491b7646b30887d2d25e27ce303f53c0ec5322d2cb0ce9f609e92bebfa",
+    "393bf02df2002885a3145174dc7871361e59c059b20c38da8e2851e9bacc28d4"
+  ]
+] as const;
+
 function pReleaseComparison(row: readonly string[], change: {
   from?: string; to?: string; subpath?: "core" | "server" | "svelte" | "app";
   name?: string; oldSignature?: string; newSignature?: string;
@@ -1870,10 +1955,23 @@ describe("P exact .20.5/.21 to .22 artifact signatures", () => {
     });
   }
 
-  test("every individually authorized manifest row has its declared kind, tier and artifact digest", () => {
+  test("historical .22 fixture retains the emitted digests used by its exact exceptions", () => {
+    for (const [, subpath, name, kind, , signature] of P_RELEASE_SIGNATURES) {
+      const historical = P_AMENDED_MANIFEST_ROWS.find(row => row[0] === subpath && row[1] === name);
+      expect(historical).toBeDefined();
+      expect(historical![2]).toBe(kind);
+      expect(historical![4]).toBe(signature);
+    }
+  });
+
+  test("current .23 inventory preserves historical names/tiers and uses current artifact digests", () => {
     const root = resolve(import.meta.dir, "..");
     const live = deriveGitDistReport(root);
-    for (const [subpath, name, kind, tier, signature] of P_AMENDED_MANIFEST_ROWS) {
+    const currentRows = [
+      ...P_AMENDED_MANIFEST_ROWS.filter(row => !P2_WS_MANIFEST_ROWS.some(next => next[0] === row[0] && next[1] === row[1])),
+      ...P2_WS_MANIFEST_ROWS,
+    ];
+    for (const [subpath, name, kind, tier, signature] of currentRows) {
       const entries = JSON.parse(readFileSync(join(root, `contract/manifest/${subpath}.json`), "utf8")) as ContractEntry[];
       expect(entries.find((entry) => entry.name === name)).toEqual({ name, kind, tier, signature });
       expect(live[subpath].find((entry) => entry.name === name)).toMatchObject({ name, kind, signature });
@@ -1903,5 +2001,539 @@ describe("P exact .20.5/.21 to .22 artifact signatures", () => {
     const errors = pCompileConsumer(consumer, { "thumbmux/server": resolve(import.meta.dir, "../git-dist/server/index.d.ts") });
     expect(errors.map((error) => error.code)).toEqual([2345]);
     expect(errors[0]!.text).toContain("history_expand_v2");
+  });
+});
+
+// P2 tests are for the separately reviewed runner. No tmux, host DB, browser,
+// installed workspace alias or WS task/failure harness is used here (A3 owns it).
+const P2_WS_CONSUMER = `
+import { TmuxWsMux, type TmuxWsMuxOptions, type MuxOwnedTaskInventory } from "thumbmux/server";
+declare const driver: TmuxWsMuxOptions["driver"];
+const absent: TmuxWsMuxOptions = { driver };
+const disabled: TmuxWsMuxOptions = { driver, ownedLifetime: false };
+const owned: TmuxWsMuxOptions = { driver, ownedLifetime: true };
+const mux = new TmuxWsMux(owned);
+const drain: Promise<void> = mux.quiesceAndDrain();
+const inventory: MuxOwnedTaskInventory = mux.getOwnedTaskInventory();
+const phase: "legacy" | "active" | "quiescing" | "drained" | "failed" = inventory.phase;
+const tasks: readonly { kind: string }[] = inventory.tasks;
+const failures: readonly { kind: string; cause: unknown }[] = inventory.failures;
+const retained: number = inventory.retainedCleanups;
+const legacyStop: void = new TmuxWsMux(absent).stop();
+const falseStop: void = new TmuxWsMux(disabled).stop();
+void [drain, phase, tasks, failures, retained, legacyStop, falseStop];
+`;
+
+function p2CompilePublic(root: string, source = P2_WS_CONSUMER) {
+  const entry = join(root, "consumer.ts");
+  // The real package export map resolves the import; no TS paths alias.
+  writeFileSync(entry, source);
+  const options: ts.CompilerOptions = {
+    strict: true, noEmit: true, skipLibCheck: true, types: [],
+    target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+  };
+  const resolution = ts.resolveModuleName("thumbmux/server", entry, options, ts.sys)
+    .resolvedModule?.resolvedFileName;
+  const errors = ts.getPreEmitDiagnostics(ts.createProgram([entry], options)).map(d => ({
+    code: d.code, text: ts.flattenDiagnosticMessageText(d.messageText, "\n"),
+  }));
+  return { resolution, errors };
+}
+
+function p2AssertPublicTypes(root: string) {
+  const result = p2CompilePublic(root);
+  expect(result.resolution).toBe(join(root, "git-dist/server/index.d.ts"));
+  expect(result.errors).toEqual([]);
+}
+
+function p2WsRuntime(root: string) {
+  const script = `
+    import { mock } from "bun:test";
+    import * as child from "node:child_process";
+    import * as fs from "node:fs";
+    const forbidden = () => { throw Error("P2 forbidden host effect"); };
+    mock.module("bun:sqlite", () => ({ Database: class { constructor() { forbidden(); } } }));
+    mock.module("node:child_process", () => ({ ...child, spawn: forbidden, spawnSync: forbidden, exec: forbidden, execSync: forbidden, execFile: forbidden, execFileSync: forbidden, fork: forbidden }));
+    mock.module("node:fs", () => ({ ...fs, openSync: forbidden, writeFileSync: forbidden, mkdirSync: forbidden, rmSync: forbidden }));
+    globalThis.setTimeout = forbidden;
+    globalThis.setInterval = forbidden;
+    const { TmuxWsMux } = await import("thumbmux/server");
+    const driver = { listSessions: () => [], capturePane: async () => "", sendKeys() {},
+      getSessionActivity: () => new Map(), getHistoryLimit: () => 2000,
+      setSessionHistoryLimit() {}, resizeWindow() {}, hash: x => x };
+    const mux = new TmuxWsMux({ driver, ownedLifetime: true });
+    console.log("P2 imported and constructed");
+    if (typeof mux.quiesceAndDrain !== "function") throw Error("P2 missing drain method");
+    const drain = mux.quiesceAndDrain();
+    if (!(drain instanceof Promise)) throw Error("P2 drain must return Promise");
+    if (mux.quiesceAndDrain() !== drain) throw Error("P2 drain promise identity");
+    await drain;
+    if (mux.getOwnedTaskInventory().phase !== "drained") throw Error("P2 empty drain failed");
+    if (mux.quiesceAndDrain() !== drain) throw Error("P2 settled drain promise identity");
+    for (const options of [{ driver }, { driver, ownedLifetime: false }]) {
+      const legacy = new TmuxWsMux(options);
+      let rejection;
+      try { await legacy.quiesceAndDrain(); } catch (error) { rejection = error; }
+      if (!rejection?.message.includes("ownedLifetime")) throw Error("P2 legacy must reject");
+      const sent = [];
+      legacy.handleMessage({ type: "ping" }, { send: frame => { sent.push(frame); return 1; } });
+      if (sent.length !== 1 || JSON.parse(sent[0]).type !== "pong") throw Error("P2 legacy unusable");
+      if (legacy.getOwnedTaskInventory().phase !== "legacy") throw Error("P2 legacy state changed");
+      if (legacy.stop() !== undefined) throw Error("P2 stop must remain void");
+    }
+    console.log("P2 public owned and legacy API passed");
+  `;
+  return spawnSync(process.execPath, ["--eval", script], { cwd: root, encoding: "utf8" });
+}
+
+function p2AssertPublicRuntime(root: string) {
+  const result = p2WsRuntime(root);
+  expect({ error: result.error?.message, status: result.status, stderr: result.stderr })
+    .toEqual({ error: undefined, status: 0, stderr: "" });
+  expect(result.stdout).toContain("P2 imported and constructed");
+  expect(result.stdout).toContain("P2 public owned and legacy API passed");
+}
+
+function p2PackedArtifact(): string {
+  const root = pArtifactFixture();
+  prepareReleasePackage(root);
+  const packed = spawnSync(process.execPath, ["pm", "pack", "--ignore-scripts", "--filename", "public.tgz"], {
+    cwd: root, encoding: "utf8", env: { ...process.env,
+      BUN_INSTALL_CACHE_DIR: join(root, "bun-cache"), npm_config_cache: join(root, "npm-cache"), TMPDIR: root },
+  });
+  expect({ error: packed.error?.message, status: packed.status }).toEqual({ error: undefined, status: 0 });
+  const unpacked = join(root, "unpacked");
+  mkdirSync(unpacked);
+  const unpack = spawnSync("tar", ["-xf", join(root, "public.tgz"), "-C", unpacked], { encoding: "utf8" });
+  expect({ error: unpack.error?.message, status: unpack.status }).toEqual({ error: undefined, status: 0 });
+  const pkg = join(unpacked, "package");
+  for (const file of ["server/index.js", "server/index.d.ts", "server/ws-mux.d.ts", "core/index.js"]) {
+    expect(readFileSync(join(pkg, "git-dist", file))).toEqual(readFileSync(join(root, "git-dist", file)));
+  }
+  return pkg;
+}
+
+// Historical .22 declaration closure, source-relative even for packed mutants.
+// These pins were computed from the immutable dist's exact bytes, separately
+// from the JSON's self-reported hashes. No rolling release baseline or network.
+const P2_BASELINE_BUNDLE = resolve(import.meta.dir, "fixtures/p2-baseline-v0220");
+const P2_BASELINE_SHARDS = {
+  "metadata.json": "2bf77d87a512b0163ab43ac66e50ce1450d4397e143249f485ff384f9626186d",
+  "core.json": "01ae52a55e11bb9bacc05466df20e84e87d768dd5c730e129e72f5cdb0908abe",
+  "server.json": "ec2651a4d3988b84541d27da57d0d442f93db6480b60653e8e09427c93f6c67d",
+  "svelte.json": "a730e5b4d02d794ee3ce2cd06196a879506e0e82d92cae9572d725cdf0fe470a",
+  "app.json": "468ac9d8892a7ece346dd7e590869ccdb0771fc40845ab81e986840714743852",
+} as const;
+const P2_BASELINE_AGGREGATE = "f06c1875853986d09fb4657bfa6097315cfb190485de1f1509c022b4e806d100";
+const P2_BASELINE_PATHS = "216fe60d551a1089f9e2e666522ab03a836db2ef5618e1812c9b619459cd509b";
+const P2_BASELINE_DIST = "551dc3b27b6dd8c77327c1accdd8916da35a77e7";
+const P2_SUBPACKAGES = ["core", "server", "svelte", "app"] as const;
+type P2BaselineFile = { path: string; byteLength: number; sha256: string; base64: string };
+type P2BaselineInventory = Omit<P2BaselineFile, "base64"> & { shard: string };
+type P2BaselineShard = { schema: string; files: P2BaselineFile[] };
+type P2BaselineMetadata = P2BaselineShard & {
+  version: string; source: string; sourceTagObject: string; dist: string; distTag: string;
+  archiveSha256: string; fileCount: number; totalBytes: number; inventory: P2BaselineInventory[];
+};
+
+function p2Digest(bytes: string | Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function p2BaselineRequire(condition: unknown, reason: string): asserts condition {
+  if (!condition) throw Error(`P2 baseline ${reason}`);
+}
+
+function p2BaselinePath(path: unknown): asserts path is string {
+  p2BaselineRequire(typeof path === "string"
+    && path.split("/").every(part => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part))
+    && /^(?:package\.json|contract\/manifest\/(?:core|server|svelte|app)\.json|git-dist\/(?:core|server|svelte|app)\/.+\.d\.ts)$/.test(path),
+  `unsafe or unlisted path: ${String(path)}`);
+}
+
+function p2ReadBaselineBundle(bundleRoot: string) {
+  const shards = new Map<string, { raw: Buffer; parsed: P2BaselineShard }>();
+  for (const name of Object.keys(P2_BASELINE_SHARDS)) {
+    const file = join(bundleRoot, name);
+    p2BaselineRequire(existsSync(file), `missing shard: ${name}`);
+    p2BaselineRequire(lstatSync(file).isFile(), `shard must be a regular file: ${name}`);
+    const raw = readFileSync(file);
+    const parsed = JSON.parse(raw.toString("utf8")) as P2BaselineShard;
+    p2BaselineRequire(parsed && parsed.schema === "thumbmux-p2-baseline/1"
+      && Array.isArray(parsed.files), `invalid shard schema: ${name}`);
+    shards.set(name, { raw, parsed });
+  }
+  const metadata = shards.get("metadata.json")!.parsed as P2BaselineMetadata;
+  p2BaselineRequire(metadata.version === "0.22.0", "wrong version");
+  p2BaselineRequire(metadata.dist === P2_BASELINE_DIST && metadata.distTag === "v0.22.0-dist", "wrong dist tuple");
+  p2BaselineRequire(metadata.source === "c47aa9d58a7719616ae8e7c727785118988f5a19"
+    && metadata.sourceTagObject === "59bdc2cf5b812b5f6ba6d29c84f905afdad74648"
+    && metadata.archiveSha256 === "4afe27e80c1f97cb0a6afd495f6aea98cfdc46e427fa1564b016d990218fdcb0", "wrong source/archive tuple");
+  p2BaselineRequire(metadata.fileCount === 145 && Array.isArray(metadata.inventory)
+    && metadata.inventory.length === 145 && metadata.totalBytes === 865506, "incomplete inventory");
+
+  const inventory = new Map<string, P2BaselineInventory>();
+  for (const row of metadata.inventory) {
+    p2BaselinePath(row?.path);
+    p2BaselineRequire(!inventory.has(row.path), `duplicate inventory path: ${row.path}`);
+    inventory.set(row.path, row);
+  }
+  const paths = [...inventory.keys()];
+  p2BaselineRequire(JSON.stringify(paths) === JSON.stringify([...paths].sort())
+    && p2Digest(paths.join("\n") + "\n") === P2_BASELINE_PATHS, "wrong exact file set");
+  for (const path of ["package.json", ...P2_SUBPACKAGES.flatMap(sub => [
+    `contract/manifest/${sub}.json`, `git-dist/${sub}/index.d.ts`,
+  ])]) p2BaselineRequire(inventory.has(path), `missing required file: ${path}`);
+
+  const files = new Map<string, { bytes: Buffer; sha256: string }>();
+  for (const [name, { parsed }] of shards) {
+    let previousPath = "";
+    for (const row of parsed.files) {
+      p2BaselinePath(row?.path);
+      p2BaselineRequire(!files.has(row.path), `duplicate file: ${row.path}`);
+      p2BaselineRequire(row.path > previousPath, `unsorted shard: ${name}`);
+      previousPath = row.path;
+      const expected = inventory.get(row.path);
+      p2BaselineRequire(expected && expected.shard === name, `unexpected file/shard: ${row.path}`);
+      p2BaselineRequire(typeof row.base64 === "string", `missing bytes: ${row.path}`);
+      const bytes = Buffer.from(row.base64, "base64");
+      p2BaselineRequire(bytes.toString("base64") === row.base64, `invalid base64: ${row.path}`);
+      p2BaselineRequire(Number.isSafeInteger(row.byteLength) && row.byteLength > 0
+        && bytes.length === row.byteLength && row.byteLength === expected.byteLength, `byte length mismatch: ${row.path}`);
+      p2BaselineRequire(/^[a-f0-9]{64}$/.test(row.sha256)
+        && p2Digest(bytes) === row.sha256 && row.sha256 === expected.sha256, `file hash mismatch: ${row.path}`);
+      files.set(row.path, { bytes, sha256: row.sha256 });
+    }
+  }
+  for (const path of paths) p2BaselineRequire(files.has(path), `missing file: ${path}`);
+  p2BaselineRequire(files.size === 145 && [...files.values()].reduce((n, file) => n + file.bytes.length, 0) === 865506,
+    "incomplete file bytes");
+  p2BaselineRequire(JSON.parse(files.get("package.json")!.bytes.toString("utf8")).version === "0.22.0", "wrong package version");
+  // Structural diagnostics above explain corruption. Independent pins below
+  // authenticate it before any bytes may be materialized, even if rehashed.
+  let aggregate = "";
+  for (const [name, expected] of Object.entries(P2_BASELINE_SHARDS)) {
+    const actual = p2Digest(shards.get(name)!.raw);
+    p2BaselineRequire(actual === expected, `pinned shard hash mismatch: ${name}`);
+    aggregate += `${name}:${actual}\n`;
+  }
+  p2BaselineRequire(p2Digest(aggregate) === P2_BASELINE_AGGREGATE, "pinned bundle identity mismatch");
+  return files;
+}
+
+function p2BaselineRoot(bundleRoot = P2_BASELINE_BUNDLE): string {
+  const files = p2ReadBaselineBundle(bundleRoot);
+  // No path cache: afterEach deletes each root. Write only verified regular
+  // files into a fresh temp directory, never links into the frozen checkout.
+  const root = mkdtempSync(join(tmpdir(), "thumbmux-p2-baseline-"));
+  roots.push(root);
+  for (const [path, { bytes, sha256 }] of files) {
+    const destination = join(root, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, bytes, { flag: "wx" });
+    p2BaselineRequire(lstatSync(destination).isFile()
+      && p2Digest(readFileSync(destination)) === sha256, `materialized bytes mismatch: ${path}`);
+  }
+  return root;
+}
+
+function p2BaselineCopy(): string {
+  const root = mkdtempSync(join(tmpdir(), "thumbmux-p2-bundle-copy-"));
+  roots.push(root);
+  cpSync(P2_BASELINE_BUNDLE, root, { recursive: true });
+  return root;
+}
+
+function p2EditBaselineShard(root: string, name: string, edit: (data: P2BaselineMetadata) => void) {
+  const path = join(root, name);
+  const data = JSON.parse(readFileSync(path, "utf8")) as P2BaselineMetadata;
+  edit(data);
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
+}
+
+function p2ArtifactComparison(root: string) {
+  const baselineRoot = p2BaselineRoot();
+  const before = deriveGitDistReport(baselineRoot, ["server"]).server;
+  for (const [, , name, kind, oldSignature, , oldCompatibility] of P2_WS_SIGNATURES) {
+    expect(before.find(row => row.name === name)).toMatchObject({ kind, signature: oldSignature, compatibilitySignature: oldCompatibility });
+  }
+  // Run the same artifact oracle for positives and mutants. Manifest checking
+  // also catches loss of the newly exported inventory type (absent from .22).
+  return checkContract({ packageRoot: root, baselinePackageRoot: baselineRoot,
+    subpackages: ["server"], validateExportParity: false });
+}
+
+function p2Replace(file: string, before: string, after: string) {
+  const original = readFileSync(file, "utf8");
+  expect(original.split(before)).toHaveLength(2);
+  writeFileSync(file, original.replace(before, after));
+}
+
+describe("P2 pinned offline .22 baseline provider", () => {
+  test("materializes the complete immutable closure with exact bytes and a fresh root per call", () => {
+    const files = p2ReadBaselineBundle(P2_BASELINE_BUNDLE);
+    expect(files.size).toBe(145);
+    const first = p2BaselineRoot();
+    const second = p2BaselineRoot();
+    expect(first).not.toBe(second);
+    expect(roots).toContain(first);
+    expect(roots).toContain(second);
+    for (const [path, { bytes }] of files) {
+      expect(readFileSync(join(first, path))).toEqual(bytes);
+      expect(readFileSync(join(second, path))).toEqual(bytes);
+    }
+    expect(JSON.parse(readFileSync(join(first, "package.json"), "utf8")).version).toBe("0.22.0");
+  });
+
+  test("all four baseline export graphs match the pinned names, kinds, signatures and historical tiers", () => {
+    const root = p2BaselineRoot();
+    const live = deriveGitDistReport(root);
+    const expectedTiers = {
+      core: { F: 86, S: 78, X: 96, D: 5 },
+      server: { F: 59, S: 20, X: 11, D: 2 },
+      svelte: { F: 36, S: 104, X: 14, D: 0 },
+      app: { F: 0, S: 39, X: 0, D: 0 },
+    };
+    for (const sub of P2_SUBPACKAGES) {
+      const manifest = JSON.parse(readFileSync(join(root, `contract/manifest/${sub}.json`), "utf8")) as ContractEntry[];
+      const shape = (rows: readonly { name: string; kind: string; signature: string }[]) =>
+        rows.map(({ name, kind, signature }) => ({ name, kind, signature }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+      expect(shape(live[sub])).toEqual(shape(manifest));
+      const tiers = { F: 0, S: 0, X: 0, D: 0 };
+      for (const entry of manifest) {
+        expect(["F", "S", "X", "D"]).toContain(entry.tier);
+        tiers[entry.tier]++;
+      }
+      expect(tiers).toEqual(expectedTiers[sub]);
+    }
+    expect(live.server.some(row => row.name === "MuxOwnedTaskInventory")).toBe(false);
+    for (const [, , name, kind, signature, , compatibilitySignature] of P2_WS_SIGNATURES) {
+      expect(live.server.find(row => row.name === name)).toMatchObject({ kind, signature, compatibilitySignature });
+    }
+  });
+
+  test("missing shard is a provider error, not a skipped contract check", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    rmSync(join(copy, "server.json"));
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline missing shard: server.json");
+  });
+
+  for (const [field, value, reason] of [
+    ["version", "0.23.0", "wrong version"],
+    ["dist", "0".repeat(40), "wrong dist tuple"],
+    ["source", "0".repeat(40), "wrong source/archive tuple"],
+  ] as const) {
+    test(`rejects a wrong historical ${field}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      p2EditBaselineShard(copy, "metadata.json", data => { data[field] = value; });
+      expect(() => p2BaselineRoot(copy)).toThrow(`P2 baseline ${reason}`);
+    });
+  }
+
+  for (const path of ["git-dist/server/index.d.ts", "git-dist/server/sqlite-history/reader.d.ts"]) {
+    test(`rejects missing declaration closure file ${path}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      p2EditBaselineShard(copy, "server.json", data => {
+        expect(data.files.some(row => row.path === path)).toBe(true);
+        data.files = data.files.filter(row => row.path !== path);
+      });
+      expect(() => p2BaselineRoot(copy)).toThrow(`P2 baseline missing file: ${path}`);
+    });
+  }
+
+  test("dropping a nested file and its inventory row still cannot redefine completeness", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    const path = "git-dist/server/sqlite-history/reader.d.ts";
+    p2EditBaselineShard(copy, "server.json", data => { data.files = data.files.filter(row => row.path !== path); });
+    p2EditBaselineShard(copy, "metadata.json", data => {
+      data.inventory = data.inventory.filter(row => row.path !== path);
+      data.fileCount--;
+    });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline incomplete inventory");
+  });
+
+  for (const rehash of [false, true]) {
+    test(`tampered declaration is rejected even when self-reported hashes are ${rehash ? "rewritten" : "unchanged"}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      const path = "git-dist/core/copy.d.ts";
+      let changedHash = "";
+      p2EditBaselineShard(copy, "core.json", data => {
+        const row = data.files.find(row => row.path === path)!;
+        const bytes = Buffer.from(row.base64, "base64");
+        bytes[0] = bytes[0]! ^ 1;
+        row.base64 = bytes.toString("base64");
+        changedHash = p2Digest(bytes);
+        if (rehash) row.sha256 = changedHash;
+      });
+      if (rehash) p2EditBaselineShard(copy, "metadata.json", data => {
+        data.inventory.find(row => row.path === path)!.sha256 = changedHash;
+      });
+      expect(() => p2BaselineRoot(copy)).toThrow(rehash
+        ? "P2 baseline pinned shard hash mismatch: metadata.json"
+        : `P2 baseline file hash mismatch: ${path}`);
+    });
+  }
+
+  test("wrong byte length is rejected before materialization", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    p2EditBaselineShard(copy, "core.json", data => { data.files[0]!.byteLength++; });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline byte length mismatch:");
+  });
+
+  test("duplicate payload path is refused even when all bytes remain authentic", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    p2EditBaselineShard(copy, "core.json", data => { data.files.push({ ...data.files[0]! }); });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline duplicate file:");
+  });
+
+  test("duplicate inventory path is refused", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    p2EditBaselineShard(copy, "metadata.json", data => { data.inventory[1] = { ...data.inventory[0]! }; });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline duplicate inventory path:");
+  });
+
+  for (const path of ["../escape.d.ts", "/tmp/escape.d.ts", "git-dist/core/../../escape.d.ts", "git-dist/core/escape.js", "git-dist\\core\\escape.d.ts"]) {
+    test(`refuses an escaping or disallowed payload path: ${path}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      p2EditBaselineShard(copy, "core.json", data => { data.files[0]!.path = path; });
+      expect(() => p2BaselineRoot(copy)).toThrow(`P2 baseline unsafe or unlisted path: ${path}`);
+    });
+  }
+});
+
+test("P2 complete built surface matches manifests and immutable .22", () => {
+  const result = checkContract({
+    packageRoot: resolve(import.meta.dir, ".."),
+    baselinePackageRoot: p2BaselineRoot(),
+  });
+  expect(result.currentVersion).toBe("0.23.0");
+  expect(result.errors).toEqual([]);
+});
+
+describe("P2 public built and packed WS API", () => {
+  for (const [label, make] of [["built", pArtifactFixture], ["packed", p2PackedArtifact]] as const) {
+    test(`${label}: actual public imports compile owned/legacy and execute empty drain`, () => {
+      const root = make();
+      p2AssertPublicTypes(root);
+      p2AssertPublicRuntime(root);
+      expect(p2ArtifactComparison(root).errors).toEqual([]);
+    });
+  }
+
+  test("copied actual JS without drain imports/constructs before the positive runtime oracle rejects it", () => {
+    const root = pArtifactFixture();
+    p2AssertPublicTypes(root);
+    p2AssertPublicRuntime(root);
+    p2Replace(join(root, "git-dist/server/index.js"), "  quiesceAndDrain() {", "  removedDrain() {");
+    const result = p2WsRuntime(root);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("P2 imported and constructed");
+    expect(result.stderr).toContain("P2 missing drain method");
+    expect(result.stderr).not.toContain("Cannot find");
+  });
+
+  for (const [label, before, after, code, text, contractCode, contractName] of [
+    ["removed drain", "    quiesceAndDrain(): Promise<void>;", "", 2339, "quiesceAndDrain", "signature-mismatch", "TmuxWsMux"],
+    ["narrowed return", "    quiesceAndDrain(): Promise<void>;", "    quiesceAndDrain(): void;", 2322, "void", "signature-mismatch", "TmuxWsMux"],
+    ["required option", "    ownedLifetime?: boolean;", "    ownedLifetime: boolean;", 2741, "ownedLifetime", "baseline-signature-change", "TmuxWsMuxOptions"],
+    ["removed legacy member", "    stop(): void;", "", 2339, "stop", "baseline-signature-change", "TmuxWsMux"],
+    ["missing inventory type", "export type MuxOwnedTaskInventory =", "type MuxOwnedTaskInventory =", 2305, "MuxOwnedTaskInventory", "missing-protected-export", "MuxOwnedTaskInventory"],
+  ] as const) {
+    test(`actual copied declarations reject ${label} after positive setup`, () => {
+      const root = pArtifactFixture();
+      p2AssertPublicTypes(root);
+      p2AssertPublicRuntime(root);
+      expect(p2ArtifactComparison(root).errors).toEqual([]);
+      const declaration = join(root, "git-dist/server/ws-mux.d.ts");
+      if (label === "missing inventory type") {
+        // Disable ambient implicit exports; normalization must pass all three
+        // positive oracles before removing the actual export modifier.
+        writeFileSync(declaration, readFileSync(declaration, "utf8") + "\nexport {};\n");
+        p2AssertPublicTypes(root);
+        p2AssertPublicRuntime(root);
+        expect(p2ArtifactComparison(root).errors).toEqual([]);
+      }
+      p2Replace(declaration, before, after);
+      const negative = p2CompilePublic(root);
+      expect(negative.resolution).toBe(join(root, "git-dist/server/index.d.ts"));
+      expect(negative.errors.some(d => d.code === code && d.text.includes(text))).toBe(true);
+      expect(negative.errors.some(d => d.code === 2307 || d.code === 1005)).toBe(false);
+      // The real public JS still imports/runs: parse/setup failure is not RED.
+      p2AssertPublicRuntime(root);
+      expect(p2ArtifactComparison(root).errors).toContainEqual(expect.objectContaining({
+        code: contractCode, subpath: "server", name: contractName,
+      }));
+    });
+  }
+
+  test("workspace export escape is rejected by the same public resolution oracle", () => {
+    const root = pArtifactFixture();
+    p2AssertPublicTypes(root);
+    p2AssertPublicRuntime(root);
+    const path = join(root, "package.json");
+    const pkg = JSON.parse(readFileSync(path, "utf8"));
+    pkg.exports["./server"] = { types: "../../server/src/index.ts", import: "../../server/src/index.ts" };
+    writeFileSync(path, JSON.stringify(pkg));
+    const result = p2CompilePublic(root);
+    expect(result.resolution).toBeUndefined();
+    expect(result.errors.some(d => d.code === 2307 && d.text.includes("thumbmux/server"))).toBe(true);
+  });
+});
+
+describe("P2 exact .22 to .23 class graph tuples", () => {
+  for (const row of P2_WS_SIGNATURES) {
+    test(`${row[2]}: exact versions, spelling, kind and both digest pairs`, () => {
+      expect(pReleaseComparison(row, { to: "0.23.0" }).errors).toEqual([]);
+      for (const mutation of [
+        { from: "0.21.0" }, { from: "0.22.1" }, { to: "0.23.1" }, { to: "0.24.0" },
+        { name: `${row[2]}Unreviewed` }, { subpath: "core" as const }, { wrongKind: true },
+        { oldSignature: "1".repeat(64) }, { newSignature: "2".repeat(64) },
+        { oldCompatibility: "3".repeat(64) }, { newCompatibility: "4".repeat(64) },
+      ]) {
+        expect(pReleaseComparison(row, { to: "0.23.0", ...mutation }).errors
+          .some(d => d.code === "baseline-signature-change")).toBe(true);
+      }
+      // Changing BOTH kinds must also miss the tuple (not just kindChanged).
+      const changed = [...row];
+      changed[3] = row[3] === "type" ? "value" : "type";
+      expect(pReleaseComparison(changed, { to: "0.23.0" }).errors
+        .some(d => d.code === "baseline-signature-change")).toBe(true);
+    });
+  }
+});
+
+describe("P2 TM0103 module resolution only (no browser semantics)", () => {
+  test("package-local fallback and explicit override resolve independent fixture installations", () => {
+    const script = readFileSync(resolve(import.meta.dir, "../svelte/tests/tm-01-03-webkit-red.mjs"), "utf8");
+    expect(script).not.toMatch(/\/home\/|\/Users\/|webkit-\d+/);
+    const expression = script.match(/const require = (createRequire\([\s\S]*?\));/)?.[1];
+    expect(expression).toBe("createRequire(process.env.PLAYWRIGHT_FROM ?? import.meta.url)");
+    const root = fixture();
+    const local = join(root, "local");
+    const override = join(root, "override");
+    for (const [dir, id] of [[local, "local"], [override, "override"]]) {
+      const packageDir = join(dir!, "node_modules/@playwright/test");
+      mkdirSync(packageDir, { recursive: true });
+      writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "@playwright/test", main: "index.cjs" }));
+      writeFileSync(join(packageDir, "index.cjs"), `module.exports = ${JSON.stringify(id)};`);
+    }
+    // Evaluate only the extracted resolver expression with fixture-local inputs.
+    const resolveFrom = new Function("createRequire", "process", "moduleUrl",
+      `return ${expression!.replace("import.meta.url", "moduleUrl")};`);
+    const moduleUrl = pathToFileURL(join(local, "probe.mjs")).href;
+    expect(resolveFrom(createRequire, { env: {} }, moduleUrl)("@playwright/test")).toBe("local");
+    expect(resolveFrom(createRequire, { env: { PLAYWRIGHT_FROM: join(override, "package.json") } }, moduleUrl)("@playwright/test")).toBe("override");
   });
 });
