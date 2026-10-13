@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import ts from "typescript";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -2114,13 +2114,142 @@ function p2PackedArtifact(): string {
   return pkg;
 }
 
-// Full .22 artifact is supplied by the runner's immutable baseline materializer.
-// Never substitute current declarations, a missing baseline, or .21 silently.
-function p2BaselineRoot(): string {
-  const root = process.env.THUMBMUX_CONTRACT_BASELINE_ROOT;
-  if (!root) throw Error("P2 requires immutable v0.22.0-dist baseline");
-  expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version).toBe("0.22.0");
+// Historical .22 declaration closure, source-relative even for packed mutants.
+// These pins were computed from the immutable dist's exact bytes, separately
+// from the JSON's self-reported hashes. No rolling release baseline or network.
+const P2_BASELINE_BUNDLE = resolve(import.meta.dir, "fixtures/p2-baseline-v0220");
+const P2_BASELINE_SHARDS = {
+  "metadata.json": "2bf77d87a512b0163ab43ac66e50ce1450d4397e143249f485ff384f9626186d",
+  "core.json": "01ae52a55e11bb9bacc05466df20e84e87d768dd5c730e129e72f5cdb0908abe",
+  "server.json": "ec2651a4d3988b84541d27da57d0d442f93db6480b60653e8e09427c93f6c67d",
+  "svelte.json": "a730e5b4d02d794ee3ce2cd06196a879506e0e82d92cae9572d725cdf0fe470a",
+  "app.json": "468ac9d8892a7ece346dd7e590869ccdb0771fc40845ab81e986840714743852",
+} as const;
+const P2_BASELINE_AGGREGATE = "f06c1875853986d09fb4657bfa6097315cfb190485de1f1509c022b4e806d100";
+const P2_BASELINE_PATHS = "216fe60d551a1089f9e2e666522ab03a836db2ef5618e1812c9b619459cd509b";
+const P2_BASELINE_DIST = "551dc3b27b6dd8c77327c1accdd8916da35a77e7";
+const P2_SUBPACKAGES = ["core", "server", "svelte", "app"] as const;
+type P2BaselineFile = { path: string; byteLength: number; sha256: string; base64: string };
+type P2BaselineInventory = Omit<P2BaselineFile, "base64"> & { shard: string };
+type P2BaselineShard = { schema: string; files: P2BaselineFile[] };
+type P2BaselineMetadata = P2BaselineShard & {
+  version: string; source: string; sourceTagObject: string; dist: string; distTag: string;
+  archiveSha256: string; fileCount: number; totalBytes: number; inventory: P2BaselineInventory[];
+};
+
+function p2Digest(bytes: string | Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function p2BaselineRequire(condition: unknown, reason: string): asserts condition {
+  if (!condition) throw Error(`P2 baseline ${reason}`);
+}
+
+function p2BaselinePath(path: unknown): asserts path is string {
+  p2BaselineRequire(typeof path === "string"
+    && path.split("/").every(part => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part))
+    && /^(?:package\.json|contract\/manifest\/(?:core|server|svelte|app)\.json|git-dist\/(?:core|server|svelte|app)\/.+\.d\.ts)$/.test(path),
+  `unsafe or unlisted path: ${String(path)}`);
+}
+
+function p2ReadBaselineBundle(bundleRoot: string) {
+  const shards = new Map<string, { raw: Buffer; parsed: P2BaselineShard }>();
+  for (const name of Object.keys(P2_BASELINE_SHARDS)) {
+    const file = join(bundleRoot, name);
+    p2BaselineRequire(existsSync(file), `missing shard: ${name}`);
+    p2BaselineRequire(lstatSync(file).isFile(), `shard must be a regular file: ${name}`);
+    const raw = readFileSync(file);
+    const parsed = JSON.parse(raw.toString("utf8")) as P2BaselineShard;
+    p2BaselineRequire(parsed && parsed.schema === "thumbmux-p2-baseline/1"
+      && Array.isArray(parsed.files), `invalid shard schema: ${name}`);
+    shards.set(name, { raw, parsed });
+  }
+  const metadata = shards.get("metadata.json")!.parsed as P2BaselineMetadata;
+  p2BaselineRequire(metadata.version === "0.22.0", "wrong version");
+  p2BaselineRequire(metadata.dist === P2_BASELINE_DIST && metadata.distTag === "v0.22.0-dist", "wrong dist tuple");
+  p2BaselineRequire(metadata.source === "c47aa9d58a7719616ae8e7c727785118988f5a19"
+    && metadata.sourceTagObject === "59bdc2cf5b812b5f6ba6d29c84f905afdad74648"
+    && metadata.archiveSha256 === "4afe27e80c1f97cb0a6afd495f6aea98cfdc46e427fa1564b016d990218fdcb0", "wrong source/archive tuple");
+  p2BaselineRequire(metadata.fileCount === 145 && Array.isArray(metadata.inventory)
+    && metadata.inventory.length === 145 && metadata.totalBytes === 865506, "incomplete inventory");
+
+  const inventory = new Map<string, P2BaselineInventory>();
+  for (const row of metadata.inventory) {
+    p2BaselinePath(row?.path);
+    p2BaselineRequire(!inventory.has(row.path), `duplicate inventory path: ${row.path}`);
+    inventory.set(row.path, row);
+  }
+  const paths = [...inventory.keys()];
+  p2BaselineRequire(JSON.stringify(paths) === JSON.stringify([...paths].sort())
+    && p2Digest(paths.join("\n") + "\n") === P2_BASELINE_PATHS, "wrong exact file set");
+  for (const path of ["package.json", ...P2_SUBPACKAGES.flatMap(sub => [
+    `contract/manifest/${sub}.json`, `git-dist/${sub}/index.d.ts`,
+  ])]) p2BaselineRequire(inventory.has(path), `missing required file: ${path}`);
+
+  const files = new Map<string, { bytes: Buffer; sha256: string }>();
+  for (const [name, { parsed }] of shards) {
+    let previousPath = "";
+    for (const row of parsed.files) {
+      p2BaselinePath(row?.path);
+      p2BaselineRequire(!files.has(row.path), `duplicate file: ${row.path}`);
+      p2BaselineRequire(row.path > previousPath, `unsorted shard: ${name}`);
+      previousPath = row.path;
+      const expected = inventory.get(row.path);
+      p2BaselineRequire(expected && expected.shard === name, `unexpected file/shard: ${row.path}`);
+      p2BaselineRequire(typeof row.base64 === "string", `missing bytes: ${row.path}`);
+      const bytes = Buffer.from(row.base64, "base64");
+      p2BaselineRequire(bytes.toString("base64") === row.base64, `invalid base64: ${row.path}`);
+      p2BaselineRequire(Number.isSafeInteger(row.byteLength) && row.byteLength > 0
+        && bytes.length === row.byteLength && row.byteLength === expected.byteLength, `byte length mismatch: ${row.path}`);
+      p2BaselineRequire(/^[a-f0-9]{64}$/.test(row.sha256)
+        && p2Digest(bytes) === row.sha256 && row.sha256 === expected.sha256, `file hash mismatch: ${row.path}`);
+      files.set(row.path, { bytes, sha256: row.sha256 });
+    }
+  }
+  for (const path of paths) p2BaselineRequire(files.has(path), `missing file: ${path}`);
+  p2BaselineRequire(files.size === 145 && [...files.values()].reduce((n, file) => n + file.bytes.length, 0) === 865506,
+    "incomplete file bytes");
+  p2BaselineRequire(JSON.parse(files.get("package.json")!.bytes.toString("utf8")).version === "0.22.0", "wrong package version");
+  // Structural diagnostics above explain corruption. Independent pins below
+  // authenticate it before any bytes may be materialized, even if rehashed.
+  let aggregate = "";
+  for (const [name, expected] of Object.entries(P2_BASELINE_SHARDS)) {
+    const actual = p2Digest(shards.get(name)!.raw);
+    p2BaselineRequire(actual === expected, `pinned shard hash mismatch: ${name}`);
+    aggregate += `${name}:${actual}\n`;
+  }
+  p2BaselineRequire(p2Digest(aggregate) === P2_BASELINE_AGGREGATE, "pinned bundle identity mismatch");
+  return files;
+}
+
+function p2BaselineRoot(bundleRoot = P2_BASELINE_BUNDLE): string {
+  const files = p2ReadBaselineBundle(bundleRoot);
+  // No path cache: afterEach deletes each root. Write only verified regular
+  // files into a fresh temp directory, never links into the frozen checkout.
+  const root = mkdtempSync(join(tmpdir(), "thumbmux-p2-baseline-"));
+  roots.push(root);
+  for (const [path, { bytes, sha256 }] of files) {
+    const destination = join(root, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, bytes, { flag: "wx" });
+    p2BaselineRequire(lstatSync(destination).isFile()
+      && p2Digest(readFileSync(destination)) === sha256, `materialized bytes mismatch: ${path}`);
+  }
   return root;
+}
+
+function p2BaselineCopy(): string {
+  const root = mkdtempSync(join(tmpdir(), "thumbmux-p2-bundle-copy-"));
+  roots.push(root);
+  cpSync(P2_BASELINE_BUNDLE, root, { recursive: true });
+  return root;
+}
+
+function p2EditBaselineShard(root: string, name: string, edit: (data: P2BaselineMetadata) => void) {
+  const path = join(root, name);
+  const data = JSON.parse(readFileSync(path, "utf8")) as P2BaselineMetadata;
+  edit(data);
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
 }
 
 function p2ArtifactComparison(root: string) {
@@ -2140,6 +2269,157 @@ function p2Replace(file: string, before: string, after: string) {
   expect(original.split(before)).toHaveLength(2);
   writeFileSync(file, original.replace(before, after));
 }
+
+describe("P2 pinned offline .22 baseline provider", () => {
+  test("materializes the complete immutable closure with exact bytes and a fresh root per call", () => {
+    const files = p2ReadBaselineBundle(P2_BASELINE_BUNDLE);
+    expect(files.size).toBe(145);
+    const first = p2BaselineRoot();
+    const second = p2BaselineRoot();
+    expect(first).not.toBe(second);
+    expect(roots).toContain(first);
+    expect(roots).toContain(second);
+    for (const [path, { bytes }] of files) {
+      expect(readFileSync(join(first, path))).toEqual(bytes);
+      expect(readFileSync(join(second, path))).toEqual(bytes);
+    }
+    expect(JSON.parse(readFileSync(join(first, "package.json"), "utf8")).version).toBe("0.22.0");
+  });
+
+  test("all four baseline export graphs match the pinned names, kinds, signatures and historical tiers", () => {
+    const root = p2BaselineRoot();
+    const live = deriveGitDistReport(root);
+    const expectedTiers = {
+      core: { F: 86, S: 78, X: 96, D: 5 },
+      server: { F: 59, S: 20, X: 11, D: 2 },
+      svelte: { F: 36, S: 104, X: 14, D: 0 },
+      app: { F: 0, S: 39, X: 0, D: 0 },
+    };
+    for (const sub of P2_SUBPACKAGES) {
+      const manifest = JSON.parse(readFileSync(join(root, `contract/manifest/${sub}.json`), "utf8")) as ContractEntry[];
+      const shape = (rows: readonly { name: string; kind: string; signature: string }[]) =>
+        rows.map(({ name, kind, signature }) => ({ name, kind, signature }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+      expect(shape(live[sub])).toEqual(shape(manifest));
+      const tiers = { F: 0, S: 0, X: 0, D: 0 };
+      for (const entry of manifest) {
+        expect(["F", "S", "X", "D"]).toContain(entry.tier);
+        tiers[entry.tier]++;
+      }
+      expect(tiers).toEqual(expectedTiers[sub]);
+    }
+    expect(live.server.some(row => row.name === "MuxOwnedTaskInventory")).toBe(false);
+    for (const [, , name, kind, signature, , compatibilitySignature] of P2_WS_SIGNATURES) {
+      expect(live.server.find(row => row.name === name)).toMatchObject({ kind, signature, compatibilitySignature });
+    }
+  });
+
+  test("missing shard is a provider error, not a skipped contract check", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    rmSync(join(copy, "server.json"));
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline missing shard: server.json");
+  });
+
+  for (const [field, value, reason] of [
+    ["version", "0.23.0", "wrong version"],
+    ["dist", "0".repeat(40), "wrong dist tuple"],
+    ["source", "0".repeat(40), "wrong source/archive tuple"],
+  ] as const) {
+    test(`rejects a wrong historical ${field}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      p2EditBaselineShard(copy, "metadata.json", data => { data[field] = value; });
+      expect(() => p2BaselineRoot(copy)).toThrow(`P2 baseline ${reason}`);
+    });
+  }
+
+  for (const path of ["git-dist/server/index.d.ts", "git-dist/server/sqlite-history/reader.d.ts"]) {
+    test(`rejects missing declaration closure file ${path}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      p2EditBaselineShard(copy, "server.json", data => {
+        expect(data.files.some(row => row.path === path)).toBe(true);
+        data.files = data.files.filter(row => row.path !== path);
+      });
+      expect(() => p2BaselineRoot(copy)).toThrow(`P2 baseline missing file: ${path}`);
+    });
+  }
+
+  test("dropping a nested file and its inventory row still cannot redefine completeness", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    const path = "git-dist/server/sqlite-history/reader.d.ts";
+    p2EditBaselineShard(copy, "server.json", data => { data.files = data.files.filter(row => row.path !== path); });
+    p2EditBaselineShard(copy, "metadata.json", data => {
+      data.inventory = data.inventory.filter(row => row.path !== path);
+      data.fileCount--;
+    });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline incomplete inventory");
+  });
+
+  for (const rehash of [false, true]) {
+    test(`tampered declaration is rejected even when self-reported hashes are ${rehash ? "rewritten" : "unchanged"}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      const path = "git-dist/core/copy.d.ts";
+      let changedHash = "";
+      p2EditBaselineShard(copy, "core.json", data => {
+        const row = data.files.find(row => row.path === path)!;
+        const bytes = Buffer.from(row.base64, "base64");
+        bytes[0] = bytes[0]! ^ 1;
+        row.base64 = bytes.toString("base64");
+        changedHash = p2Digest(bytes);
+        if (rehash) row.sha256 = changedHash;
+      });
+      if (rehash) p2EditBaselineShard(copy, "metadata.json", data => {
+        data.inventory.find(row => row.path === path)!.sha256 = changedHash;
+      });
+      expect(() => p2BaselineRoot(copy)).toThrow(rehash
+        ? "P2 baseline pinned shard hash mismatch: metadata.json"
+        : `P2 baseline file hash mismatch: ${path}`);
+    });
+  }
+
+  test("wrong byte length is rejected before materialization", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    p2EditBaselineShard(copy, "core.json", data => { data.files[0]!.byteLength++; });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline byte length mismatch:");
+  });
+
+  test("duplicate payload path is refused even when all bytes remain authentic", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    p2EditBaselineShard(copy, "core.json", data => { data.files.push({ ...data.files[0]! }); });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline duplicate file:");
+  });
+
+  test("duplicate inventory path is refused", () => {
+    const copy = p2BaselineCopy();
+    p2BaselineRoot(copy);
+    p2EditBaselineShard(copy, "metadata.json", data => { data.inventory[1] = { ...data.inventory[0]! }; });
+    expect(() => p2BaselineRoot(copy)).toThrow("P2 baseline duplicate inventory path:");
+  });
+
+  for (const path of ["../escape.d.ts", "/tmp/escape.d.ts", "git-dist/core/../../escape.d.ts", "git-dist/core/escape.js", "git-dist\\core\\escape.d.ts"]) {
+    test(`refuses an escaping or disallowed payload path: ${path}`, () => {
+      const copy = p2BaselineCopy();
+      p2BaselineRoot(copy);
+      p2EditBaselineShard(copy, "core.json", data => { data.files[0]!.path = path; });
+      expect(() => p2BaselineRoot(copy)).toThrow(`P2 baseline unsafe or unlisted path: ${path}`);
+    });
+  }
+});
+
+test("P2 complete built surface matches manifests and immutable .22", () => {
+  const result = checkContract({
+    packageRoot: resolve(import.meta.dir, ".."),
+    baselinePackageRoot: p2BaselineRoot(),
+  });
+  expect(result.currentVersion).toBe("0.23.0");
+  expect(result.errors).toEqual([]);
+});
 
 describe("P2 public built and packed WS API", () => {
   for (const [label, make] of [["built", pArtifactFixture], ["packed", p2PackedArtifact]] as const) {
@@ -2164,27 +2444,37 @@ describe("P2 public built and packed WS API", () => {
     expect(result.stderr).not.toContain("Cannot find");
   });
 
-  for (const [label, before, after, code, text] of [
-    ["removed drain", "    quiesceAndDrain(): Promise<void>;", "", 2339, "quiesceAndDrain"],
-    ["narrowed return", "    quiesceAndDrain(): Promise<void>;", "    quiesceAndDrain(): void;", 2322, "void"],
-    ["required option", "    ownedLifetime?: boolean;", "    ownedLifetime: boolean;", 2741, "ownedLifetime"],
-    ["removed legacy member", "    stop(): void;", "", 2339, "stop"],
-    ["missing inventory type", "export type MuxOwnedTaskInventory =", "type MuxOwnedTaskInventory =", 2305, "MuxOwnedTaskInventory"],
+  for (const [label, before, after, code, text, contractCode, contractName] of [
+    ["removed drain", "    quiesceAndDrain(): Promise<void>;", "", 2339, "quiesceAndDrain", "signature-mismatch", "TmuxWsMux"],
+    ["narrowed return", "    quiesceAndDrain(): Promise<void>;", "    quiesceAndDrain(): void;", 2322, "void", "signature-mismatch", "TmuxWsMux"],
+    ["required option", "    ownedLifetime?: boolean;", "    ownedLifetime: boolean;", 2741, "ownedLifetime", "baseline-signature-change", "TmuxWsMuxOptions"],
+    ["removed legacy member", "    stop(): void;", "", 2339, "stop", "baseline-signature-change", "TmuxWsMux"],
+    ["missing inventory type", "export type MuxOwnedTaskInventory =", "type MuxOwnedTaskInventory =", 2305, "MuxOwnedTaskInventory", "missing-protected-export", "MuxOwnedTaskInventory"],
   ] as const) {
     test(`actual copied declarations reject ${label} after positive setup`, () => {
       const root = pArtifactFixture();
       p2AssertPublicTypes(root);
       p2AssertPublicRuntime(root);
       expect(p2ArtifactComparison(root).errors).toEqual([]);
-      p2Replace(join(root, "git-dist/server/ws-mux.d.ts"), before, after);
+      const declaration = join(root, "git-dist/server/ws-mux.d.ts");
+      if (label === "missing inventory type") {
+        // Disable ambient implicit exports; normalization must pass all three
+        // positive oracles before removing the actual export modifier.
+        writeFileSync(declaration, readFileSync(declaration, "utf8") + "\nexport {};\n");
+        p2AssertPublicTypes(root);
+        p2AssertPublicRuntime(root);
+        expect(p2ArtifactComparison(root).errors).toEqual([]);
+      }
+      p2Replace(declaration, before, after);
       const negative = p2CompilePublic(root);
       expect(negative.resolution).toBe(join(root, "git-dist/server/index.d.ts"));
       expect(negative.errors.some(d => d.code === code && d.text.includes(text))).toBe(true);
       expect(negative.errors.some(d => d.code === 2307 || d.code === 1005)).toBe(false);
       // The real public JS still imports/runs: parse/setup failure is not RED.
       p2AssertPublicRuntime(root);
-      expect(p2ArtifactComparison(root).errors.some(d => d.name === "TmuxWsMux"
-        || d.name === "TmuxWsMuxOptions" || d.name === "MuxOwnedTaskInventory")).toBe(true);
+      expect(p2ArtifactComparison(root).errors).toContainEqual(expect.objectContaining({
+        code: contractCode, subpath: "server", name: contractName,
+      }));
     });
   }
 

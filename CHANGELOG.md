@@ -3,7 +3,7 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.22.0-dist`.
 
-## v0.23.0 — release preparation
+## v0.23.0
 
 - server: opt in with `ownedLifetime: true` at construction, before starting
   work. Public `TmuxWsMux.quiesceAndDrain(): Promise<void>` revokes admission
@@ -32,8 +32,10 @@ scripts): `thumbmux@github:<owner>/<repo>#v0.22.0-dist`.
   `PLAYWRIGHT_FROM` override. The current source no longer embeds a private
   installation path; historical blobs are unchanged. Module-resolution checks
   do not certify WebKit/browser semantics.
-- Validation: typecheck/build and artifact inventory are preparation only.
-  Contract/runtime tests await paired review and the dedicated runner.
+- Validation evidence is bound to the immutable source/dist tuple and its CI run
+  attempts. Typecheck, builds and artifact inventories alone do not certify
+  contract/runtime behavior. See the matching release evidence; this changelog
+  does not grant production activation.
 
 ## v0.22.0 — 2026-10-13
 
