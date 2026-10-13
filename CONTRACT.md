@@ -487,3 +487,72 @@ lockfile remain outside it.
   Hosts may set `cookieName` explicitly now. `server/tests/token-guard.test.ts`
   pins the current default; the documented-default rule makes an earlier change
   breaking.
+
+
+## Opt-in owned mux lifetime (WS-LIFETIME)
+
+`new TmuxWsMux({ ...options, ownedLifetime: true })` opts in **before the first
+producer or dispatch**. `quiesceAndDrain(): Promise<void>` is a terminal barrier;
+`getOwnedTaskInventory(): MuxOwnedTaskInventory` is a copied diagnostic snapshot,
+not an idle certificate. The existing `thumbmux/server` barrel exports this API.
+No extra import, task ledger, dependency proxy or drain promise is created when
+`ownedLifetime` is absent or false. A legacy instance rejects a drain request
+without changing its state: work that was never tracked cannot be certified
+retroactively.
+
+Calling the barrier synchronously revokes new public dispatch (including direct
+subscribe, input, resize, history, list, reset, rename and backpressure entry
+points), timer scheduling, saved pipe callbacks and projection notifications.
+It cancels timers and invokes every owned dirty-pipe/watch/route/dirty disposer,
+even if another disposer fails. A disposer must synchronously revoke its producer;
+it may return a promise for completion. The mux guards saved callbacks as well.
+Network sends are suppressed after revocation. Already admitted captures keep
+their archive/output-hook work; closing the last viewer in owned mode detaches
+that viewer but retains an in-flight capture's lifecycle through its queued
+successors, then drops its unused state. Explicit session invalidation still
+revokes the old session identity. Reconnects never receive frames on the old
+socket.
+
+Drain awaits a separate ledger of actual promises to a fixed point: capture
+queues and successors (including archive-boundary/geometry requeues), complete
+poll continuations, projected before/after history replies, v2 history reads and
+replies, returned async driver/input/hook/socket operations, and disposer
+completion. The ledger is independent of subscription/capture-tail maps. Tasks
+registered by admitted continuations during draining are included. There is no
+timeout success, snapshot-count success, or caller-provided `drained` proof.
+An unresolved dependency keeps the barrier pending.
+
+Owned dependency wrappers preserve method receivers and normalize a returned
+thenable once. A void hook/driver/disposer that starts async work must **return
+its completion promise**, including all its child work. Detached work, external
+host pollers, retention lanes, journal flushes whose hooks return only a boolean,
+listener/request registries, DB handles, locks, provider processes and durable
+collectors remain the host owner's responsibility. Value-returning policy,
+archive ingest/boundary, projection snapshot/selection and geometry contracts
+remain synchronous; this option does not turn those contracts into async APIs.
+The option must not be used to certify opaque fire-and-forget adapters.
+
+Any observed dependency/task failure is sticky, including failures caught by
+legacy wire-error/telemetry handling. Drain still joins the remaining work, then
+rejects with `AggregateError` and phase `failed`. Failed teardown closures remain
+retained (`retainedCleanups`); diagnostics may include the same cause at multiple
+owning boundaries. A repeated drain call returns the **same** promise and never
+retries or reports success after failure. The host must retain its DB/lock and
+resource ownership on rejection; neither a closed socket nor an empty task list
+permits release. On success the phase is `drained` and this instance cannot be
+reopened. Construct a new instance for the next owned generation.
+
+For callers with no opt-in, `stop(): void`, subscription/reconnect resume,
+protocol frames, hook isolation and default producer behavior retain their
+previous semantics. On an **owned** instance `stop()` starts terminal revocation
+but remains void; callers must await `quiesceAndDrain()` to obtain the result.
+`handleDrain(ws)` remains a backpressure callback, never a lifetime barrier.
+
+The package neither closes host DB/locks nor retires long-lived collectors.
+For restart/off the host must stop its own ingress/producers, await this barrier
+and all host work, close the old host, then release its old DB/lock while keeping
+the verified pane/provider/collector available for adoption. Final retirement
+additionally waits for the actual owners of those resources. These are distinct
+host lifecycles; package drain alone is not a host handoff receipt or ON proof.
+Release metadata, public artifact provenance, consumer pins, host wiring and
+installed-runtime verification must follow in their owning lots.

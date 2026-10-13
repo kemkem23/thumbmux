@@ -397,6 +397,9 @@ export type TmuxWsMuxOptions<
    * `perMessageDeflate: true` on Bun.serve's websocket config. Default false
    * (other WS engines may not accept a boolean second argument). */
   compressFrames?: boolean;
+  /** Opt in before any work starts. Enables terminal quiesceAndDrain and its
+   * independent task ledger. Absent/false retains the legacy stop/resume path. */
+  ownedLifetime?: boolean;
   driver: TmuxDriver<SessionRow>;
   pipes?: PipeManagerLike | null;
   archive?: HistoryArchiveLike | null;
@@ -462,14 +465,162 @@ function boundProjectedHistoryPage(page: unknown): unknown {
   return { ...(page as object), markers: bounded.slice(-HISTORY_PAGE_MARKER_LIMIT) };
 }
 
+function muxThenable(value: unknown): value is PromiseLike<unknown> {
+  return value !== null && (typeof value === "object" || typeof value === "function")
+    && "then" in value && typeof value.then === "function";
+}
+
+/** Diagnostic snapshot, never a substitute for awaiting quiesceAndDrain. */
+export type MuxOwnedTaskInventory = {
+  phase: "legacy" | "active" | "quiescing" | "drained" | "failed";
+  tasks: readonly { kind: string }[];
+  failures: readonly { kind: string; cause: unknown }[];
+  retainedCleanups: number;
+};
+
+type OwnedLifetime = {
+  phase: "active" | "quiescing" | "drained" | "failed";
+  tasks: Map<Promise<void>, { kind: string }>;
+  failures: { kind: string; cause: unknown }[];
+  drain: Promise<void> | null;
+  cleanups: Set<() => unknown>;
+  captureOwners: Map<Set<unknown>, number>;
+};
+
 export class TmuxWsMux<
   WS extends WsLike = WsLike,
   SessionRow extends SessionListRow = SessionListItem,
 > {
   private compressFrames = false;
+  // No ledger, promises or dependency wrappers on the default constructor path.
+  private owned: OwnedLifetime | null = null;
+
+  private get ownedRevoked(): boolean {
+    return this.owned !== null && this.owned.phase !== "active";
+  }
+
+  getOwnedTaskInventory(): MuxOwnedTaskInventory {
+    return {
+      phase: this.owned?.phase ?? "legacy",
+      tasks: this.owned ? [...this.owned.tasks.values()].map(task => ({ ...task })) : [],
+      failures: this.owned ? this.owned.failures.map(failure => ({ ...failure })) : [],
+      retainedCleanups: this.owned?.cleanups.size ?? 0,
+    };
+  }
+
+  /** Observe returned promises while preserving dependency receivers. The independent ledger survives unsubscribe/rename/map deletion. */
+  private trackOwnedTask<T>(kind: string, result: T): T {
+    const owned = this.owned;
+    if (!owned || !muxThenable(result)) return result;
+    const completion = Promise.resolve(result);
+    const task = completion.then(
+      () => { owned.tasks.delete(task); },
+      cause => { owned.failures.push({ kind, cause }); owned.tasks.delete(task); },
+    );
+    owned.tasks.set(task, { kind });
+    // Normalize a lazy thenable once, so tracking cannot execute its work twice.
+    return completion as T;
+  }
+
+  private ownedCall<T>(kind: string, call: () => T): T {
+    try { return this.trackOwnedTask(kind, call()); }
+    catch (cause) { this.owned?.failures.push({ kind, cause }); throw cause; }
+  }
+
+  private ownFunction<T extends (...args: any[]) => any>(kind: string, fn: T): T {
+    if (!this.owned) return fn;
+    return ((...args: Parameters<T>) => this.ownedCall(kind, () => fn.apply(this, args))) as T;
+  }
+
+  /** Only owned instances wrap host dependencies. Void-returning TS hooks can
+   * return promises at runtime; those promises must cover all their child work.
+   * Sync value contracts (capture metadata, ingest, policy) remain synchronous. */
+  private ownDependency<T extends object>(kind: string, dependency: T): T {
+    if (!this.owned) return dependency;
+    return new Proxy({} as T, {
+      get: (_target, key) => {
+        const value = Reflect.get(dependency, key, dependency);
+        return typeof value === "function"
+          ? (...args: unknown[]) => this.ownedCall(`${kind}.${String(key)}`, () => value.apply(dependency, args))
+          : value;
+      },
+    });
+  }
+
+  /** Terminal, opt-in barrier. Revocation happens before this method returns.
+   * Repeated calls return the same promise, including the same sticky failure. */
+  quiesceAndDrain(): Promise<void> {
+    const owned = this.owned;
+    if (!owned) return Promise.reject(new Error("ownedLifetime must be enabled at construction"));
+    if (owned.drain) return owned.drain;
+    owned.phase = "quiescing";
+    // Publish the promise before invoking teardown callbacks (which may reenter).
+    owned.drain = Promise.resolve().then(async () => {
+      for (;;) {
+        await Promise.all([...owned.tasks.keys()]);
+        // An admitted continuation may have installed a disposer after the
+        // synchronous revoke, or registered a successor/hook during this wait.
+        this.revokeOwnedProducers();
+        if (owned.tasks.size === 0) break;
+      }
+      if (owned.failures.length) {
+        owned.phase = "failed";
+        throw new AggregateError(owned.failures.map(failure => failure.cause), "mux owned drain failed; retain host ownership");
+      }
+      owned.phase = "drained";
+    });
+    this.revokeOwnedProducers();
+    return owned.drain;
+  }
+
+  private ownedCleanup<T>(kind: string, call: () => T): T {
+    const owned = this.owned!;
+    // Retain the actual disposer until success, including async failure.
+    owned.cleanups.add(call);
+    const result = this.ownedCall(kind, call);
+    if (muxThenable(result)) {
+      return this.trackOwnedTask(`${kind}.completion`, Promise.resolve(result).then(value => {
+        owned.cleanups.delete(call);
+        return value;
+      })) as T;
+    }
+    owned.cleanups.delete(call);
+    return result;
+  }
+
+  private revokeOwnedProducers(): void {
+    const attempt = (kind: string, call: () => unknown) => {
+      try { this.ownedCleanup(kind, call); } catch { /* recorded; attempt all other owners */ }
+    };
+    if (this.interval) { clearInterval(this.interval); this.interval = null; }
+    if (this.sessionListInterval) { clearInterval(this.sessionListInterval); this.sessionListInterval = null; }
+    if (this.burstTimer) { clearTimeout(this.burstTimer); this.burstTimer = null; }
+    for (const timers of [this.immediateCaptureTimers, this.pipeDebounceTimers, this.pipeMaxTimers]) {
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    }
+    for (const timer of this.blockedTimeouts.values()) attempt("blockedTimer.off", () => muxDisarmTimeout(timer));
+    this.blockedTimeouts.clear();
+    for (const session of [...this.piped]) {
+      this.piped.delete(session);
+      attempt("pipe.off", () => this.pipes?.stopPipe(session));
+    }
+    for (const [session, off] of [...this.projectionWatches]) {
+      this.projectionWatches.delete(session);
+      attempt("projection.watch.off", off);
+    }
+    const routeOff = this.projectionRouteOff;
+    this.projectionRouteOff = null;
+    if (routeOff) attempt("projection.route.off", routeOff);
+    const dirtyOff = this.projectionDirtyOff;
+    this.projectionDirtyOff = null;
+    if (dirtyOff) attempt("projection.dirty.off", dirtyOff);
+  }
 
   /** Send one frame; with compressFrames, opt into Bun's per-message deflate. */
   private wsSend(ws: any, data: string) {
+    if (this.ownedRevoked) return 0;
+    if (this.owned) return this.ownedCall("socket.send", () => this.compressFrames ? ws.send(data, true) : ws.send(data));
     if (this.compressFrames) return ws.send(data, true);
     return ws.send(data);
   }
@@ -584,21 +735,24 @@ export class TmuxWsMux<
   private blockedTimeouts = new Map<WS, ReturnType<typeof setTimeout>>();
 
   constructor(opts: TmuxWsMuxOptions<WS, SessionRow>) {
+    if (opts.ownedLifetime === true) {
+      this.owned = { phase: "active", tasks: new Map(), failures: [], drain: null, cleanups: new Set(), captureOwners: new Map() };
+    }
     this.compressFrames = opts.compressFrames === true;
-    this.driver = opts.driver;
-    this.pipes = opts.pipes ?? null;
-    this.archive = opts.archive ?? null;
-    this.projection = opts.projection ?? null;
-    this.newarchV2 = opts.newarchV2 ?? null;
+    this.driver = this.ownDependency("driver", opts.driver);
+    this.pipes = opts.pipes ? this.ownDependency("pipes", opts.pipes) : null;
+    this.archive = opts.archive ? this.ownDependency("archive", opts.archive) : null;
+    this.projection = opts.projection ? this.ownDependency("projection", opts.projection) : null;
+    this.newarchV2 = opts.newarchV2 ? this.ownFunction("v2.selection", opts.newarchV2) : null;
     this.newarchV2History = opts.newarchV2History ?? null;
     this.projectionRouteOff = this.projection?.onRouteChange((session) => this.handleProjectionRouteChange(session)) ?? null;
     this.projectionDirtyOff = this.projection?.onLegacyDirty?.((session) => {
-      if (this.projection?.owns(session)) return;
+      if (this.ownedRevoked || this.projection?.owns(session)) return;
       const viewers = this.subscribers.get(session);
       if (viewers && viewers.size > 0) this.queueCapture(session);
     }) ?? null;
-    this.hooks = opts.hooks ?? {};
-    this.profileOf = opts.profile ?? (() => DEFAULT_PROFILE);
+    this.hooks = this.ownDependency("hooks", opts.hooks ?? {});
+    this.profileOf = this.ownFunction("profile", opts.profile ?? (() => DEFAULT_PROFILE));
     this.liveLineLimit = opts.liveLineLimit ?? 2000;
     this.POLL_NORMAL = opts.pollNormalMs ?? 250;
     this.POLL_BURST = opts.pollBurstMs ?? 100;
@@ -609,10 +763,10 @@ export class TmuxWsMux<
     this.INITIAL_CAPTURE_START_LINE = -Math.min(250, this.liveLineLimit);
     this.DEFAULT_CAPTURE_START_LINE = -this.liveLineLimit;
     this.currentRate = this.POLL_NORMAL;
-    this.log = opts.log ?? (() => {});
-    this.logError = opts.logError ?? console.error;
+    this.log = this.ownFunction("log", opts.log ?? (() => {}));
+    this.logError = this.ownFunction("logError", opts.logError ?? console.error);
     this.sessionListProvider = this.withNewarchV2(() => this.driver.listSessions());
-    const bp = opts.backpressure ?? {};
+    const bp = this.ownDependency("backpressure", opts.backpressure ?? {});
     this.bpEnabled = bp.enabled !== false;
     this.bpMaxBufferedBytes = bp.maxBufferedBytes ?? 8 * 1024 * 1024;
     this.bpMaxBlockedMs = bp.maxBlockedMs ?? 30_000;
@@ -621,7 +775,8 @@ export class TmuxWsMux<
   }
 
   setSessionListProvider(provider?: () => readonly SessionRow[]) {
-    this.sessionListProvider = this.withNewarchV2(provider ?? (() => this.driver.listSessions()));
+    if (this.ownedRevoked) return;
+    this.sessionListProvider = this.withNewarchV2(provider ? this.ownFunction("sessionListProvider", provider) : (() => this.driver.listSessions()));
     this.lastSessionsJson = "";
   }
 
@@ -655,6 +810,7 @@ export class TmuxWsMux<
   }
 
   subscribe(session: string, ws: WS, client?: unknown, opts: { tail?: number; delta?: boolean } = {}) {
+    if (this.ownedRevoked) return;
     this.hooks.onSubscribe?.(session, ws, client);
     if (this.hooks.canSubscribe?.(session, ws, client) === false) return;
     let set = this.subscribers.get(session);
@@ -740,17 +896,18 @@ export class TmuxWsMux<
   }
 
   private watchProjection(session: string) {
+    if (this.ownedRevoked) return;
     if (!this.projection || this.projectionWatches.has(session)) return;
     const viewers = this.subscribers.get(session);
     this.projectionWatches.set(session, this.projection.watch(session, () => {
-      if (viewers && this.ownsSessionLifecycle(session, viewers) && this.projection?.owns(session)) this.broadcastProjected(session, viewers);
+      if (!this.ownedRevoked && viewers && this.ownsSessionLifecycle(session, viewers) && this.projection?.owns(session)) this.broadcastProjected(session, viewers);
     }));
   }
 
   private unwatchProjection(session: string) {
     const off = this.projectionWatches.get(session);
     this.projectionWatches.delete(session);
-    try { off?.(); } catch {}
+    try { if (off) this.owned ? this.ownedCleanup("projection.watch.off", off) : off(); } catch {}
   }
 
   /**
@@ -760,12 +917,13 @@ export class TmuxWsMux<
    * marked `resync` from the new route.
    */
   private handleProjectionRouteChange(session: string): void {
+    if (this.ownedRevoked) return;
     const viewers = this.subscribers.get(session);
     this.unwatchProjection(session);
     this.lastNewarch.delete(session);
     if (this.projection?.ownsPipe?.(session) && this.piped.delete(session)) {
       this.clearPipeCaptureTimers(session);
-      try { this.pipes?.stopPipe(session); } catch {}
+      try { this.owned ? this.ownedCleanup("pipe.route.off", () => this.pipes?.stopPipe(session)) : this.pipes?.stopPipe(session); } catch {}
     }
     if (!viewers || viewers.size === 0) return;
     this.contents.delete(session);
@@ -789,6 +947,7 @@ export class TmuxWsMux<
   }
 
   unsubscribe(session: string, ws: WS, client?: unknown) {
+    if (this.ownedRevoked) return;
     this.projectedHistoryLifetimes.get(ws)?.delete(session);
     this.hooks.onUnsubscribe?.(session, ws, client);
     this.tails.get(session)?.delete(ws);
@@ -797,7 +956,7 @@ export class TmuxWsMux<
     if (set) {
       set.delete(ws);
       this.projection?.setViewers?.(session, set.size);
-      if (set.size === 0) {
+      if (set.size === 0 && !this.owned?.captureOwners.has(set)) {
         this.dropSessionState(session);
       }
     }
@@ -806,6 +965,7 @@ export class TmuxWsMux<
   }
 
   unsubscribeAll(ws: WS) {
+    if (this.ownedRevoked) return;
     this.projectedHistoryLifetimes.delete(ws);
     this.hooks.onSocketClose?.(ws);
     this.sessionListSubscribers.delete(ws);
@@ -816,7 +976,7 @@ export class TmuxWsMux<
     for (const [session, set] of this.subscribers) {
       set.delete(ws);
       this.projection?.setViewers?.(session, set.size);
-      if (set.size === 0) {
+      if (set.size === 0 && !this.owned?.captureOwners.has(set)) {
         this.dropSessionState(session);
       }
     }
@@ -826,6 +986,7 @@ export class TmuxWsMux<
 
   /** True while this socket is being skipped because it has not drained. */
   isBackpressured(ws: WS): boolean {
+    if (this.ownedRevoked) return true;
     return this.blockedSockets.has(ws);
   }
 
@@ -856,6 +1017,7 @@ export class TmuxWsMux<
    * broadcast and therefore must push the current cached content itself.
    */
   handleDrain(ws: WS): void {
+    if (this.ownedRevoked) return;
     if (this.shedSockets.has(ws)) return;
 
     // A3-5: a real drop (status 0) records session-list debt without marking
@@ -953,10 +1115,12 @@ export class TmuxWsMux<
    * drop the only timer and leave the peer blocked forever on an idle session.
    */
   private armBlockedTimeout(ws: WS) {
+    if (this.ownedRevoked) return;
     this.clearBlockedTimeout(ws);
     if (!this.bpEnabled) return;
     if (!(this.bpMaxBlockedMs > 0) || !Number.isFinite(this.bpMaxBlockedMs)) return;
     const timer = muxArmTimeout(() => {
+      if (this.ownedRevoked) return;
       this.blockedTimeouts.delete(ws);
       if (this.shedSockets.has(ws)) return;
       if (!this.blockedSockets.has(ws)) return;
@@ -981,7 +1145,7 @@ export class TmuxWsMux<
     }
     const any = ws as any;
     if (typeof any.close === "function") {
-      try { any.close(1013, reason); } catch {}
+      try { this.owned ? this.ownedCall("socket.close", () => any.close(1013, reason)) : any.close(1013, reason); } catch {}
     }
   }
 
@@ -1242,6 +1406,12 @@ export class TmuxWsMux<
    * immediate captures, pipe debounces) and stop active pipes. For hosts
    * that create short-lived muxes (tests, per-request servers). */
   stop() {
+    if (this.owned) {
+      // Owned stop revokes too, but is still void: only the explicit barrier
+      // conveys completion/failure. Suppress an unobserved rejection here.
+      void this.quiesceAndDrain().catch(() => {});
+      return;
+    }
     this.projectedHistoryLifetimes = new WeakMap();
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.sessionListInterval) { clearInterval(this.sessionListInterval); this.sessionListInterval = null; }
@@ -1605,6 +1775,7 @@ export class TmuxWsMux<
    * purged; notification and detachment are intentionally not optional.
    */
   invalidateSession(session: string, opts: InvalidateSessionOptions = {}): number {
+    if (this.ownedRevoked) return 0;
     const viewers = [...(this.subscribers.get(session) ?? [])];
     this.dropSessionState(session);
     // Unlike an ordinary last-viewer unsubscribe, invalidation ends the tmux
@@ -1650,6 +1821,7 @@ export class TmuxWsMux<
    * changes underneath the same logical session name.
    */
   resetSessionOutput(session: string): number {
+    if (this.ownedRevoked) return 0;
     const viewers = this.subscribers.get(session);
     if (!viewers || viewers.size === 0) return 0;
     this.contents.delete(session);
@@ -1698,7 +1870,8 @@ export class TmuxWsMux<
     this.lastAppliedGeometry.delete(session);
     if (this.piped.delete(session)) {
       try {
-        this.pipes?.stopPipe(session);
+        if (this.owned) this.ownedCleanup("pipe.session.off", () => this.pipes?.stopPipe(session));
+        else this.pipes?.stopPipe(session);
       } catch (error: unknown) {
         try {
           const message = error instanceof Error ? error.message : String(error);
@@ -1711,6 +1884,7 @@ export class TmuxWsMux<
   }
 
   subscribeSessions(ws: WS, client?: unknown) {
+    if (this.ownedRevoked) return;
     this.sessionListSubscribers.add(ws);
     this.sessionListClients.set(ws, client);
     // Session-list is a server push. While blocked, remember the debt and
@@ -1751,6 +1925,7 @@ export class TmuxWsMux<
   }
 
   unsubscribeSessions(ws: WS) {
+    if (this.ownedRevoked) return;
     this.sessionListSubscribers.delete(ws);
     this.sessionListClients.delete(ws);
     // Opt-out must cancel list debt — otherwise handleDrain redelivers after
@@ -1763,6 +1938,7 @@ export class TmuxWsMux<
    * the host's onResizeRequest hook may suppress the request (e.g. a
    * mobile-first size arbiter). */
   handleResize(session: string, cols: number, rows: number, ws?: WS, client?: unknown): NewarchV2GeometryReply | null {
+    if (this.ownedRevoked) return null;
     this.hooks.onResizeTelemetry?.(session, ws ?? null, { cols, rows }, client);
     const fixed = this.newarchV2Fixed(session);
     if (fixed) return fixed.reply;
@@ -1777,6 +1953,7 @@ export class TmuxWsMux<
   /** Actually resize tmux + refresh captures. Also used by host policy (size
    * arbiter) to re-apply a surviving viewer's geometry after a hold releases. */
   applyGeometry(session: string, cols: number, rows: number, ws?: WS): NewarchV2GeometryReply | null {
+    if (this.ownedRevoked) return null;
     // Host policy (size arbiter) calls this directly: the NEWARCH gate has to
     // sit here too, not only in handleResize. Returns the fixed geometry.
     const fixed = this.newarchV2Fixed(session);
@@ -1818,6 +1995,7 @@ export class TmuxWsMux<
   }
 
   handleKeys(session: string, data: string, ws?: WS, client?: unknown) {
+    if (this.ownedRevoked) return;
     if (ws) this.hooks.onKeys?.(session, ws, client);
     try {
       this.driver.sendKeys(session, data);
@@ -1868,17 +2046,18 @@ export class TmuxWsMux<
       && this.projection.routeGeneration(session) === generation
       && this.subscribers.get(session) === subscribers && subscribers?.has(ws)
       && this.projectedHistoryLifetimes.get(ws)?.get(session) === lifetime;
-    void Promise.resolve(result).then(page => {
+    this.trackOwnedTask("history.projected.reply", Promise.resolve(result).then(page => {
       if (!current()) return;
       this.wsSend(ws, JSON.stringify({channel: session, type: 'history', data: JSON.stringify(boundProjectedHistoryPage(page))}));
     }).catch(error => {
       if (!current()) return;
       this.reportArchiveReadErrorBestEffort('readBefore', session, error);
       this.sendHistoryReadErrorBestEffort(session, ws);
-    });
+    }));
   }
 
   expandHistory(session: string, ws: WS, beforeLine?: number | null, limit?: number) {
+    if (this.ownedRevoked) return;
     let history: unknown = EMPTY_HISTORY_PAGE;
     let readFailed = false;
     if (this.projection?.owns(session)) {
@@ -1942,6 +2121,7 @@ export class TmuxWsMux<
   }
 
   expandHistoryAfter(session: string, ws: WS, afterLine: number | null, limit?: number) {
+    if (this.ownedRevoked) return;
     let history: unknown = EMPTY_HISTORY_PAGE;
     let readFailed = false;
     if (this.projection?.owns(session)) {
@@ -2006,6 +2186,7 @@ export class TmuxWsMux<
    * empty ok page; a cursor never becomes a line number on this path.
    */
   expandHistoryV2(msg: NewarchV2HistoryExpandMessage, ws: WS): void {
+    if (this.ownedRevoked) return;
     const session = typeof msg?.session === "string" && msg.session.length > 0 ? msg.session : null;
     const requestId = typeof msg?.requestId === "string" && msg.requestId.length > 0
       && msg.requestId.length <= V2_REQUEST_ID_MAX ? msg.requestId : null;
@@ -2051,15 +2232,15 @@ export class TmuxWsMux<
     };
     let result: Result<V2HistoryPage> | PromiseLike<Result<V2HistoryPage>>;
     const method = request.direction === "after" ? "readAfter" : "readBefore";
-    try { result = reader(session, request); } catch (error) {
+    try { result = this.owned ? this.ownedCall("history.v2.read", () => reader(session, request)) : reader(session, request); } catch (error) {
       this.reportArchiveReadErrorBestEffort(method, session, error);
       return fail("owner-unavailable", V2_HISTORY_RETRY_MS);
     }
     if (result && typeof (result as PromiseLike<unknown>).then === "function") {
-      void Promise.resolve(result).then(finish, (error: unknown) => {
+      this.trackOwnedTask("history.v2.reply", Promise.resolve(result).then(finish, (error: unknown) => {
         this.reportArchiveReadErrorBestEffort(method, session, error);
         fail("owner-unavailable", V2_HISTORY_RETRY_MS);
-      });
+      }));
       return;
     }
     finish(result);
@@ -2074,12 +2255,13 @@ export class TmuxWsMux<
    * Answers client keepalive pings: the thumbmux/svelte client closes the
    * connection when a ping goes unanswered for 8s. */
   handleMessage(msg: MuxClientMessage, ws: WS) {
+    if (this.ownedRevoked) return;
     if (msg.type === "history_expand_v2") {
       this.expandHistoryV2(msg, ws);
       return;
     }
     switch (msg.type) {
-      case "ping": try { ws.send('{"type":"pong"}'); } catch {} break;
+      case "ping": try { this.owned ? this.wsSend(ws, '{"type":"pong"}') : ws.send('{"type":"pong"}'); } catch {} break;
       case "client_info": this.hooks.onClientInfo?.(ws, msg.client); break;
       case "subscribe": if (msg.session) this.subscribe(msg.session, ws, msg.client, { tail: msg.tail, delta: msg.delta }); break;
       case "unsubscribe": if (msg.session) this.unsubscribe(msg.session, ws, msg.client); break;
@@ -2111,8 +2293,10 @@ export class TmuxWsMux<
   }
 
   private scheduleImmediateCapture(session: string) {
+    if (this.ownedRevoked) return;
     this.clearImmediateCapture(session);
     this.immediateCaptureTimers.set(session, setTimeout(() => {
+      if (this.ownedRevoked) return;
       this.immediateCaptureTimers.delete(session);
       this.queueCapture(session);
     }, 16));
@@ -2136,7 +2320,7 @@ export class TmuxWsMux<
 
   private queueCapture(session: string, opts: { fullHistory?: boolean } = {}): Promise<void> {
     const viewers = this.subscribers.get(session);
-    if (!viewers || viewers.size === 0) return Promise.resolve();
+    if (!viewers || (viewers.size === 0 && !this.owned?.captureOwners.has(viewers))) return Promise.resolve();
     if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
 
     if (this.queuedCapturesInFlight.has(session)) {
@@ -2146,7 +2330,10 @@ export class TmuxWsMux<
     }
 
     this.queuedCapturesInFlight.add(session);
-    const run = this.runQueuedCapture(session, viewers);
+    if (this.owned) {
+      this.owned.captureOwners.set(viewers, (this.owned.captureOwners.get(viewers) ?? 0) + 1);
+    }
+    const run = this.trackOwnedTask("capture.queue", this.runQueuedCapture(session, viewers));
     this.queuedCaptureTails.set(session, run);
     return run;
   }
@@ -2167,6 +2354,7 @@ export class TmuxWsMux<
       // string key while this old Promise is still settling. The viewer Set is
       // the ownership token: an old finally must not erase the new lane.
       if (!this.ownsSessionLifecycle(session, viewers)) {
+        this.releaseOwnedCapture(viewers);
         this.queuedCaptureTails.delete(session);
         return;
       }
@@ -2180,15 +2368,17 @@ export class TmuxWsMux<
       } else {
         this.queuedCaptureTails.delete(session);
       }
+      this.releaseOwnedCapture(viewers);
     }
   }
 
   // Debounce pipe signals with max wait: captures 15ms after last signal OR 100ms max
   private tryStartPipe(session: string) {
+    if (this.ownedRevoked) return;
     if (!this.pipes) return;
     const viewers = this.subscribers.get(session);
     if (!viewers || viewers.size === 0) return;
-    const ownsLifecycle = () => this.ownsSessionLifecycle(session, viewers);
+    const ownsLifecycle = () => !this.ownedRevoked && this.ownsSessionLifecycle(session, viewers);
     const started = this.pipes.startPipe(
       session,
       // onData: pipe-pane data = "dirty signal" → debounce with max wait
@@ -2235,6 +2425,7 @@ export class TmuxWsMux<
   }
 
   handleSessionRename(oldSession: string, newSession: string) {
+    if (this.ownedRevoked) return;
     // Always migrate subscribers (works for both piped and polled sessions)
     const previousViewers = this.subscribers.get(oldSession);
     const fullHistoryInFlight = previousViewers
@@ -2354,12 +2545,14 @@ export class TmuxWsMux<
 
   /** Switch to burst polling for a bit after keystrokes, then back to normal */
   private enterBurst() {
+    if (this.ownedRevoked) return;
     if (this.burstTimer) clearTimeout(this.burstTimer);
     if (this.currentRate !== this.POLL_BURST) {
       this.currentRate = this.POLL_BURST;
       this.restartPolling();
     }
     this.burstTimer = setTimeout(() => {
+      if (this.ownedRevoked) return;
       this.burstTimer = null;
       if (this.currentRate !== this.POLL_NORMAL) {
         this.currentRate = this.POLL_NORMAL;
@@ -2369,6 +2562,7 @@ export class TmuxWsMux<
   }
 
   private restartPolling() {
+    if (this.ownedRevoked) return;
     if (!this.interval) return; // not polling
     clearInterval(this.interval);
     this.interval = setInterval(() => this.poll(), this.currentRate);
@@ -2418,6 +2612,7 @@ export class TmuxWsMux<
         try {
           boundaryBeforeCapture = this.sampleArchiveBoundary(session);
         } catch (archiveCause) {
+          this.owned?.failures.push({ kind: "capture.archive", cause: archiveCause });
           const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
           try { this.logError(`[thumbmux-mux] archive boundary error for "${session}":`, message); } catch {}
           if (opts.fullHistory) this.queuedCapturesFullHistory.add(session);
@@ -2485,6 +2680,7 @@ export class TmuxWsMux<
             return;
           }
         } catch (archiveCause) {
+          this.owned?.failures.push({ kind: "capture.archive", cause: archiveCause });
           if (!this.ownsSessionLifecycle(session, viewers)) return;
           const message = archiveCause instanceof Error ? archiveCause.message : String(archiveCause);
           try {
@@ -2667,6 +2863,7 @@ export class TmuxWsMux<
       }
       this.sendGroupedOutputFrames(session, viewers, liveContent, cursor);
     } catch (cause) {
+      this.owned?.failures.push({ kind: "capture", cause });
       if (!this.ownsSessionLifecycle(session, viewers)) return;
       // Driver / outer failure — established wire contract for an unreachable
       // pane. Archive failures are handled above and never reach here (A3-4).
@@ -2733,11 +2930,32 @@ export class TmuxWsMux<
     this.projection?.fullReady?.(session, next.routeGeneration);
   }
 
+  private releaseOwnedCapture(viewers: Set<WS>): void {
+    const owners = this.owned?.captureOwners;
+    if (!owners) return;
+    const count = owners.get(viewers) ?? 0;
+    if (count > 1) { owners.set(viewers, count - 1); return; }
+    owners.delete(viewers);
+    // Queued successors share this set; renamed/reborn sessions have a fresh
+    // set. Only the last actual capture may retire its empty session state.
+    if (viewers.size === 0) {
+      for (const [session, current] of this.subscribers) {
+        if (current !== viewers) continue;
+        this.dropSessionState(session);
+        this.maybeStopPolling();
+        this.refreshSessionListSchedule();
+        break;
+      }
+    }
+  }
+
   private ownsSessionLifecycle(session: string, viewers: Set<WS>): boolean {
-    return viewers.size > 0 && this.subscribers.get(session) === viewers;
+    return (viewers.size > 0 || this.owned?.captureOwners.has(viewers) === true)
+      && this.subscribers.get(session) === viewers;
   }
 
   private ensurePolling() {
+    if (this.ownedRevoked) return;
     if (this.interval) return;
     this.log(`[thumbmux-mux] Starting adaptive poll (${this.currentRate}ms)`);
     this.interval = setInterval(() => this.poll(), this.currentRate);
@@ -2752,6 +2970,7 @@ export class TmuxWsMux<
   }
 
   private refreshSessionListSchedule() {
+    if (this.ownedRevoked) return;
     const needsDedicatedListPolling = this.sessionListSubscribers.size > 0 && this.subscribers.size === 0;
 
     if (needsDedicatedListPolling) {
@@ -2766,7 +2985,12 @@ export class TmuxWsMux<
     }
   }
 
-  private async poll() {
+  private poll(): Promise<void> {
+    if (this.ownedRevoked) return Promise.resolve();
+    return this.trackOwnedTask("poll", this.runPoll());
+  }
+
+  private async runPoll() {
     if (this.inFlight) return;
     this.inFlight = true;
 
@@ -2835,6 +3059,7 @@ export class TmuxWsMux<
    * existing dedupe, filtering, and backpressure rules still apply.
    */
   broadcastSessionList() {
+    if (this.ownedRevoked) return;
     try {
       const sessions = this.sessionListProvider();
       const json = JSON.stringify(sessions);
