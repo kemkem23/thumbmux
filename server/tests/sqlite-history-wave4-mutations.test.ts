@@ -12,6 +12,24 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+// Keep child runners on the frozen suite's timeout contract, read once here.
+const childTestTimeoutArgs = (() => {
+  const suitePath = resolve(import.meta.dir, '../../../../ops/testing/thumbmux-suite.py');
+  const invalid = (detail: string) => new Error(`M4 child test timeout contract (${suitePath}): ${detail}`);
+  let source: string;
+  try { source = readFileSync(suitePath, 'utf8'); }
+  catch (error) { throw invalid(`cannot read suite source: ${String(error)}`); }
+  const blocks = [...source.matchAll(/^def traced_command\([^\n]*\):[^\n]*\n[\s\S]*?(?=^def |$(?![\s\S]))/gm)];
+  if (blocks.length !== 1) throw invalid(`expected one traced_command block, found ${blocks.length}`);
+  const timeouts = [...blocks[0]![0].matchAll(/"test"\s*,\s*"--timeout"\s*,\s*"([0-9]+)"/g)];
+  if (timeouts.length !== 1) throw invalid(`expected one decimal test timeout tuple, found ${timeouts.length}`);
+  const value = timeouts[0]![1]!;
+  if (!Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
+    throw invalid(`timeout must be a positive safe integer, got ${value}`);
+  }
+  return ['--timeout', value] as const;
+})();
+
 type Mutant = { name: string; pattern: string; file: string; from: string; to: string };
 
 test('wave4 reader detectors kill every injected fault and the clean tree passes before and after', async () => {
@@ -62,7 +80,7 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
     writeFileSync(join(copiedCore, 'package.json'), '\n{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}\n');
     writeFileSync(join(root, 'package.json'), '\n{"type":"module"}\n');
     const run = async (name: string, pattern?: string) => {
-      const args = [process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts'];
+      const args = [process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts'];
       if (pattern) args.push('--test-name-pattern', pattern);
       const child = Bun.spawn(args, { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -170,7 +188,7 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     let fullRuns = 0;
     const run = async (pattern: string) => {
       const started = performance.now();
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const result = { exit, output: out + err, signal: child.signalCode, elapsedMs: performance.now() - started };
@@ -313,7 +331,7 @@ test('contract repair mutants go red then restored real seams go green', async (
       let mutant=original.replace(m.from,m.to);
       if(m.from2) {expect(mutant.includes(m.from2)).toBe(true);mutant=mutant.replace(m.from2,m.to2!);}
       const run=async()=>{
-        const child=Bun.spawn([process.execPath,'test',`./packages/thumbmux/server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
+        const child=Bun.spawn([process.execPath,'test',...childTestTimeoutArgs,`./packages/thumbmux/server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
           {cwd:root,stdout:'pipe',stderr:'pipe'});
         const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
         return {exit,output:out+err};
@@ -361,7 +379,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
     writeFileSync(join(root,'package.json'),'{"type":"module"}');
     const file=join(root,'server/src/history-engine.ts'),original=readFileSync(file,'utf8');
     const run=async(pattern:string)=>{
-      const child=Bun.spawn([process.execPath,'test','./server/tests/sqlite-history-wave4.test.ts','--test-name-pattern',pattern],{cwd:root,stdout:'pipe',stderr:'pipe'});
+      const child=Bun.spawn([process.execPath,'test',...childTestTimeoutArgs,'./server/tests/sqlite-history-wave4.test.ts','--test-name-pattern',pattern],{cwd:root,stdout:'pipe',stderr:'pipe'});
       const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);return {exit,output:out+err};
     };
     const clean=await run('flag-on H|H-r2');expect(clean.exit,clean.output).toBe(0);expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
@@ -409,7 +427,7 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     const run = async (name: string, failed: boolean) => {
       // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1/HS2 storage
       // cases (seconds each) have their own mutant runners below.
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] |HPERF )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] |HPERF )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
       console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
@@ -501,7 +519,7 @@ test('BH mutants: issued prefix readback, durable start/end fence, atomic refusa
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'H v2'],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'H v2'],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
@@ -678,7 +696,7 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS1'],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS1'],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
@@ -752,7 +770,7 @@ test('HS2 mutants: cached iterate, profile not persisted or not checked or check
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS2'],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS2'],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
@@ -860,7 +878,7 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^HPERF '],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^HPERF '],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
