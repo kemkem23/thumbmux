@@ -7,11 +7,11 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { readdirSync, readFileSync, readlinkSync, mkdirSync, statfsSync } from 'node:fs';
+import { readdirSync, readFileSync, readlinkSync, mkdirSync, statfsSync, accessSync, constants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
+import { join, isAbsolute, basename } from 'node:path';
 import { HistoryReaderCanary, historyReaderRequest } from '../src/sqlite-history/reader';
 import { rowsDigest, encodeBlock, decodeBlock, encodeCaptureArchive, decodeCaptureArchive, LEGACY_INFLATE_MAX_BYTES } from '../src/sqlite-history/codec';
 import { validateHistoryPage } from '../src/sqlite-history/detectors';
@@ -561,13 +561,13 @@ function relSqliteInventory() {
       let path: string;
       try { path = readlinkSync('/proc/self/fd/' + fd); } catch { continue; } // FD may have closed.
       if (!inTestRoot(path)) continue;
-      try { const st = statSync('/proc/self/fd/' + fd); fds.push({ fd, path, dev: st.dev, ino: st.ino }); }
-      catch (e) { fds.push({ fd, path, error: String(e) }); }
+      try { const st = statSync('/proc/self/fd/' + fd); fds.push({ fd, path: relPublicText(path), dev: st.dev, ino: st.ino }); }
+      catch (e) { fds.push({ fd, path: relPublicText(path), error: relPublicText(String(e)) }); }
     }
-  } catch (e) { errors.push('fd: ' + String(e)); }
+  } catch (e) { errors.push('fd: ' + relPublicText(String(e))); }
   let maps: string[] = [];
-  try { maps = readFileSync('/proc/self/maps', 'utf8').split('\n').filter(line => inTestRoot(line.slice(line.indexOf('/')))); }
-  catch (e) { errors.push('maps: ' + String(e)); }
+  try { maps = readFileSync('/proc/self/maps', 'utf8').split('\n').filter(line => inTestRoot(line.slice(line.indexOf('/')))).map(relPublicText); }
+  catch (e) { errors.push('maps: ' + relPublicText(String(e))); }
   return { pid: process.pid, at: new Date().toISOString(), fds, maps, errors };
 }
 const relDbSuffixes = ['', '-wal', '-shm', '-journal'] as const;
@@ -591,18 +591,43 @@ function relCopySnapshot(from: string, to: string, facts: ReturnType<typeof relF
   assert.deepEqual(relFileFacts(to).map(({ suffix, exists, ...fact }) => ({ suffix, exists, hash: fact.sha256 })),
     facts.map(({ suffix, exists, ...fact }) => ({ suffix, exists, hash: fact.sha256 })), 'REL snapshot copies must share exact bytes');
 }
+function relPublicText(text: string) {
+  const configured = process.env.THUMBMUX_REL_FIX_EVIDENCE_DIR;
+  return (configured ? text.replaceAll(configured, '<evidence-root>') : text).replaceAll(tmpdir(), '<tmp>');
+}
+function relTail(text: string) {
+  return { tail: relPublicText(text).slice(-2000), length: text.length, truncated: text.length > 2000 };
+}
+function relEvidenceRoot() {
+  const root = process.env.THUMBMUX_REL_FIX_EVIDENCE_DIR;
+  if (root === undefined) return undefined;
+  try {
+    if (!isAbsolute(root) || !statSync(root).isDirectory()) throw Error('absolute existing directory required');
+    accessSync(root, constants.W_OK | constants.X_OK);
+  } catch {
+    // Never echo the configured path or fall back on explicit misconfiguration.
+    throw Error('REL evidence configuration: absolute existing writable/searchable directory required');
+  }
+  return root;
+}
+function relIntegrityValues(rows: unknown[]) {
+  return rows.flatMap(row => Object.values(row as Record<string, unknown>));
+}
 function relError(error: unknown) {
   const e = error as { name?: string; message?: string; code?: string; errno?: number; byteOffset?: number };
-  return { name: e?.name, message: e?.message ?? String(error), code: e?.code, errno: e?.errno, byteOffset: e?.byteOffset };
+  return { name: e?.name, message: relPublicText(e?.message ?? String(error)).slice(-2000), code: e?.code, errno: e?.errno, byteOffset: e?.byteOffset };
 }
 function relInspectCopy(path: string) {
   let engine: StreamHistoryEngine | undefined, raw: Database | undefined;
   try {
     engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
     raw = new Database(path, { readonly: true });
+    const integrity = raw.query('PRAGMA quick_check').all();
+    const values = relIntegrityValues(integrity);
     return { ok: true, pid: process.pid, bun: Bun.version,
+      integrityOk: integrity.length === 1 && values.length === 1 && values[0] === 'ok',
       sqlite: raw.query('SELECT sqlite_version() AS version').get(),
-      integrity: raw.query('PRAGMA quick_check').all(),
+      integrity,
       inputs: raw.query('SELECT count(*) AS n FROM sh_input').get(),
       rows: raw.query('SELECT count(*) AS n FROM sh_row').get(),
       checkpoints: raw.query('SELECT count(*) AS n FROM sh_checkpoint').get() };
@@ -615,8 +640,9 @@ function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
   // failure, never a successful recovery or a mutation kill.
   const script = `import {Database} from 'bun:sqlite';
     import {StreamHistoryEngine} from ${JSON.stringify(join(import.meta.dir, '../src/history-engine.ts'))};
-    import {existsSync,readFileSync,statSync} from 'node:fs'; import {createHash} from 'node:crypto';
+    import {existsSync,readFileSync,statSync} from 'node:fs'; import {createHash} from 'node:crypto'; import {tmpdir} from 'node:os';
     const relDbSuffixes=${JSON.stringify(relDbSuffixes)}, relHash=${relHash.toString()}, relFileFacts=${relFileFacts.toString()};
+    const relPublicText=${relPublicText.toString()}, relIntegrityValues=${relIntegrityValues.toString()};
     const relError=${relError.toString()}, relInspectCopy=${relInspectCopy.toString()};
     const facts=relFileFacts(${JSON.stringify(path)});
     const expected=${JSON.stringify(facts)};
@@ -625,9 +651,9 @@ function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
   const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 2_000 });
   const output = child.stdout ?? '';
   let observation: unknown;
-  try { observation = JSON.parse(output.trim()); } catch { observation = { invalidOutput: output }; }
+  try { observation = JSON.parse(output.trim()); } catch { observation = { invalidOutput: relTail(output) }; }
   return { exit: child.status, signal: child.signal, error: child.error ? relError(child.error) : null,
-    stderr: child.stderr, observation };
+    stderr: relTail(child.stderr ?? ''), observation };
 }
 
 describe('stream-first H crash and continuation', () => {
@@ -662,6 +688,7 @@ describe('stream-first H crash and continuation', () => {
     } finally { f.cleanup(); }
   });
   test('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement', async () => {
+    const configuredEvidenceRoot = relEvidenceRoot(); // Fail configuration before starting any writer.
     for (const phase of ['input-before-write', 'input-before-commit', 'input-after-commit',
       'checkpoint-before-write', 'checkpoint-before-commit', 'checkpoint-after-commit']) {
       const dir = mkdtempSync(join(tmpdir(), 'stream-kill-'));
@@ -699,11 +726,12 @@ describe('stream-first H crash and continuation', () => {
         // All three awaited streams are complete above: the writer is quiescent.
         // Freeze before the ORIGINAL constructor can recover/checkpoint anything.
         const facts = relFileFacts(path), beforeReopen = relSqliteInventory();
-        const evidenceRoot = process.env.THUMBMUX_REL_FIX_EVIDENCE_DIR ?? dir;
+        const evidenceRoot = configuredEvidenceRoot ?? dir;
         const evidence = mkdtempSync(join(evidenceRoot, 'rel-short-read-'));
         const snapshot = join(evidence, 'snapshot', 'stream.sqlite');
         relCopySnapshot(path, snapshot, facts);
-        const context = { phase, startedAt, beforeReopenAt: new Date().toISOString(), killed,
+        const context = { phase, startedAt, retention: configuredEvidenceRoot === undefined ? 'ephemeral' : 'external-on-failure',
+          evidenceLabel: basename(evidence), beforeReopenAt: new Date().toISOString(), killed,
           child: { pid: child.pid, exit, signal: child.signalCode }, parentPid: process.pid, parentBun: Bun.version,
           fsTypeHex: '0x' + statfsSync(dir).type.toString(16),
           snapshotFsTypeHex: '0x' + statfsSync(evidence).type.toString(16), facts, beforeChild, beforeReopen };
@@ -726,7 +754,7 @@ describe('stream-first H crash and continuation', () => {
             diagnostics = { parentCopy, freshCopy };
           } catch (diagnosticError) { diagnostics = { error: relError(diagnosticError) }; }
           const failure = { ...context, afterFailure, afterDiagnostics: relSqliteInventory(),
-            evidence, error: relError(e), diagnostics, output, stderr };
+            evidenceLabel: basename(evidence), error: relError(e), diagnostics, output: relTail(output), stderr: relTail(stderr) };
           console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify(failure));
           try { writeFileSync(join(evidence, 'failure.json'), JSON.stringify(failure, null, 2)); }
           catch (writeError) { console.log('REL_EVIDENCE_WRITE_FAILED', JSON.stringify(relError(writeError))); }
@@ -776,6 +804,8 @@ test('stream-first H REL snapshot controls distinguish clean, corrupt and trunca
     const path = join(dir, 'clean', 'stream.sqlite'); mkdirSync(join(path, '..'));
     const clean = relInspectCopy(path);
     assert.equal(clean.ok, true, 'REL clean new database must open');
+    assert.deepEqual(relIntegrityValues(clean.integrity ?? []), ['ok'], 'REL clean new database quick_check exact');
+    assert.equal(clean.integrityOk, true, 'REL clean new database integrity');
     const facts = relFileFacts(path), snapshot = join(dir, 'snapshot', 'stream.sqlite');
     relCopySnapshot(path, snapshot, facts);
     for (const control of ['clean', 'corrupt', 'truncate'] as const) {
@@ -797,6 +827,10 @@ test('stream-first H REL snapshot controls distinguish clean, corrupt and trunca
       for (const result of [parent, observation.result]) {
         assert.ok(result, 'REL fresh process must report a structured open result');
         assert.equal(result.ok, control === 'clean', 'REL snapshot integrity control');
+        if (control === 'clean') {
+          assert.deepEqual(relIntegrityValues(result.integrity ?? []), ['ok'], 'REL clean copy quick_check exact');
+          assert.equal(result.integrityOk, true, 'REL clean copy integrity');
+        }
         if (!result.ok) {
           assert.match(result.error?.code ?? '', /^SQLITE_(?:NOTADB|CORRUPT|IOERR)/, 'REL corruption must fail with SQLite I/O or integrity error');
         }
