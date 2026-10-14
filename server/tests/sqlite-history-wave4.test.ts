@@ -7,9 +7,9 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { readdirSync, readFileSync, readlinkSync, mkdirSync, statfsSync, accessSync, constants } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { readdirSync, readFileSync, readlinkSync, mkdirSync, statfsSync, accessSync, constants, writeSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync, spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { join, isAbsolute, basename } from 'node:path';
 import { HistoryReaderCanary, historyReaderRequest } from '../src/sqlite-history/reader';
@@ -634,7 +634,7 @@ function relInspectCopy(path: string) {
   } catch (e) { return { ok: false, pid: process.pid, bun: Bun.version, error: relError(e) }; }
   finally { raw?.close(); engine?.close(); }
 }
-function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
+function relFreshScript(path: string, facts: ReturnType<typeof relFileFacts>) {
   // Independent copy from the frozen snapshot, never the parent-opened copy.
   // Two seconds is inside the existing 30s case budget; a timeout is diagnostic
   // failure, never a successful recovery or a mutation kill.
@@ -648,12 +648,227 @@ function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
     const expected=${JSON.stringify(facts)};
     if(JSON.stringify(facts.map(f=>[f.suffix,f.exists,f.sha256]))!==JSON.stringify(expected.map(f=>[f.suffix,f.exists,f.sha256]))) throw Error('REL fresh snapshot hash mismatch');
     console.log(JSON.stringify({before:facts,result:relInspectCopy(${JSON.stringify(path)})}));`;
+  return script;
+}
+function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
+  const script = relFreshScript(path, facts);
   const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 2_000 });
   const output = child.stdout ?? '';
   let observation: unknown;
   try { observation = JSON.parse(output.trim()); } catch { observation = { invalidOutput: relTail(output) }; }
   return { exit: child.status, signal: child.signal, error: child.error ? relError(child.error) : null,
     stderr: relTail(child.stderr ?? ''), observation };
+}
+
+// Only serialized into the failure-only supervisor. Its event loop performs
+// IPC and asynchronous child management, never SQLite or synchronous file I/O.
+function relSupervisorMain(config: { parentPid: number; nonce: string; deadlineMs: number; original: unknown }) {
+  const now = () => Number(process.hrtime.bigint() / 1_000_000n);
+  const target = config.parentPid;
+  const validParent = () => Number.isSafeInteger(target) && target > 1 && process.ppid === target;
+  if (!validParent() || !Number.isFinite(config.deadlineMs) || config.deadlineMs - now() > 4000) process.exit(2);
+  let armed = false, stopping = false, probed = false;
+  let fresh: ReturnType<typeof spawn> | undefined;
+  let reaped: Promise<{ exit: number | null; signal: NodeJS.Signals | null }> | undefined;
+  let freshTimer: ReturnType<typeof setTimeout> | undefined;
+  const send = (type: string, data: object = {}) => process.stdout.write(JSON.stringify({ type, nonce: config.nonce, ...data }) + '\n');
+  const killFresh = () => {
+    // ChildProcess owns the PID and its reap; never accept a PID over IPC.
+    if (fresh && Number.isSafeInteger(fresh.pid) && fresh.pid! > 1 && fresh.exitCode === null && fresh.signalCode === null) fresh.kill('SIGKILL');
+  };
+  const stop = async (reason: string, terminateParent: boolean, ack = false) => {
+    if (terminateParent) {
+      process.stderr.write('REL_DIAGNOSTIC_DEADLINE ' + JSON.stringify({ ...config, reason: 'diagnostic-timeout', testsRemaining: 'INCOMPLETE' }) + '\n');
+      // Re-check the *current* immediate-parent relationship at the syscall.
+      if (armed && validParent()) {
+        try { process.kill(target, 'SIGKILL'); } catch { /* Parent already exited. */ }
+      }
+    }
+    // A deadline must still terminate the parent while a prior DISARM/EOF
+    // cleanup is awaiting fresh reaping. Do not let 'stopping' cancel the cap.
+    if (stopping) return;
+    stopping = true;
+    if (freshTimer) clearTimeout(freshTimer);
+    try { killFresh(); } catch (error) { process.stderr.write('REL_SUPERVISOR_KILL_ERROR ' + String(error).slice(-2000) + '\n'); }
+    // Destroy pipes after signalling so inherited pipe writers cannot stall EOF;
+    // wait for the owned process close/reap, not for an unowned descendant.
+    fresh?.stdout?.destroy(); fresh?.stderr?.destroy();
+    if (reaped) await reaped;
+    clearTimeout(deadlineTimer);
+    armed = false;
+    process.stdin.destroy();
+    const record = { type: ack ? 'ACK' : 'STOPPED', nonce: config.nonce, reason };
+    process.stdout.write(JSON.stringify(record) + '\n', () => process.exit(ack ? 0 : 2));
+  };
+  const deadlineTimer = setTimeout(() => { void stop('deadline', armed); }, Math.max(0, config.deadlineMs - now()));
+  let buffer = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('end', () => { void stop('parent-ipc-eof', false); });
+  process.stdin.on('error', () => { void stop('parent-ipc-error', false); });
+  process.stdout.on('error', () => { void stop('parent-ipc-output-error', false); });
+  const receive = async (message: { type?: string; nonce?: string; parentPid?: number; deadlineMs?: number; script?: string }) => {
+    if (stopping) return;
+    if (!validParent() || message.nonce !== config.nonce) { await stop('invalid-owner-or-nonce', false); return; }
+    if (message.type === 'ARM' && !armed && !probed && message.parentPid === target && message.deadlineMs === config.deadlineMs && now() < config.deadlineMs) {
+      armed = true; send('READY'); return;
+    }
+    if (message.type === 'DISARM') { await stop('disarmed', false, true); return; }
+    if (message.type !== 'PROBE' || !armed || probed || typeof message.script !== 'string' || message.script.length > 131072) {
+      await stop('invalid-state', false); return;
+    }
+    probed = true;
+    if (config.deadlineMs - now() < 2_000 + 100) {
+      send('FRESH', { outcome: 'not-run', reason: 'insufficient-fresh-budget' }); return;
+    }
+    let output = '', outputTail = '', stderrTail = '', outputLength = 0, stderrLength = 0;
+    let spawnError: string | undefined, timedOut = false;
+    try {
+      fresh = spawn(process.execPath, ['-e', message.script], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const owned = fresh;
+      reaped = new Promise(resolve => {
+        owned.once('error', error => { spawnError = String(error).slice(-2000); });
+        owned.once('close', (exit, signal) => resolve({ exit, signal }));
+      });
+      owned.stdout!.setEncoding('utf8'); owned.stderr!.setEncoding('utf8');
+      owned.stdout!.on('data', (chunk: string) => {
+        outputLength += chunk.length; outputTail = (outputTail + chunk).slice(-2000);
+        if (output.length < 65536) output = (output + chunk).slice(0, 65536);
+      });
+      owned.stderr!.on('data', (chunk: string) => { stderrLength += chunk.length; stderrTail = (stderrTail + chunk).slice(-2000); });
+      freshTimer = setTimeout(() => {
+        timedOut = true;
+        try { killFresh(); } catch { void stop('fresh-kill-error', false); }
+      }, 2_000);
+      const status = await reaped;
+      clearTimeout(freshTimer); freshTimer = undefined;
+      if (stopping) return;
+      let observation: unknown, validOutput = false;
+      try {
+        if (outputLength > 65536) throw Error('output limit');
+        observation = JSON.parse(output.trim());
+        const record = observation as { result?: { ok?: unknown; pid?: unknown } };
+        validOutput = typeof record?.result?.ok === 'boolean' && record.result.pid === owned.pid;
+      } catch { observation = { invalidOutput: { tail: outputTail, length: outputLength, truncated: outputLength > 2000 } }; }
+      send('FRESH', { outcome: timedOut ? 'timed-out' : spawnError || status.exit !== 0 || status.signal || !validOutput ? 'error' : 'complete',
+        ...status, error: spawnError, observation,
+        stderr: { tail: stderrTail, length: stderrLength, truncated: stderrLength > 2000 } });
+    } catch (error) {
+      await stop('fresh-infrastructure-error: ' + String(error).slice(-2000), false);
+    }
+  };
+  process.stdin.on('data', (chunk: string) => {
+    buffer += chunk;
+    if (buffer.length > 262144) { void stop('ipc-limit', false); return; }
+    let end: number;
+    while ((end = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+      try { void receive(JSON.parse(line)).catch(() => stop('ipc-handler-error', false)); }
+      catch { void stop('invalid-ipc-json', false); }
+    }
+  });
+}
+
+function relDiagnosticLog(label: string, value: unknown) {
+  // Logging must never replace the original exception. The original-error
+  // record contains only bounded fields; later bulky observations get a tail.
+  try {
+    const text = relPublicText(JSON.stringify(value));
+    const bounded = text.length <= 32768 ? text : JSON.stringify({ length: text.length, truncated: true, tail: text.slice(-16000) });
+    writeSync(2, label + ' ' + bounded + '\n');
+  } catch { /* Preserve the original reopen exception even if stderr fails. */ }
+}
+
+async function relDiagnoseFailure(snapshot: string, evidence: string, facts: ReturnType<typeof relFileFacts>,
+  original: object, deadlineMs: number) {
+  const now = () => Number(process.hrtime.bigint() / 1_000_000n);
+  const nonce = randomUUID(), config = { parentPid: process.pid, nonce, deadlineMs, original };
+  if (!Number.isSafeInteger(process.pid) || process.pid <= 1 || deadlineMs <= now()) {
+    relDiagnosticLog('STREAM_KILL_REOPEN_DIAGNOSTICS', { ...original, outcome: 'not-run', reason: 'invalid-owner-or-budget' }); return;
+  }
+  const script = `import {spawn} from 'node:child_process'; (${relSupervisorMain.toString()})(${JSON.stringify(config)});`;
+  const supervisor = spawn(process.execPath, ['-e', script], { stdio: ['pipe', 'pipe', 'inherit'] });
+  let ready = false, probeSent = false, disarmed = false, closed = false, buffer = '';
+  let diagnosticRecord: object | undefined;
+  let waiter: { type: string; resolve: (message: any) => void; reject: (error: Error) => void } | undefined;
+  let responseTimer: ReturnType<typeof setTimeout> | undefined;
+  const reject = (error: Error) => { const w = waiter; waiter = undefined; if (responseTimer) clearTimeout(responseTimer); w?.reject(error); };
+  const exited = new Promise<void>(resolve => {
+    supervisor.once('error', error => reject(error));
+    supervisor.once('close', () => { closed = true; reject(Error('REL supervisor exited before acknowledgement')); resolve(); });
+  });
+  supervisor.stdin!.on('error', error => reject(error));
+  supervisor.stdout!.on('error', error => reject(error));
+  supervisor.stdout!.setEncoding('utf8');
+  supervisor.stdout!.on('data', (chunk: string) => {
+    buffer += chunk;
+    if (buffer.length > 131072) { reject(Error('REL supervisor output limit')); return; }
+    let end: number;
+    while ((end = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+      try {
+        const message = JSON.parse(line);
+        if (message.nonce !== nonce || message.type !== waiter?.type) { reject(Error('REL supervisor unexpected IPC')); continue; }
+        const w = waiter!; waiter = undefined; if (responseTimer) clearTimeout(responseTimer); w.resolve(message);
+      } catch { reject(Error('REL supervisor invalid IPC')); }
+    }
+  });
+  const exchange = (type: string, reply: string, fields: object = {}) => new Promise<any>((resolve, rejectReply) => {
+    if (closed || deadlineMs <= now()) { rejectReply(Error('REL supervisor deadline elapsed')); return; }
+    waiter = { type: reply, resolve, reject: rejectReply };
+    responseTimer = setTimeout(() => reject(Error('REL supervisor response deadline')), Math.max(0, deadlineMs - now()));
+    supervisor.stdin!.write(JSON.stringify({ type, nonce, ...fields }) + '\n');
+  });
+  try {
+    await exchange('ARM', 'READY', { parentPid: process.pid, deadlineMs }); ready = true;
+    relDiagnosticLog('REL_DIAGNOSTIC_READY', { nonce, deadlineMs, parentPid: process.pid });
+    const parentPath = join(evidence, 'parent-copy', 'stream.sqlite'), freshPath = join(evidence, 'fresh-copy', 'stream.sqlite');
+    relCopySnapshot(snapshot, parentPath, facts);
+    relCopySnapshot(snapshot, freshPath, facts);
+    if (deadlineMs - now() < 2_000 + 100) {
+      diagnosticRecord = { ...original, outcome: 'not-run', reason: 'insufficient-fresh-budget' };
+      relDiagnosticLog('STREAM_KILL_REOPEN_DIAGNOSTICS', diagnosticRecord); return;
+    }
+    probeSent = true;
+    const fresh = await exchange('PROBE', 'FRESH', { script: relFreshScript(freshPath, facts) });
+    // The supervisor reports only after fresh has exited, drained and been reaped.
+    const publicFresh = JSON.parse(relPublicText(JSON.stringify(fresh)));
+    relDiagnosticLog('REL_DIAGNOSTIC_FRESH', { nonce, ...publicFresh });
+    if (fresh.outcome !== 'complete') {
+      diagnosticRecord = { ...original, outcome: fresh.outcome, reason: 'fresh-incomplete', freshCopy: publicFresh };
+      relDiagnosticLog('STREAM_KILL_REOPEN_DIAGNOSTICS', diagnosticRecord); return;
+    }
+    if (closed || deadlineMs <= now()) throw Error('REL supervisor unavailable before parent probe');
+    // Same PID, same JS/native SQLite context as the original failure. The
+    // independent supervisor's absolute timer remains armed during this call.
+    const parentCopy = relInspectCopy(parentPath);
+    diagnosticRecord = { ...original, outcome: 'complete', diagnostics: { freshCopy: publicFresh, parentCopy }, afterDiagnostics: relSqliteInventory() };
+    relDiagnosticLog('STREAM_KILL_REOPEN_DIAGNOSTICS', diagnosticRecord);
+  } catch (error) {
+    diagnosticRecord = { ...original, outcome: 'error', diagnosticError: relError(error) };
+    relDiagnosticLog('STREAM_KILL_REOPEN_DIAGNOSTICS', diagnosticRecord);
+  } finally {
+    // File writes are also inside the armed independent watchdog's deadline.
+    if (ready && !closed && deadlineMs > now() && diagnosticRecord) {
+      try { writeFileSync(join(evidence, 'failure.json'), JSON.stringify(diagnosticRecord, null, 2)); }
+      catch (error) { relDiagnosticLog('REL_EVIDENCE_WRITE_FAILED', { error: relError(error) }); }
+    }
+    try {
+      if (!closed && ready) { await exchange('DISARM', 'ACK'); disarmed = true; }
+    } catch (error) { relDiagnosticLog('REL_DIAGNOSTIC_DISARM_ERROR', { nonce, error: relError(error) }); }
+    finally {
+      if (responseTimer) clearTimeout(responseTimer);
+      try { supervisor.stdin!.end(); } catch (error) { relDiagnosticLog('REL_DIAGNOSTIC_IPC_CLOSE_ERROR', { error: relError(error) }); }
+      // Before READY no PROBE was sent, so this child cannot own a fresh child.
+      // Once a probe was sent, only the supervisor may kill/reap that child.
+      if (!probeSent && !disarmed && !closed && Number.isSafeInteger(supervisor.pid) && supervisor.pid! > 1) {
+        try { supervisor.kill('SIGKILL'); } catch (error) { relDiagnosticLog('REL_DIAGNOSTIC_STOP_ERROR', { error: relError(error) }); }
+      }
+      await exited;
+      supervisor.stdout!.removeAllListeners('data');
+      supervisor.stdout!.destroy(); supervisor.stdin!.destroy();
+      relDiagnosticLog('REL_DIAGNOSTIC_REAPED', { nonce, exit: supervisor.exitCode, signal: supervisor.signalCode });
+    }
+  }
 }
 
 describe('stream-first H crash and continuation', () => {
@@ -688,6 +903,7 @@ describe('stream-first H crash and continuation', () => {
     } finally { f.cleanup(); }
   });
   test('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement', async () => {
+    const testStarted = Number(process.hrtime.bigint() / 1_000_000n);
     const configuredEvidenceRoot = relEvidenceRoot(); // Fail configuration before starting any writer.
     for (const phase of ['input-before-write', 'input-before-commit', 'input-after-commit',
       'checkpoint-before-write', 'checkpoint-before-commit', 'checkpoint-after-commit']) {
@@ -713,6 +929,7 @@ describe('stream-first H crash and continuation', () => {
         shOk(await engine.appendFinalized(shAppend()));
         shOk(await shCheckpoint(engine));
         console.log('CHECKPOINT_ACK');`;
+      let primaryFailed = false;
       try {
         const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
         const [exit, output, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -740,26 +957,25 @@ describe('stream-first H crash and continuation', () => {
         let engine: StreamHistoryEngine;
         try { engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] }); }
         catch (e) {
-          // These opens explain failure only. Never retry or replace the gate's
-          // original path. SHM is copied as crash evidence, never deleted as a fix.
-          const afterFailure = relSqliteInventory();
-          let diagnostics: unknown;
-          try {
-            const parentPath = join(evidence, 'parent-copy', 'stream.sqlite');
-            const freshPath = join(evidence, 'fresh-copy', 'stream.sqlite');
-            relCopySnapshot(snapshot, parentPath, facts);
-            relCopySnapshot(snapshot, freshPath, facts);
-            const parentCopy = relInspectCopy(parentPath);
-            const freshCopy = relFreshCopy(freshPath, facts);
-            diagnostics = { parentCopy, freshCopy };
-          } catch (diagnosticError) { diagnostics = { error: relError(diagnosticError) }; }
-          const failure = { ...context, afterFailure, afterDiagnostics: relSqliteInventory(),
-            evidenceLabel: basename(evidence), error: relError(e), diagnostics, output: relTail(output), stderr: relTail(stderr) };
-          console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify(failure));
-          try { writeFileSync(join(evidence, 'failure.json'), JSON.stringify(failure, null, 2)); }
-          catch (writeError) { console.log('REL_EVIDENCE_WRITE_FAILED', JSON.stringify(relError(writeError))); }
+          // First action: synchronous bounded error/context, before diagnostic
+          // inventory, copies, spawn, SQLite or failure.json writes.
+          const original = { phase, parentPid: process.pid, child: context.child, killed,
+            facts, fsTypeHex: context.fsTypeHex, snapshotFsTypeHex: context.snapshotFsTypeHex,
+            retention: context.retention, evidenceLabel: context.evidenceLabel,
+            startedAt, beforeReopenAt: context.beforeReopenAt, error: relError(e),
+            output: relTail(output), stderr: relTail(stderr) };
+          relDiagnosticLog('STREAM_KILL_REOPEN_FAILED', { ...original, diagnostics: 'pending' });
+          const now = Number(process.hrtime.bigint() / 1_000_000n);
+          const allowance = Math.min(4000, Math.max(0, 30000 - (now - testStarted) - 1000));
+          if (allowance < 2_000 + 100) {
+            relDiagnosticLog('STREAM_KILL_REOPEN_DIAGNOSTICS', { ...original, outcome: 'not-run', reason: 'budget-exhausted' });
+          } else {
+            try { await relDiagnoseFailure(snapshot, evidence, facts, original, now + allowance); }
+            catch (diagnosticError) { relDiagnosticLog('REL_DIAGNOSTIC_INFRASTRUCTURE', { error: relError(diagnosticError) }); }
+          }
           throw e;
         }
+        let phasePassed = false;
         try {
           const recovered = [];
           for await (const result of engine.recover(shPane, null, shCancel)) recovered.push(result);
@@ -787,12 +1003,20 @@ describe('stream-first H crash and continuation', () => {
             expect((rawAfter.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n).toBe(1);
           }
           finally { rawAfter.close(); }
+          phasePassed = true;
         } finally {
           engine.close();
           console.log('REL_CRASH_AFTER_CLOSE', JSON.stringify({ phase, inventory: relSqliteInventory() }));
-          rmSync(evidence, { recursive: true, force: true }); // Retain external snapshots only on reopen failure.
+          if (phasePassed) rmSync(evidence, { recursive: true, force: true }); // Keep failed external child directories.
         }
-      } finally { rmSync(dir, { recursive: true, force: true }); }
+      } catch (error) { primaryFailed = true; throw error; }
+      finally {
+        try { rmSync(dir, { recursive: true, force: true }); }
+        catch (error) {
+          relDiagnosticLog('REL_FIXTURE_CLEANUP_ERROR', { phase, error: relError(error) });
+          if (!primaryFailed) throw error;
+        }
+      }
     }
   }, 30000);
 });
