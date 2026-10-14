@@ -10,7 +10,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -1520,27 +1521,124 @@ for (const mutation of ["drop-final-frame", "skip-dedicated-q-ack"] as const) te
       : source.replace(qAck, '    send(b"B", {"workerEof": False})\n\n\nif __name__ == "__main__":');
     expect(damaged).not.toBe(source);
 
-    async function witness(mutated: boolean) {
-      const dir = join(root, mutated ? "damaged" : "clean"); mkdirSync(dir);
-      const assets = pipeVtAssets(dir);
-      writeFileSync(assets.worker, mutated ? damaged : source);
+    for (const anchor of [qBranch, qAck, 'def main():', '        chunk = os.read(fd, 1 << 16)',
+      '            worker, eof = dispatch(worker, kind, payload, rx_at)']) {
+      assert.equal(source.split(anchor).length - 1, 1, `unique F1-Q substitution: ${anchor}`);
+    }
+    const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+    async function witness(mutated: boolean, schedule: "pending-at-Q" | "emit-before-Q", label: string) {
+      const dir = join(root, label); mkdirSync(dir);
+      const assets = pipeVtAssets(dir), tracePath = join(dir, "schedule.jsonl");
+      // Only the copied read adapter controls scheduling. It assembles exact
+      // D+Q bytes across arbitrarily short FIFO reads; dispatch/emit/B stay real.
+      const adapter = `def f1q_trace(event, **fields):
+    with open(${JSON.stringify(tracePath)}, "a") as trace:
+        trace.write(json.dumps(dict(event=event, **fields)) + "\\n")
+
+f1q_send_original = send
+def send(kind, value, timed=False):
+    if kind in (b"U", b"B"):
+        f1q_trace(kind.decode(), value=value)
+    return f1q_send_original(kind, value, timed)
+
+f1q_first_read = True
+def f1q_read(fd, size):
+    global f1q_first_read
+    if not f1q_first_read:
+        return os.read(fd, size)
+    f1q_first_read = False
+    expected = b"D" + struct.pack(">IQQ", 16 + len(b"MUTATION-FINAL"), 1, 1) + b"MUTATION-FINAL"
+    if ${schedule === "pending-at-Q" ? "True" : "False"}:
+        expected += b"Q" + struct.pack(">I", 0)
+    chunk = bytearray()
+    while len(chunk) < len(expected):
+        part = os.read(fd, len(expected) - len(chunk))
+        if not part:
+            raise RuntimeError("F1-Q barrier EOF before exact payload")
+        chunk.extend(part)
+    if bytes(chunk) != expected:
+        raise RuntimeError("F1-Q barrier unexpected bytes")
+    f1q_trace("read-barrier", size=len(chunk), hex=bytes(chunk).hex())
+    return bytes(chunk)
+
+`;
+      const copied = (mutated ? damaged : source)
+        .replace('def main():', adapter + 'def main():')
+        .replace('        chunk = os.read(fd, 1 << 16)', '        chunk = f1q_read(fd, 1 << 16)')
+        .replace('            worker, eof = dispatch(worker, kind, payload, rx_at)',
+          '            if kind == b"Q":\n                f1q_trace("pre-Q", pending=worker.pending(), seq_to=worker.seq_to, emitted_seq=worker.emitted_seq)\n            worker, eof = dispatch(worker, kind, payload, rx_at)');
+      writeFileSync(assets.worker, copied);
       writeFileSync(assets.vendor, readFileSync(original.vendor));
       writeFileSync(assets.license, readFileSync(original.license));
-      const updates: PipeVtUpdate[] = [];
-      const worker = new PipeVtWorker({ assets, cols: 80, rows: 3, onFault: () => {},
-        onUpdate: (update) => { updates.push(update); } });
-      await worker.start();
-      assert.equal(worker.feed(1, encoder.encode("MUTATION-FINAL")), true);
-      const receipt = await worker.close(1_000);
-      assert.equal(updates.at(-1)?.seqTo, 1, "Q must preserve the final parser update");
-      assert.equal(rowText(updates.at(-1)!.frame.dirty["0"]!).trimEnd(), "MUTATION-FINAL");
-      assert.deepEqual(receipt, { workerEof: true, outputDrained: true, issues: [], unknownTail: false },
-        "close must wait for the ordered Q acknowledgement");
+      assert.equal(sha(readFileSync(assets.worker)), sha(copied));
+      assert.equal(sha(readFileSync(assets.vendor)), PIPE_VT_VENDOR_SHA256);
+      const updates: PipeVtUpdate[] = [], faults: PipeVtFault[] = [];
+      let targetReceived!: () => void;
+      const target = new Promise<void>(resolve => { targetReceived = resolve; });
+      const worker = new PipeVtWorker({ assets, cols: 80, rows: 3, onFault: fault => { faults.push(fault); },
+        onUpdate: (update) => {
+          updates.push(update);
+          if (update.seqTo === 1 && update.frame.dirty["0"] &&
+            rowText(update.frame.dirty["0"]).trimEnd() === "MUTATION-FINAL") targetReceived();
+        } });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await worker.start();
+        const child = (worker as unknown as { child: ChildProcess }).child;
+        assert.equal(worker.feed(1, encoder.encode("MUTATION-FINAL")), true);
+        if (schedule === "emit-before-Q") {
+          await Promise.race([target, new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(Error("F1-Q pre-emitted control did not observe target U")), 1_000);
+          })]);
+          clearTimeout(timer);
+        }
+        const receipt = await worker.close(1_000);
+        const trace = readFileSync(tracePath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        console.log("F1_Q_WITNESS", JSON.stringify({ mutation, mutated, schedule, label,
+          workerSha256: sha(copied), vendorSha256: sha(readFileSync(assets.vendor)),
+          trace, updateOrder: updates.map(u => u.seqTo), exit: child.exitCode, signal: child.signalCode, receipt, faults }));
+        assert.equal(child.exitCode, 0, "F1-Q child must exit normally");
+        assert.equal(child.signalCode, null, "F1-Q barrier must not force child shutdown");
+        assert.deepEqual(faults, [], "F1-Q infrastructure faults are not mutant kills");
+        const pre = trace.filter(t => t.event === "pre-Q");
+        assert.equal(pre.length, 1, "F1-Q must reach the Q dispatch exactly once");
+        assert.equal(pre[0].seq_to, 1, "F1-Q must dispatch D before Q");
+        const qIndex = trace.findIndex(t => t.event === "pre-Q");
+        const targetBeforeQ = trace.slice(0, qIndex).some(t => t.event === "U" && t.value.seqTo === 1);
+        assert.equal(targetBeforeQ, schedule === "emit-before-Q", "F1-Q schedule precondition");
+        if (schedule === "pending-at-Q") {
+          assert.equal(pre[0].pending, true, "F1-Q pending-at-Q precondition");
+          assert.notEqual(pre[0].emitted_seq, 1, "F1-Q final update must still be pending");
+        } else assert.equal(pre[0].emitted_seq, 1, "F1-Q target U must precede Q");
+        assert.equal(trace.filter(t => t.event === "read-barrier").length, 1);
+        assert.equal(trace.filter(t => t.event === "B").length, 1, "F1-Q must record the real B");
+        assert.equal(trace.at(-1).event, "B", "F1-Q B must follow every emitted update");
+        assert.equal(updates.at(-1)?.seqTo, 1, "Q must preserve the final parser update");
+        assert.equal(rowText(updates.at(-1)!.frame.dirty["0"]!).trimEnd(), "MUTATION-FINAL");
+        assert.deepEqual(receipt, { workerEof: true, outputDrained: true, issues: [], unknownTail: false },
+          "close must wait for the ordered Q acknowledgement");
+      } finally {
+        if (timer) clearTimeout(timer);
+        try { await worker.close(1_000); } finally { rmSync(dir, { recursive: true, force: true }); }
+      }
     }
 
-    await witness(false);
-    await assert.rejects(witness(true), { name: "AssertionError" });
-    console.log(`F1-Q mutation ${mutation}: clean=PASS damaged=DETECTED`);
+    try {
+      await witness(false, "pending-at-Q", "clean-before");
+      try {
+        await assert.rejects(witness(true, "pending-at-Q", "damaged"), (error: any) =>
+          error?.code === "ERR_ASSERTION" && error.message.startsWith(mutation === "drop-final-frame"
+            ? "Q must preserve the final parser update" : "close must wait for the ordered Q acknowledgement"));
+      } finally { await witness(false, "pending-at-Q", "restored-clean-after"); }
+      if (mutation === "drop-final-frame") {
+        // This is deliberately non-discriminating: there is no pending tail to
+        // lose. A real target U must arrive before close sends Q (no sleeps).
+        await witness(false, "emit-before-Q", "pre-emitted-clean");
+        try { await witness(true, "emit-before-Q", "pre-emitted-damaged"); }
+        finally { await witness(false, "emit-before-Q", "pre-emitted-restored"); }
+      }
+      console.log(`F1-Q mutation ${mutation}: clean=PASS damaged=DETECTED restored=PASS`);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   }, 20_000,
 );
 
