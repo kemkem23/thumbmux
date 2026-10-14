@@ -652,7 +652,7 @@ function relFreshScript(path: string, facts: ReturnType<typeof relFileFacts>) {
 }
 function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
   const script = relFreshScript(path, facts);
-  const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 2_000 });
+  const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 2_000, killSignal: 'SIGKILL' });
   const output = child.stdout ?? '';
   let observation: unknown;
   try { observation = JSON.parse(output.trim()); } catch { observation = { invalidOutput: relTail(output) }; }
@@ -662,6 +662,9 @@ function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
 
 // Only serialized into the failure-only supervisor. Its event loop performs
 // IPC and asynchronous child management, never SQLite or synchronous file I/O.
+// Cross-process deadlines assume process.hrtime.bigint() shares the system
+// CLOCK_MONOTONIC origin on Linux (Ubuntu CI). An incompatible origin makes
+// diagnostics fail closed with an error; the original reopen failure stays red.
 function relSupervisorMain(config: { parentPid: number; nonce: string; deadlineMs: number; original: unknown }) {
   const now = () => Number(process.hrtime.bigint() / 1_000_000n);
   const target = config.parentPid;
@@ -684,10 +687,11 @@ function relSupervisorMain(config: { parentPid: number; nonce: string; deadlineM
         try { process.kill(target, 'SIGKILL'); } catch { /* Parent already exited. */ }
       }
     }
-    // A deadline must still terminate the parent while a prior DISARM/EOF
-    // cleanup is awaiting fresh reaping. Do not let 'stopping' cancel the cap.
+    // A deadline must still terminate the parent while non-ack cleanup
+    // awaits fresh reaping. DISARM cancels the deadline before that await.
     if (stopping) return;
     stopping = true;
+    if (ack) clearTimeout(deadlineTimer);
     if (freshTimer) clearTimeout(freshTimer);
     try { killFresh(); } catch (error) { process.stderr.write('REL_SUPERVISOR_KILL_ERROR ' + String(error).slice(-2000) + '\n'); }
     // Destroy pipes after signalling so inherited pipe writers cannot stall EOF;
