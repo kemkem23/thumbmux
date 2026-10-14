@@ -7,7 +7,10 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, readlinkSync, mkdirSync, statfsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { HistoryReaderCanary, historyReaderRequest } from '../src/sqlite-history/reader';
 import { rowsDigest, encodeBlock, decodeBlock, encodeCaptureArchive, decodeCaptureArchive, LEGACY_INFLATE_MAX_BYTES } from '../src/sqlite-history/codec';
@@ -546,6 +549,87 @@ describe('stream-first H quantitative gates', () => {
   });
 });
 
+// Inspect only this process's references into synthetic temporary SQLite roots.
+// Do not enumerate other processes or open any database through an FD.
+function relSqliteInventory() {
+  const inTestRoot = (path: string) => path.startsWith(tmpdir() + '/') &&
+    /\/(?:thumbmux-|stream-|na-|newarch-|flagon-|h-v2-|h2-|hperf-|bh-|hs[12]-|pipehist-|tmwal-|contract-|onepath-|p2-|p2opt-|l2c-|i3-|i4c-|spike2-|native-max-|q22-|b1-|k-flagon-)[^/]+\//.test(path);
+  const fds: Array<{ fd: string; path: string; dev?: number; ino?: number; error?: string }> = [];
+  const errors: string[] = [];
+  try {
+    for (const fd of readdirSync('/proc/self/fd')) {
+      let path: string;
+      try { path = readlinkSync('/proc/self/fd/' + fd); } catch { continue; } // FD may have closed.
+      if (!inTestRoot(path)) continue;
+      try { const st = statSync('/proc/self/fd/' + fd); fds.push({ fd, path, dev: st.dev, ino: st.ino }); }
+      catch (e) { fds.push({ fd, path, error: String(e) }); }
+    }
+  } catch (e) { errors.push('fd: ' + String(e)); }
+  let maps: string[] = [];
+  try { maps = readFileSync('/proc/self/maps', 'utf8').split('\n').filter(line => inTestRoot(line.slice(line.indexOf('/')))); }
+  catch (e) { errors.push('maps: ' + String(e)); }
+  return { pid: process.pid, at: new Date().toISOString(), fds, maps, errors };
+}
+const relDbSuffixes = ['', '-wal', '-shm', '-journal'] as const;
+function relHash(bytes: Buffer) { return createHash('sha256').update(bytes).digest('hex'); }
+function relFileFacts(path: string) {
+  return relDbSuffixes.map(suffix => {
+    if (!existsSync(path + suffix)) return { suffix, exists: false as const };
+    const st = statSync(path + suffix), bytes = readFileSync(path + suffix);
+    return { suffix, exists: true as const, size: st.size, dev: st.dev, ino: st.ino,
+      sha256: relHash(bytes), headerHex: bytes.subarray(0, suffix === '' ? 100 : 64).toString('hex') };
+  });
+}
+function relCopySnapshot(from: string, to: string, facts: ReturnType<typeof relFileFacts>) {
+  mkdirSync(join(to, '..'), { recursive: true });
+  for (const fact of facts) {
+    if (!fact.exists) { assert.equal(existsSync(from + fact.suffix), false, 'REL snapshot component existence'); continue; }
+    const bytes = readFileSync(from + fact.suffix);
+    assert.equal(relHash(bytes), fact.sha256, 'REL snapshot source hash before copy');
+    writeFileSync(to + fact.suffix, bytes);
+  }
+  assert.deepEqual(relFileFacts(to).map(({ suffix, exists, ...fact }) => ({ suffix, exists, hash: fact.sha256 })),
+    facts.map(({ suffix, exists, ...fact }) => ({ suffix, exists, hash: fact.sha256 })), 'REL snapshot copies must share exact bytes');
+}
+function relError(error: unknown) {
+  const e = error as { name?: string; message?: string; code?: string; errno?: number; byteOffset?: number };
+  return { name: e?.name, message: e?.message ?? String(error), code: e?.code, errno: e?.errno, byteOffset: e?.byteOffset };
+}
+function relInspectCopy(path: string) {
+  let engine: StreamHistoryEngine | undefined, raw: Database | undefined;
+  try {
+    engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] });
+    raw = new Database(path, { readonly: true });
+    return { ok: true, pid: process.pid, bun: Bun.version,
+      sqlite: raw.query('SELECT sqlite_version() AS version').get(),
+      integrity: raw.query('PRAGMA quick_check').all(),
+      inputs: raw.query('SELECT count(*) AS n FROM sh_input').get(),
+      rows: raw.query('SELECT count(*) AS n FROM sh_row').get(),
+      checkpoints: raw.query('SELECT count(*) AS n FROM sh_checkpoint').get() };
+  } catch (e) { return { ok: false, pid: process.pid, bun: Bun.version, error: relError(e) }; }
+  finally { raw?.close(); engine?.close(); }
+}
+function relFreshCopy(path: string, facts: ReturnType<typeof relFileFacts>) {
+  // Independent copy from the frozen snapshot, never the parent-opened copy.
+  // Two seconds is inside the existing 30s case budget; a timeout is diagnostic
+  // failure, never a successful recovery or a mutation kill.
+  const script = `import {Database} from 'bun:sqlite';
+    import {StreamHistoryEngine} from ${JSON.stringify(join(import.meta.dir, '../src/history-engine.ts'))};
+    import {existsSync,readFileSync,statSync} from 'node:fs'; import {createHash} from 'node:crypto';
+    const relDbSuffixes=${JSON.stringify(relDbSuffixes)}, relHash=${relHash.toString()}, relFileFacts=${relFileFacts.toString()};
+    const relError=${relError.toString()}, relInspectCopy=${relInspectCopy.toString()};
+    const facts=relFileFacts(${JSON.stringify(path)});
+    const expected=${JSON.stringify(facts)};
+    if(JSON.stringify(facts.map(f=>[f.suffix,f.exists,f.sha256]))!==JSON.stringify(expected.map(f=>[f.suffix,f.exists,f.sha256]))) throw Error('REL fresh snapshot hash mismatch');
+    console.log(JSON.stringify({before:facts,result:relInspectCopy(${JSON.stringify(path)})}));`;
+  const child = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 2_000 });
+  const output = child.stdout ?? '';
+  let observation: unknown;
+  try { observation = JSON.parse(output.trim()); } catch { observation = { invalidOutput: output }; }
+  return { exit: child.status, signal: child.signal, error: child.error ? relError(child.error) : null,
+    stderr: child.stderr, observation };
+}
+
 describe('stream-first H crash and continuation', () => {
   test('large physical row crosses disk blocks and page bytes with a real cell cursor', async () => {
     const f = shFixture();
@@ -582,12 +666,21 @@ describe('stream-first H crash and continuation', () => {
       'checkpoint-before-write', 'checkpoint-before-commit', 'checkpoint-after-commit']) {
       const dir = mkdtempSync(join(tmpdir(), 'stream-kill-'));
       const path = join(dir, 'stream.sqlite');
+      const beforeChild = relSqliteInventory();
+      const startedAt = new Date().toISOString();
       const source = join(import.meta.dir, '../src/history-engine.ts');
       const script = `import { StreamHistoryEngine, streamDigest } from ${JSON.stringify(source)};
+        import {writeSync} from 'node:fs'; import {Database} from 'bun:sqlite';
+        const versionDb=new Database(':memory:');
+        const sqlite=versionDb.query('SELECT sqlite_version() AS version').get(); versionDb.close();
         const shPane=${JSON.stringify(shPane)}, shIdentity=${JSON.stringify(shIdentity)};
         const shOk=${shOk.toString()}, shInput=${shInput.toString()}, shAppend=${shAppend.toString()}, shCheckpoint=${shCheckpoint.toString()};
         const engine = new StreamHistoryEngine({path:${JSON.stringify(path)},codecVersions:['fixture-v1'],
-          boundary(at) { if(at===${JSON.stringify(phase)}) process.kill(process.pid,'SIGKILL'); }});
+          boundary(at) { if(at===${JSON.stringify(phase)}) {
+            writeSync(1, 'REL_KILL_PHASE '+JSON.stringify({phase:at,pid:process.pid,at:new Date().toISOString(),bun:Bun.version,sqlite})+'\\n');
+            if(!Number.isSafeInteger(process.pid)||process.pid<=1) throw Error('unsafe child pid');
+            process.kill(process.pid,'SIGKILL');
+          } }});
         shOk(await engine.journalInput(shInput()));
         console.log('INPUT_ACK');
         shOk(await engine.appendFinalized(shAppend()));
@@ -599,14 +692,44 @@ describe('stream-first H crash and continuation', () => {
         expect(exit).not.toBe(0);
         expect(child.signalCode).toBe('SIGKILL');
         expect(stderr).not.toMatch(/SyntaxError|ReferenceError|Cannot find/);
+        const marker = output.split('\n').find(line => line.startsWith('REL_KILL_PHASE '));
+        assert.ok(marker, 'REL crash must reach the requested boundary');
+        const killed = JSON.parse(marker.slice('REL_KILL_PHASE '.length));
+        assert.equal(killed.phase, phase); assert.equal(killed.pid, child.pid);
+        // All three awaited streams are complete above: the writer is quiescent.
+        // Freeze before the ORIGINAL constructor can recover/checkpoint anything.
+        const facts = relFileFacts(path), beforeReopen = relSqliteInventory();
+        const evidenceRoot = process.env.THUMBMUX_REL_FIX_EVIDENCE_DIR ?? dir;
+        const evidence = mkdtempSync(join(evidenceRoot, 'rel-short-read-'));
+        const snapshot = join(evidence, 'snapshot', 'stream.sqlite');
+        relCopySnapshot(path, snapshot, facts);
+        const context = { phase, startedAt, beforeReopenAt: new Date().toISOString(), killed,
+          child: { pid: child.pid, exit, signal: child.signalCode }, parentPid: process.pid, parentBun: Bun.version,
+          fsTypeHex: '0x' + statfsSync(dir).type.toString(16),
+          snapshotFsTypeHex: '0x' + statfsSync(evidence).type.toString(16), facts, beforeChild, beforeReopen };
+        writeFileSync(join(evidence, 'before-reopen.json'), JSON.stringify(context, null, 2));
+        console.log('REL_CRASH_SNAPSHOT', JSON.stringify(context));
         let engine: StreamHistoryEngine;
         try { engine = new StreamHistoryEngine({ path, codecVersions: ['fixture-v1'] }); }
         catch (e) {
-          // One GitHub run failed this open with SQLITE_IOERR_SHORT_READ and no local stress reproduced it:
-          // print what the killed writer left so a recurrence carries its own evidence.
-          const sizes = Object.fromEntries(['', '-wal', '-shm', '-journal'].map(s => [s || 'db', existsSync(path + s) ? statSync(path + s).size : null]));
-          const dbIno = existsSync(path) ? Number(statSync(path).ino) : null;
-          console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify({ phase, sizes, dbIno, output, stderr: stderr.slice(-2000), error: String(e) }));
+          // These opens explain failure only. Never retry or replace the gate's
+          // original path. SHM is copied as crash evidence, never deleted as a fix.
+          const afterFailure = relSqliteInventory();
+          let diagnostics: unknown;
+          try {
+            const parentPath = join(evidence, 'parent-copy', 'stream.sqlite');
+            const freshPath = join(evidence, 'fresh-copy', 'stream.sqlite');
+            relCopySnapshot(snapshot, parentPath, facts);
+            relCopySnapshot(snapshot, freshPath, facts);
+            const parentCopy = relInspectCopy(parentPath);
+            const freshCopy = relFreshCopy(freshPath, facts);
+            diagnostics = { parentCopy, freshCopy };
+          } catch (diagnosticError) { diagnostics = { error: relError(diagnosticError) }; }
+          const failure = { ...context, afterFailure, afterDiagnostics: relSqliteInventory(),
+            evidence, error: relError(e), diagnostics, output, stderr };
+          console.log('STREAM_KILL_REOPEN_FAILED', JSON.stringify(failure));
+          try { writeFileSync(join(evidence, 'failure.json'), JSON.stringify(failure, null, 2)); }
+          catch (writeError) { console.log('REL_EVIDENCE_WRITE_FAILED', JSON.stringify(relError(writeError))); }
           throw e;
         }
         try {
@@ -616,22 +739,71 @@ describe('stream-first H crash and continuation', () => {
           try {
             const inputs = (raw.query('SELECT count(*) AS n FROM sh_input').get() as { n: number }).n;
             const rows = (raw.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n;
+            assert.equal(inputs, phase.startsWith('input-before') ? 0 : 1, 'REL durable input boundary');
+            assert.equal(rows, phase === 'checkpoint-after-commit' ? 1 : 0, 'REL durable row boundary');
+            const checkpoints = (raw.query('SELECT count(*) AS n FROM sh_checkpoint').get() as { n: number }).n;
+            assert.equal(checkpoints, phase === 'checkpoint-after-commit' ? 1 : 0, 'REL durable checkpoint boundary');
+            if (output.includes('INPUT_ACK')) assert.equal(inputs, 1, 'REL acknowledged input survives reopen');
             expect(inputs).toBe(phase.startsWith('input-before') ? 0 : 1);
             expect(rows).toBe(phase === 'checkpoint-after-commit' ? 1 : 0);
             if (output.includes('INPUT_ACK')) expect(inputs).toBe(1);
           } finally { raw.close(); }
           shOk(await engine.journalInput(shInput()));
           const retry = shOk(await engine.appendFinalized(shAppend()));
+          assert.equal(retry.head, 1, 'REL continuation retry head exactly once');
           expect(retry.head).toBe(1);
           shOk(await shCheckpoint(engine));
           const rawAfter = new Database(path, { readonly: true });
-          try { expect((rawAfter.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n).toBe(1); }
+          try {
+            assert.equal((rawAfter.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n, 1, 'REL continuation durable rows exactly once');
+            expect((rawAfter.query('SELECT count(*) AS n FROM sh_row').get() as { n: number }).n).toBe(1);
+          }
           finally { rawAfter.close(); }
-        } finally { engine.close(); }
+        } finally {
+          engine.close();
+          console.log('REL_CRASH_AFTER_CLOSE', JSON.stringify({ phase, inventory: relSqliteInventory() }));
+          rmSync(evidence, { recursive: true, force: true }); // Retain external snapshots only on reopen failure.
+        }
       } finally { rmSync(dir, { recursive: true, force: true }); }
     }
   }, 30000);
 });
+
+
+test('stream-first H REL snapshot controls distinguish clean, corrupt and truncated copies', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stream-rel-controls-'));
+  try {
+    const path = join(dir, 'clean', 'stream.sqlite'); mkdirSync(join(path, '..'));
+    const clean = relInspectCopy(path);
+    assert.equal(clean.ok, true, 'REL clean new database must open');
+    const facts = relFileFacts(path), snapshot = join(dir, 'snapshot', 'stream.sqlite');
+    relCopySnapshot(path, snapshot, facts);
+    for (const control of ['clean', 'corrupt', 'truncate'] as const) {
+      const copy = join(dir, control + '-copy', 'stream.sqlite');
+      relCopySnapshot(snapshot, copy, facts);
+      if (control !== 'clean') {
+        const bytes = readFileSync(copy);
+        if (control === 'corrupt') { bytes.fill(0x58, 0, 16); writeFileSync(copy, bytes); }
+        else writeFileSync(copy, bytes.subarray(0, 100)); // Nonempty truncated DB: never a new/empty DB.
+      }
+      const observedFacts = relFileFacts(copy);
+      const freshPath = join(dir, control + '-fresh', 'stream.sqlite');
+      relCopySnapshot(copy, freshPath, observedFacts);
+      const parent = relInspectCopy(copy), fresh = relFreshCopy(freshPath, observedFacts);
+      const observation = fresh.observation as { result?: ReturnType<typeof relInspectCopy> };
+      console.log('REL_SNAPSHOT_CONTROL', JSON.stringify({ control, observedFacts, parent, fresh }));
+      assert.equal(fresh.exit, 0, 'REL control fresh process must finish normally');
+      assert.equal(fresh.signal, null, 'REL control timeout is not an integrity detection');
+      for (const result of [parent, observation.result]) {
+        assert.ok(result, 'REL fresh process must report a structured open result');
+        assert.equal(result.ok, control === 'clean', 'REL snapshot integrity control');
+        if (!result.ok) {
+          assert.match(result.error?.code ?? '', /^SQLITE_(?:NOTADB|CORRUPT|IOERR)/, 'REL corruption must fail with SQLite I/O or integrity error');
+        }
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30000);
 
 
 describe('stream-first H legacy decode admission', () => {

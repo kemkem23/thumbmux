@@ -138,6 +138,21 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     { name: 'omit-retry-integrity', pattern: 'same key with changed content',
       from: "if (prior.request.digest !== request.digest) throw Error('event identity collision');",
       to: '/* mutant: accepts divergent retry */' },
+    // Boundary-gated persistence damage is confined to the killed fixture
+    // child. Parent continuation stays real, so earlier schema-only phases
+    // cannot die for a different reason before the intended named assertion.
+    { name: 'rel-drop-crash-input', pattern: 'process SIGKILL around input', assertion: 'REL durable input boundary',
+      from: "        this.db.query('INSERT INTO sh_input VALUES(?,?,?,?,?,?)').run(key, sourceEpoch, packetSeq, event.digest, streamCanonical(event), streamCanonical(receipt));",
+      to: "        if (!this.options.boundary) this.db.query('INSERT INTO sh_input VALUES(?,?,?,?,?,?)').run(key, sourceEpoch, packetSeq, event.digest, streamCanonical(event), streamCanonical(receipt));" },
+    { name: 'rel-drop-crash-rows', pattern: 'process SIGKILL around input', assertion: 'REL durable row boundary',
+      from: "      this.transaction('checkpoint', () => {\n        this.flushRows(key);",
+      to: "      this.transaction('checkpoint', () => {\n        if (!this.options.boundary) this.flushRows(key);" },
+    { name: 'rel-drop-crash-checkpoint', pattern: 'process SIGKILL around input', assertion: 'REL durable checkpoint boundary',
+      from: "        this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision, streamDigest('vt-checkpoint', cp));",
+      to: "        if (!this.options.boundary) this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision, streamDigest('vt-checkpoint', cp));" },
+    { name: 'rel-false-continuation-receipt', pattern: 'process SIGKILL around input', assertion: 'REL continuation retry head exactly once',
+      from: "      if (durable) { if (durable.digest !== request.digest) throw Error('event identity collision'); return ok(JSON.parse(String(durable.receipt))); }",
+      to: "      if (durable) { if (durable.digest !== request.digest) throw Error('event identity collision'); return ok({...JSON.parse(String(durable.receipt)), head: 2}); }" },
   ];
   try {
     mkdirSync(join(root, 'server'), { recursive: true });
@@ -160,13 +175,36 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     expect((await run('stream-first H')).exit).toBe(0);
     for (const mutation of mutations) {
       expect(original.includes(mutation.from)).toBe(true);
-      writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
-      const result = await run(mutation.pattern);
-      console.log('STREAM_H_MUTANT', mutation.name, result.exit, result.output);
-      expect(result.exit).not.toBe(0);
-      expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
-      expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
-      writeFileSync(file, original);
+      if ('assertion' in mutation) {
+        expect(original.split(mutation.from).length - 1).toBe(1);
+        const clean = await run(mutation.pattern);
+        console.log('REL_MUTANT_CLEAN_BEFORE', mutation.name, clean.exit, clean.output);
+        expect(clean.exit).toBe(0);
+        expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+      }
+      try {
+        writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
+        const result = await run(mutation.pattern);
+        console.log('STREAM_H_MUTANT', mutation.name, result.exit, result.output);
+        expect(result.exit).not.toBe(0);
+        expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
+        expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+        expect(result.output).not.toMatch(/ReferenceError|timed out|TimeoutError|test timeout|Cannot find package|Failed to resolve/i);
+        if ('assertion' in mutation) {
+          // Require the assertion's actual error line, not its presence in a
+          // printed source excerpt. Spawn/import/timeout errors never qualify.
+          expect(result.output).toMatch(new RegExp('(?:AssertionError[^\\n]*: |error: )' + mutation.assertion));
+          expect(result.output).toMatch(/\b1 fail\b/);
+        }
+      } finally {
+        writeFileSync(file, original);
+        if ('assertion' in mutation) {
+          const restored = await run(mutation.pattern);
+          console.log('REL_MUTANT_RESTORED', mutation.name, restored.exit, restored.output);
+          expect(restored.exit).toBe(0);
+          expect(restored.output).toMatch(/\b[1-9]\d* pass\b/);
+        }
+      }
     }
     expect((await run('stream-first H')).exit).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
