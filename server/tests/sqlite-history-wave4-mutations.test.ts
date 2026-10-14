@@ -93,6 +93,9 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
       return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
     const before = await run('clean-before');
+    if (before.code !== 0 || before.tests === 0) {
+      console.error('WAVE4_CLEAN_BEFORE_FAILED_OUTPUT', before.output);
+    }
     expect(before.code).toBe(0);
     expect(before.tests).toBeGreaterThan(0);
     for (const mutant of mutants) {
