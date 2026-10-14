@@ -706,6 +706,7 @@ function relSupervisorMain(config: { parentPid: number; nonce: string; deadlineM
   process.stdin.on('end', () => { void stop('parent-ipc-eof', false); });
   process.stdin.on('error', () => { void stop('parent-ipc-error', false); });
   process.stdout.on('error', () => { void stop('parent-ipc-output-error', false); });
+  process.stderr.on('error', () => { /* Logging failure must not orphan fresh. */ });
   const receive = async (message: { type?: string; nonce?: string; parentPid?: number; deadlineMs?: number; script?: string }) => {
     if (stopping) return;
     if (!validParent() || message.nonce !== config.nonce) { await stop('invalid-owner-or-nonce', false); return; }
@@ -730,6 +731,8 @@ function relSupervisorMain(config: { parentPid: number; nonce: string; deadlineM
         owned.once('close', (exit, signal) => resolve({ exit, signal }));
       });
       owned.stdout!.setEncoding('utf8'); owned.stderr!.setEncoding('utf8');
+      owned.stdout!.on('error', () => { void stop('fresh-stdout-error', false); });
+      owned.stderr!.on('error', () => { void stop('fresh-stderr-error', false); });
       owned.stdout!.on('data', (chunk: string) => {
         outputLength += chunk.length; outputTail = (outputTail + chunk).slice(-2000);
         if (output.length < 65536) output = (output + chunk).slice(0, 65536);
