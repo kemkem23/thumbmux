@@ -1514,6 +1514,7 @@ for (const mutation of ["drop-final-frame", "skip-dedicated-q-ack"] as const) te
     const root = mkdtempSync(join(tmpdir(), "f1q-dedicated-mutation-")); roots.push(root);
     const original = pipeVtAssets();
     const source = readFileSync(original.worker, "utf8");
+    const vendorBytes = readFileSync(original.vendor), licenseBytes = readFileSync(original.license);
     const qBranch = '    elif kind == b"Q":\n        return worker, True';
     const qAck = '    send(b"B", {"workerEof": True})\n\n\nif __name__ == "__main__":';
     const damaged = mutation === "drop-final-frame"
@@ -1568,8 +1569,8 @@ def f1q_read(fd, size):
         .replace('            worker, eof = dispatch(worker, kind, payload, rx_at)',
           '            if kind == b"Q":\n                f1q_trace("pre-Q", pending=worker.pending(), seq_to=worker.seq_to, emitted_seq=worker.emitted_seq)\n            worker, eof = dispatch(worker, kind, payload, rx_at)');
       writeFileSync(assets.worker, copied);
-      writeFileSync(assets.vendor, readFileSync(original.vendor));
-      writeFileSync(assets.license, readFileSync(original.license));
+      writeFileSync(assets.vendor, vendorBytes);
+      writeFileSync(assets.license, licenseBytes);
       assert.equal(sha(readFileSync(assets.worker)), sha(copied));
       assert.equal(sha(readFileSync(assets.vendor)), PIPE_VT_VENDOR_SHA256);
       const updates: PipeVtUpdate[] = [], faults: PipeVtFault[] = [];
