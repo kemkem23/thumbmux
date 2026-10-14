@@ -166,48 +166,104 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const originalBytes = readFileSync(file);
+    let fullRuns = 0;
     const run = async (pattern: string) => {
+      const started = performance.now();
       const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      return { exit, output: out + err };
+      const result = { exit, output: out + err, signal: child.signalCode, elapsedMs: performance.now() - started };
+      if (pattern === 'stream-first H') summary(fullRuns++ === 0 ? 'full-clean-before' : 'full-clean-after', pattern, result);
+      return result;
     };
-    expect((await run('stream-first H')).exit).toBe(0);
-    for (const mutation of mutations) {
-      expect(original.includes(mutation.from)).toBe(true);
-      if ('assertion' in mutation) {
-        expect(original.split(mutation.from).length - 1).toBe(1);
-        const clean = await run(mutation.pattern);
-        console.log('REL_MUTANT_CLEAN_BEFORE', mutation.name, clean.exit, clean.output);
-        expect(clean.exit).toBe(0);
-        expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+    const summary = (stage: string, name: string, result: Awaited<ReturnType<typeof run>>) => {
+      const namedLine = result.output.split('\n').find(line => /(?:AssertionError[^\n]*: |error: )REL /.test(line));
+      console.log('STREAM_H_RUN', JSON.stringify({ stage, name, exit: result.exit, signal: result.signal,
+        elapsedMs: result.elapsedMs, pass: Number(/\b(\d+) pass\b/.exec(result.output)?.[1] ?? 0),
+        fail: Number(/\b(\d+) fail\b/.exec(result.output)?.[1] ?? 0), namedLine: namedLine?.slice(0, 4000),
+        outputLength: result.output.length, truncated: result.output.length > 4000, tail: result.output.slice(-4000) }));
+    };
+    const restore = () => {
+      writeFileSync(file, originalBytes);
+      expect(readFileSync(file)).toEqual(originalBytes);
+    };
+    // A secondary restoration failure is visible but never replaces the first
+    // failed oracle. The same rule applies to group restored runtime checks.
+    const preservingPrimary = async (work: () => Promise<void>, cleanup: () => Promise<void>) => {
+      let failed = false;
+      try { await work(); }
+      catch (error) { failed = true; throw error; }
+      finally {
+        try { await cleanup(); }
+        catch (error) {
+          console.error('REL_RESTORE_SECONDARY', String(error).slice(-4000));
+          if (!failed) throw error;
+        }
       }
-      try {
+    };
+    const damaged = async (mutation: typeof mutations[number]) => {
+      expect(readFileSync(file)).toEqual(originalBytes);
+      expect(original.includes(mutation.from)).toBe(true);
+      await preservingPrimary(async () => {
         writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
         const result = await run(mutation.pattern);
-        console.log('STREAM_H_MUTANT', mutation.name, result.exit, result.output);
+        summary('damaged', mutation.name, result);
         expect(result.exit).not.toBe(0);
         expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
         expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
         expect(result.output).not.toMatch(/ReferenceError|timed out|TimeoutError|test timeout|Cannot find package|Failed to resolve/i);
         if ('assertion' in mutation) {
-          // Require the assertion's actual error line, not its presence in a
-          // printed source excerpt. Spawn/import/timeout errors never qualify.
+          // Match FULL output, not the bounded presentation above.
           expect(result.output).toMatch(new RegExp('(?:AssertionError[^\\n]*: |error: )' + mutation.assertion));
           expect(result.output).toMatch(/\b1 fail\b/);
         }
-      } finally {
-        writeFileSync(file, original);
-        if ('assertion' in mutation) {
-          const restored = await run(mutation.pattern);
-          console.log('REL_MUTANT_RESTORED', mutation.name, restored.exit, restored.output);
+      }, async () => { restore(); });
+    };
+    await preservingPrimary(async () => {
+      expect((await run('stream-first H')).exit).toBe(0);
+      const legacy = mutations.filter(mutation => !('assertion' in mutation));
+      const rel = mutations.filter(mutation => 'assertion' in mutation);
+      expect(legacy).toHaveLength(4); expect(rel).toHaveLength(4);
+      for (const mutation of legacy) await damaged(mutation);
+      for (const mutation of rel) {
+        expect(mutation.pattern).toBe('process SIGKILL around input');
+        expect(original.split(mutation.from).length - 1).toBe(1);
+      }
+      expect(readFileSync(file)).toEqual(originalBytes);
+      await preservingPrimary(async () => {
+        const clean = await run('process SIGKILL around input');
+        summary('clean-before', 'REL group', clean);
+        expect(clean.exit).toBe(0);
+        expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+        expect(clean.output).toContain('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement');
+        expect((clean.output.match(/REL_CRASH_AFTER_CLOSE/g) ?? []).length).toBe(6);
+        for (const mutation of rel) await damaged(mutation);
+      }, async () => {
+        // Even a failed byte restoration must not silently skip runtime restore.
+        let restoreError: unknown;
+        try { restore(); } catch (error) { restoreError = error; }
+        try {
+          const restored = await run('process SIGKILL around input');
+          summary('restored-after', 'REL group', restored);
           expect(restored.exit).toBe(0);
           expect(restored.output).toMatch(/\b[1-9]\d* pass\b/);
+          expect(restored.output).toContain('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement');
+          expect((restored.output.match(/REL_CRASH_AFTER_CLOSE/g) ?? []).length).toBe(6);
+        } catch (error) {
+          if (restoreError !== undefined) console.error('REL_RESTORE_SECONDARY', String(error).slice(-4000));
+          else throw error;
         }
-      }
-    }
-    expect((await run('stream-first H')).exit).toBe(0);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+        if (restoreError !== undefined) throw restoreError;
+      });
+      expect((await run('stream-first H')).exit).toBe(0);
+    }, async () => { restore(); });
+  } catch (error) {
+    try { rmSync(root, { recursive: true, force: true }); }
+    catch (cleanupError) { console.error('REL_CLEANUP_SECONDARY', String(cleanupError).slice(-4000)); }
+    throw error;
+  }
+  rmSync(root, { recursive: true, force: true });
 }, 120000);
 
 test('contract repair mutants go red then restored real seams go green', async () => {
