@@ -19,11 +19,147 @@ const childTestTimeoutArgs = (() => {
   let source: string;
   try { source = readFileSync(suitePath, 'utf8'); }
   catch (error) { throw invalid(`cannot read suite source: ${String(error)}`); }
-  const blocks = [...source.matchAll(/^def traced_command\([^\n]*\):[^\n]*\n[\s\S]*?(?=^def |$(?![\s\S]))/gm)];
-  if (blocks.length !== 1) throw invalid(`expected one traced_command block, found ${blocks.length}`);
-  const timeouts = [...blocks[0]![0].matchAll(/"test"\s*,\s*"--timeout"\s*,\s*"([0-9]+)"/g)];
-  if (timeouts.length !== 1) throw invalid(`expected one decimal test timeout tuple, found ${timeouts.length}`);
-  const value = timeouts[0]![1]!;
+  // Tokenize without executing Python. Strings/comments never become statements;
+  // offsets, indentation and bracket depth still refer to the original source.
+  type Token = { text: string; start: number; end: number; column: number; depth: number;
+    kind: 'code' | 'string' | 'comment'; plain: boolean };
+  const tokens: Token[] = [];
+  const brackets: string[] = [];
+  for (let at = 0; at < source.length;) {
+    if (/\s/.test(source[at]!)) { at++; continue; }
+    const start = at, column = start - source.lastIndexOf('\n', start - 1) - 1;
+    const depth = brackets.length;
+    let kind: Token['kind'] = 'code', plain = false;
+    const word = /^[A-Za-z_][A-Za-z_0-9]*/.exec(source.slice(at))?.[0];
+    const prefix = word && /^[rRuUbBfF]+$/.test(word)
+      && /['"]/.test(source[at + word.length] ?? '') ? word : '';
+    const quoteAt = at + prefix.length, quote = source[quoteAt];
+    if (source[at] === '#') {
+      kind = 'comment';
+      const newline = source.indexOf('\n', at);
+      at = newline < 0 ? source.length : newline;
+    } else if (quote === '"' || quote === "'") {
+      kind = 'string';
+      const triple = source.slice(quoteAt, quoteAt + 3) === quote.repeat(3);
+      const delimiter = triple ? quote.repeat(3) : quote;
+      plain = !prefix && !triple;
+      at = quoteAt + delimiter.length;
+      let closed = false;
+      while (at < source.length) {
+        if (source.startsWith(delimiter, at)) { at += delimiter.length; closed = true; break; }
+        if (source[at] === '\\') { plain = false; at += 2; continue; }
+        if (source[at] === '\n' || source[at] === '\r') {
+          plain = false;
+          if (!triple) throw invalid('unsupported multiline string');
+        }
+        at++;
+      }
+      if (!closed) throw invalid('unterminated string in suite source');
+    } else {
+      at += word?.length ?? 1;
+      const text = source.slice(start, at);
+      if ('([{'.includes(text)) brackets.push(text);
+      else if (')]}'.includes(text)) {
+        const expected = ['(', '[', '{'][')]}'.indexOf(text)];
+        if (brackets.pop() !== expected) throw invalid('unbalanced suite brackets');
+      }
+    }
+    tokens.push({ text: source.slice(start, at), start, end: at, column, depth, kind, plain });
+  }
+  if (brackets.length) throw invalid('unclosed suite brackets');
+  const code = tokens.filter(token => token.kind !== 'comment');
+  const definitions = code.filter((token, index) => token.kind === 'code' && token.text === 'def'
+    && token.column === 0 && token.depth === 0 && code[index + 1]?.text === 'traced_command');
+  if (definitions.length !== 1) throw invalid(`expected one active traced_command, found ${definitions.length}`);
+  const definition = definitions[0]!;
+  if (code[code.indexOf(definition) - 1]?.text === '\\') throw invalid('continued function definition');
+  const headerEnd = source.indexOf('\n', definition.start);
+  if (headerEnd < 0 || !/^def +traced_command\(\s*paths\s*,\s*trace_path\s*,\s*quiet\s*=\s*False\s*\):\s*$/.test(
+    source.slice(definition.start, headerEnd))) throw invalid('unsupported traced_command signature');
+  const end = code.find(token => token.start > headerEnd && token.column === 0 && token.depth === 0)?.start
+    ?? source.length;
+  const body = tokens.filter(token => token.start > headerEnd && token.start < end);
+  if (body.some(token => token.kind === 'comment' || (token.kind === 'string'
+    && (token.text.includes('\n') || token.text.includes('\r') || /^(?:[rRuUbBfF]*)(?:"""|''')/.test(token.text)))
+    || (token.kind === 'code' && (token.text === '\\' || token.text === ';')))
+    || /[^\S \r\n]/.test(source.slice(headerEnd, end))) {
+    throw invalid('unsupported comment, multiline string, continuation or indentation in traced_command');
+  }
+  // Count all command uses except Popen's first argument before examining RHS.
+  // This also rejects aliases, augmented/annotated/tuple targets and mutations.
+  const assignments = body.filter((token, index) => token.kind === 'code' && token.text === 'command'
+    && !(body[index - 1]?.text === '(' && body[index - 2]?.text === 'Popen'
+      && body[index - 3]?.text === '.' && body[index - 4]?.text === 'subprocess'
+      && body[index + 1]?.text === ','));
+  if (assignments.length !== 1) throw invalid(`expected one command assignment, found ${assignments.length}`);
+  const assignment = assignments[0]!, assignmentIndex = body.indexOf(assignment);
+  if (assignment.column !== 4 || assignment.depth !== 0
+    || body[assignmentIndex + 1]?.text !== '=' || body[assignmentIndex + 2]?.text !== '['
+    || !/^command *= *\[$/.test(source.slice(assignment.start, body[assignmentIndex + 2]!.end))) {
+    throw invalid('command must be one direct-body list assignment');
+  }
+  // Only the existing guard may precede the assignment. Its diagnostic is a
+  // string token (including the current f-string), never executable markers.
+  const guard = body.slice(0, assignmentIndex);
+  const colon = guard.findIndex(token => token.kind === 'code' && token.text === ':' && token.depth === 0);
+  const raise = guard.slice(colon + 1);
+  if (guard[0]?.text !== 'if' || guard[0]?.column !== 4 || colon < 2
+    || guard.slice(1, colon).some(token => token.column === 4 || token.text === ':' || token.text === 'def')
+    || raise.length !== 5 || raise[0]?.text !== 'raise' || raise[0]?.column !== 8
+    || raise[1]?.text !== 'ValueError' || raise[2]?.text !== '('
+    || raise[3]?.kind !== 'string' || raise[4]?.text !== ')'
+    || source.slice(guard[0]!.start, guard[colon]!.end).includes('\n')
+    || !/^[ \r]*\n *$/.test(source.slice(guard[colon]!.end, raise[0]!.start))
+    || source.slice(raise[0]!.start, raise[4]!.end).includes('\n')
+    || !/^[ \r]*\n[ \r\n]*$/.test(source.slice(raise[4]!.end, assignment.start))) {
+    throw invalid('unsupported control flow before command assignment');
+  }
+  const openIndex = assignmentIndex + 2;
+  const closeIndex = body.findIndex((token, index) => index > openIndex
+    && token.kind === 'code' && token.text === ']' && token.depth === 1);
+  if (closeIndex < 0) throw invalid('missing command list close');
+  const list = body.slice(openIndex + 1, closeIndex);
+  if (list.some(token => token.kind === 'string' && !token.plain)) {
+    throw invalid('command strings must be unprefixed, unescaped single-line literals');
+  }
+  // Require the list to end the assignment, followed by the existing direct
+  // Popen return. No trailing expression, intervening write or alias is allowed.
+  const suffix = body.slice(closeIndex + 1);
+  if (!/^[ \r]*\n[ \r\n]*$/.test(source.slice(body[closeIndex]!.end, suffix[0]?.start ?? end))
+    || suffix[0]?.column !== 4 || suffix.map(token => token.text).join(' ') !==
+      'return subprocess . Popen ( command , start_new_session = True , stdout = subprocess . DEVNULL if quiet else None , stderr = subprocess . DEVNULL if quiet else None , )'
+    || !/^return +subprocess *\. *Popen *\($/.test(source.slice(suffix[0]!.start, suffix[4]!.end))) {
+    throw invalid('command list must be passed directly to the existing Popen return');
+  }
+  const items: Token[][] = [];
+  let item: Token[] = [];
+  for (const token of list) {
+    if (token.kind === 'code' && token.text === ',' && token.depth === 1) {
+      if (!item.length) throw invalid('empty command list item');
+      items.push(item); item = [];
+    } else item.push(token);
+  }
+  if (item.length) items.push(item);
+  const literal = (part: Token[] | undefined) => part?.length === 1 && part[0]!.kind === 'string'
+    && part[0]!.plain ? part[0]!.text.slice(1, -1) : undefined;
+  // Count options before validating any operand, including missing/nondecimal
+  // operands. A string nested in the paths comprehension is not a top-level option.
+  const timeouts = items.flatMap((part, index) => part.filter(token => token.kind === 'string'
+    && token.depth === 1 && token.text.slice(1, -1) === '--timeout').map(() => index));
+  if (timeouts.length !== 1) throw invalid(`expected one top-level timeout candidate, found ${timeouts.length}`);
+  const timeoutIndex = timeouts[0]!;
+  if (literal(items[timeoutIndex]) !== '--timeout' || literal(items[timeoutIndex - 1]) !== 'test') {
+    throw invalid('timeout option must be a literal immediately after test');
+  }
+  const value = literal(items[timeoutIndex + 1]);
+  if (value === undefined || !/^[0-9]+$/.test(value)) throw invalid('timeout operand must be one complete decimal literal');
+  for (const part of items) {
+    if (literal(part) !== undefined) continue;
+    const spelling = part.map(token => token.kind === 'string' ? '<string>' : token.text).join(' ');
+    if (spelling === 'STRACE' || spelling === 'str ( trace_path )') continue;
+    if (spelling === '* [ <string> + p for p in paths ]' && literal([part[2]!]) === './') continue;
+    throw invalid('unsupported non-literal command item');
+  }
   if (!Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
     throw invalid(`timeout must be a positive safe integer, got ${value}`);
   }
