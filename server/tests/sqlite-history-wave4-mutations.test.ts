@@ -8,13 +8,90 @@
  * tree is run before the first mutant and again after the last one.
  */
 import { test, expect } from 'bun:test';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-// Keep child runners on the frozen suite's timeout contract, read once here.
+// Read the package's active CI contract once. Monorepo runs must also agree
+// with the frozen Python suite; neither layout has a fallback timeout.
 const childTestTimeoutArgs = (() => {
-  const suitePath = resolve(import.meta.dir, '../../../../ops/testing/thumbmux-suite.py');
+  const packageRoot = realpathSync(resolve(import.meta.dir, '../..'));
+  const readContract = (path: string) => {
+    try { return readFileSync(path, 'utf8'); }
+    catch (error) { throw new Error(`M4 child test timeout contract (${path}): cannot read source: ${String(error)}`); }
+  };
+  const requirePackage = (root: string, name: string) => {
+    const path = join(root, 'package.json');
+    try {
+      if (JSON.parse(readContract(path)).name !== name) throw new Error(`expected package ${name}`);
+    } catch (error) { throw new Error(`M4 child test timeout layout (${path}): ${String(error)}`); }
+  };
+  requirePackage(packageRoot, 'thumbmux');
+  // A checkout rooted at the package is public. Check its own marker first:
+  // never walk into ancestors of a public checkout to find a host contract.
+  const markerPath = join(packageRoot, '.git');
+  let publicCheckout: boolean;
+  try {
+    const marker = lstatSync(markerPath, { throwIfNoEntry: false });
+    if (marker && !marker.isFile() && !marker.isDirectory()) throw new Error('unsupported checkout marker');
+    publicCheckout = marker !== undefined;
+  } catch (error) { throw new Error(`M4 child test timeout layout (${markerPath}): ${String(error)}`); }
+  const checkoutRoot = publicCheckout ? packageRoot : resolve(packageRoot, '../..');
+  if (!publicCheckout) {
+    if (packageRoot !== join(checkoutRoot, 'packages/thumbmux')) {
+      throw new Error(`M4 child test timeout layout (${packageRoot}): cannot prove public or monorepo layout`);
+    }
+    // Frozen monorepo exports need not retain .git, but retain this root
+    // manifest and the exact packages/thumbmux position. Missing ops still fails.
+    requirePackage(checkoutRoot, 'cortex-orchestrator');
+  }
+  const actionPath = join(packageRoot, '.github/actions/verify-gate/action.yml');
+  const invalidAction = (detail: string) => new Error(`M4 child test timeout contract (${actionPath}): ${detail}`);
+  const actionSource = readContract(actionPath);
+  if (/\t|\r(?!\n)/.test(actionSource)) throw invalidAction('unsupported action whitespace');
+  const lines = actionSource.split(/\r?\n/).filter(line => line.trim() && !/^ *#/.test(line));
+  // This is a deliberately narrow structural reader, not a YAML interpreter.
+  // Validate the known header so runs/steps cannot come from a quoted scalar,
+  // alias, duplicate mapping or a different root section.
+  const header = /^name: verify-gate\ndescription: >\n(?:  [^\n]+\n)+inputs:\n  e2e-artifact-suffix:\n    description: [A-Za-z][^\n]*\n    required: true\nruns:\n  using: composite\n  steps:\n/;
+  const headerText = header.exec(lines.join('\n') + '\n')?.[0];
+  if (!headerText) throw invalidAction('unsupported composite action header');
+  const steps: string[][] = [];
+  let nested: 'block' | 'mapping' | undefined;
+  for (const line of lines.slice(headerText.split('\n').length - 1)) {
+    if (/^    - (?:name|uses|run): /.test(line)) {
+      steps.push([]); nested = undefined;
+    }
+    const step = steps.at(-1);
+    if (!step) throw invalidAction('missing step boundary');
+    const field = /^(?:    - |      )([a-z][a-z-]*):(?: (.*))?$/.exec(line);
+    if (field) {
+      const value = field[2] ?? '';
+      if (/^["'&*!\[{]/.test(value)) throw invalidAction('unsupported quoted or indirect step field');
+      nested = value === '|' || value === '>' ? 'block' : value === '' ? 'mapping' : undefined;
+    } else if (!/^ {8,}\S/.test(line) || !nested
+      || (nested === 'mapping' && !/^        [A-Za-z_][A-Za-z_0-9-]*: [^"'&*!\[{}|>].*$/.test(line))) {
+      throw invalidAction('unsupported step structure or multiline scalar');
+    }
+    step.push(line);
+  }
+  const named = steps.filter(step => step.some(line =>
+    /^(?:    - |      )name: unit and contract suites$/.test(line)));
+  if (named.length !== 1) throw invalidAction(`expected one unit and contract suites step, found ${named.length}`);
+  const step = named[0]!;
+  if (step.length !== 3 || step[0] !== '    - name: unit and contract suites'
+    || step[2] !== '      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}') {
+    throw invalidAction('expected one direct run and the supported shell in the active step');
+  }
+  // Exact envelope and suite list: no comments, substitutions, continuation,
+  // second command, extra bun test or duplicate --timeout can match.
+  const command = /^      run: \/usr\/bin\/timeout --kill-after=60s 60m bun test --timeout ([0-9]+) \.\/server\/tests\/\*\.test\.ts \.\/core\/tests\/\*\.test\.ts \.\/core\/src\/\*\.test\.ts \.\/svelte\/tests\/\*\.test\.ts \.\/app\/tests\/\*\.test\.ts \.\/demo\/\*\.test\.ts \.\/scripts\/\*\.test\.ts$/.exec(step[1]!);
+  const actionValue = command?.[1];
+  if (actionValue === undefined || !Number.isSafeInteger(Number(actionValue)) || Number(actionValue) <= 0) {
+    throw invalidAction('expected supported direct bun test command with one positive safe decimal timeout');
+  }
+  if (publicCheckout) return ['--timeout', actionValue] as const;
+  const suitePath = join(checkoutRoot, 'ops/testing/thumbmux-suite.py');
   const invalid = (detail: string) => new Error(`M4 child test timeout contract (${suitePath}): ${detail}`);
   let source: string;
   try { source = readFileSync(suitePath, 'utf8'); }
@@ -163,7 +240,10 @@ const childTestTimeoutArgs = (() => {
   if (!Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
     throw invalid(`timeout must be a positive safe integer, got ${value}`);
   }
-  return ['--timeout', value] as const;
+  if (Number(value) !== Number(actionValue)) {
+    throw invalid(`active traced_command timeout ${value} differs from ${actionPath}: ${actionValue}`);
+  }
+  return ['--timeout', actionValue] as const;
 })();
 
 type Mutant = { name: string; pattern: string; file: string; from: string; to: string };
@@ -218,22 +298,26 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
     const run = async (name: string, pattern?: string) => {
       const args = [process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts'];
       if (pattern) args.push('--test-name-pattern', pattern);
+      const started = performance.now();
       const child = Bun.spawn(args, { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const elapsedMs = performance.now() - started;
       const output = out + err;
       const ran = /Ran (\d+) tests?/.exec(output);
       // bun 1.3 prints "1 fail"; older reporters printed "(fail)". Either is a real test death.
       const failed = /\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
-      console.log('WAVE4_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed }));
+      console.log('WAVE4_MUTANT_RUN', JSON.stringify({ name, pattern, elapsedMs, code, tests: Number(ran?.[1] ?? 0), failed }));
       if (code !== 0 && !failed) console.log('WAVE4_MUTANT_INVALID_OUTPUT', output.slice(-4000));
       return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
-    const before = await run('clean-before');
+    // All 85 non-HS1/HS2/HPERF controls; the other 20 have clean runners below.
+    const before = await run('clean-before', '^(?!HS[12] |HPERF )');
     if (before.code !== 0 || before.tests === 0) {
       console.error('WAVE4_CLEAN_BEFORE_FAILED_OUTPUT', before.output);
     }
     expect(before.code).toBe(0);
     expect(before.tests).toBeGreaterThan(0);
+    expect(before.tests).toBe(85);
     for (const mutant of mutants) {
       const path = join(root, 'server/src/sqlite-history', mutant.file), original = readFileSync(path, 'utf8');
       // The point the mutant edits must exist before it is edited.
@@ -270,9 +354,10 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
         if (original === null) rmSync(path); else writeFileSync(path, original);
       }
     }
-    const after = await run('clean-after');
+    const after = await run('clean-after', '^(?!HS[12] |HPERF )');
     expect(after.code).toBe(0);
     expect(after.tests).toBe(before.tests);
+    expect(after.tests).toBe(85);
     console.log('WAVE4_MUTATION_RESULT', JSON.stringify({
       killed: mutants.length + importMutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests,
     }));
@@ -534,7 +619,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
 
 
 // Q22 new API: real behavioral red on broken implementations, followed by a
-// restored full-file run. Mutants live only in a private copy INSIDE the cage.
+// restored H v2 run. Mutants live only in a private copy INSIDE the cage.
 test('H v2 mutations reject forged writers, lost incidents, stale audits and non-atomic checkpoints', async () => {
   const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'h-v2-mutants-'));
   const mutations = [
@@ -564,15 +649,16 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string, failed: boolean) => {
-      // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1/HS2 storage
-      // cases (seconds each) have their own mutant runners below.
-      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] |HPERF )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      // All 23 H v2 detectors, for both clean controls and all 12 mutants.
+      const pattern = '^H v2', started = performance.now();
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const elapsedMs = performance.now() - started;
       const output = out + err;
-      console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
+      console.log('H_V2_MUTANT', JSON.stringify({ name, pattern, elapsedMs, exit, summary: output.slice(-1600) }));
       expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
       if (failed) { expect(exit).not.toBe(0); expect(output).toMatch(/\(fail\) H v2/); }
-      else expect(exit, output).toBe(0);
+      else { expect(exit, output).toBe(0); expect(output).toMatch(/\b23 pass\b/); }
     };
     await run('clean-before', false);
     for (const mutant of mutations) {
@@ -1016,12 +1102,14 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
     cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
-    const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^HPERF '],
+    const run = async (name: string, pattern = '^HPERF ') => {
+      const started = performance.now();
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const elapsedMs = performance.now() - started;
       const output = out + err;
-      console.log('HPERF_MUTANT', JSON.stringify({ name, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [],
+      console.log('HPERF_MUTANT', JSON.stringify({ name, pattern, elapsedMs, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [],
         asserted: output.match(/^error: HPERF-ASSERT .*$/gm) ?? [], thrown: output.match(/^(?:\d+ \| .*)?\b(?:TypeError|ReferenceError)\b.*$/gm) ?? [], summary: output.slice(-600) }));
       expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
       return { exit, output };
@@ -1034,7 +1122,8 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
       if (m.from2) { expect(mutant.split(m.from2).length).toBe(2); mutant = mutant.replace(m.from2, m.to2!); }
       try {
         writeFileSync(file, mutant);
-        const red = await run(m.name);
+        const red = await run(m.name, m.name === 'PAGE-quadratic' || m.name === 'PAGE-quadratic-raw'
+          ? '^HPERF page budget:' : undefined);
         expect(red.exit).not.toBe(0);
         expect(red.output).toMatch(m.kills);
         expect(red.output).toMatch(m.assert);
