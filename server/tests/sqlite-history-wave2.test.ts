@@ -420,11 +420,32 @@ test('newarch FIX2: close leaves no fixture fds and immediate reopen never needs
  }finally{rmSync(root,{recursive:true,force:true});}
 },60000);
 
+// Inspect only this process's references into synthetic temporary SQLite roots.
+// Do not enumerate other processes or open any database through an FD.
+function relSqliteInventory() {
+  const inTestRoot = (path: string) => path.startsWith(tmpdir() + '/') &&
+    /\/(?:thumbmux-|stream-|na-|newarch-|flagon-|h-v2-|h2-|hperf-|bh-|hs[12]-|pipehist-|tmwal-|contract-|onepath-|p2-|p2opt-|l2c-|i3-|i4c-|spike2-|native-max-|q22-|b1-|k-flagon-)[^/]+\//.test(path);
+  const fds: Array<{ fd: string; path: string; dev?: number; ino?: number; error?: string }> = [];
+  const errors: string[] = [];
+  try {
+    for (const fd of readdirSync('/proc/self/fd')) {
+      let path: string;
+      try { path = readlinkSync('/proc/self/fd/' + fd); } catch { continue; } // FD may have closed.
+      if (!inTestRoot(path)) continue;
+      try { const st = statSync('/proc/self/fd/' + fd); fds.push({ fd, path, dev: st.dev, ino: st.ino }); }
+      catch (e) { fds.push({ fd, path, error: String(e) }); }
+    }
+  } catch (e) { errors.push('fd: ' + String(e)); }
+  let maps: string[] = [];
+  try { maps = readFileSync('/proc/self/maps', 'utf8').split('\n').filter(line => inTestRoot(line.slice(line.indexOf('/')))); }
+  catch (e) { errors.push('maps: ' + String(e)); }
+  return { pid: process.pid, at: new Date().toISOString(), fds, maps, errors };
+}
 test('newarch DEBT: a disk worker that never exits is terminated without throwing at close',async()=>{
- // terminate() never sqlite3_close, so the SQLite inode table of this process would
- // keep the worker's -shm mapping after the directory is removed. ext4 can then hand
- // that inode to a later file in the same process. The scene runs in a child; this
- // process deletes the directory only after that child has exited.
+ // The terminated worker can retain SHM mappings until its process exits.
+ // Inode reuse causing SHORT_READ remains an unproven hypothesis. Keep this
+ // scene isolated and remove its files only after the child has exited.
+ const beforeScene=relSqliteInventory();
  const root=mkdtempSync(join(tmpdir(),'na-close-stuck-'));
  const dbFile=join(root,PROJECTION_STORE_FILE);
  const shmFile=dbFile+'-shm';
@@ -435,6 +456,8 @@ test('newarch DEBT: a disk worker that never exits is terminated without throwin
 import {PROJECTION_STORE_FILE} from ${JSON.stringify(schemaPath)};
 import {readdirSync,readFileSync,readlinkSync,statSync} from 'node:fs';
 import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+const relSqliteInventory=${relSqliteInventory.toString()};
 const root=${JSON.stringify(root)};
 const key={serverIdentity:'close-stuck',paneId:'%1',birthGeneration:1};
 const file=join(root,PROJECTION_STORE_FILE);
@@ -444,6 +467,7 @@ try {
   s.flush();
   const worker=s.worker;if(!worker) throw new Error('missing-worker');
   worker.postMessage=()=>{};
+  const beforeCloseInventory=relSqliteInventory();
   const started=performance.now();await s.close();const closeMs=performance.now()-started;
   if(s.worker!==null) throw new Error('worker-not-cleared');
   if(!(closeMs<10000)) throw new Error('closeMs '+closeMs);
@@ -456,7 +480,7 @@ try {
   let nextLineId;
   try {nextLineId=again.token(key).nextLineId;} finally {await again.close();}
   if(nextLineId!==200) throw new Error('nextLineId '+nextLineId);
-  console.log('NA_DEBT_STUCK_RESULT '+JSON.stringify({closeMs,fdsAfterClose:fds.length,dbIno,shmMapLines,nextLineId}));
+  console.log('NA_DEBT_STUCK_RESULT '+JSON.stringify({closeMs,fdsAfterClose:fds.length,dbIno,shmMapLines,nextLineId,beforeCloseInventory,afterCloseInventory:relSqliteInventory()}));
 } finally {await s.close();}
 `);
  let child:ReturnType<typeof Bun.spawn>|undefined;
@@ -477,6 +501,7 @@ try {
   expect(parentFds).toHaveLength(0);
   const dbIno=Number(statSync(dbFile).ino);
   expect(dbIno).toBe(result.dbIno);
+  console.log('REL_N37_INVENTORY',JSON.stringify({beforeScene,afterScene:relSqliteInventory(),childInventory:result,childPid:child.pid,exitCode,dbDev:statSync(dbFile).dev,dbIno}));
   console.log('NA_DEBT_STUCK_CLOSE',JSON.stringify({closeMs:Math.round(result.closeMs),fdsAfterClose:result.fdsAfterClose,dbIno,shmMapLines:result.shmMapLines,parentShmMapLines}));
  }finally{
   if(child && child.exitCode===null) child.kill('SIGKILL');

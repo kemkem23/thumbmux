@@ -1573,7 +1573,7 @@ class LegacyOverride extends TmuxWsMux {
 `;
 
 function pArtifactFixture(): string {
-  const root = fixture("0.23.0");
+  const root = fixture("0.23.1");
   const packageRoot = resolve(import.meta.dir, "..");
   cpSync(join(packageRoot, "git-dist"), join(root, "git-dist"), { recursive: true });
   cpSync(join(packageRoot, "contract/manifest"), join(root, "contract/manifest"), { recursive: true });
@@ -1688,7 +1688,7 @@ describe("P 0.23 release metadata and WJ manifests", () => {
   const releaseManifests = ["package.json", "core/package.json", "server/package.json", "svelte/package.json", "app/package.json"];
 
   test("the five releases are .23, demo stays private .1, source export layout stays intact", () => {
-    expect(assertReleaseVersion("v0.23.0", packageRoot)).toBe("0.23.0");
+    expect(assertReleaseVersion("v0.23.1", packageRoot)).toBe("0.23.1");
     const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
     expect(pkg.private).toBe(true);
     expect(pkg.exports["./pipe-history-runtime"]).toEqual({
@@ -1700,18 +1700,18 @@ describe("P 0.23 release metadata and WJ manifests", () => {
 
   test("every wrong package version and every wrong internal range is rejected separately", () => {
     for (const path of releaseManifests) {
-      const root = fixture("0.23.0");
+      const root = fixture("0.23.1");
       for (const manifest of releaseManifests) {
         mkdirSync(resolve(root, manifest, ".."), { recursive: true });
         cpSync(join(packageRoot, manifest), join(root, manifest));
       }
       const current = JSON.parse(readFileSync(join(root, path), "utf8"));
       writeFileSync(join(root, path), JSON.stringify({ ...current, version: "0.21.0" }));
-      expect(() => assertReleaseVersion("v0.23.0", root)).toThrow(`${path}: version 0.21.0 != 0.23.0`);
+      expect(() => assertReleaseVersion("v0.23.1", root)).toThrow(`${path}: version 0.21.0 != 0.23.1`);
       writeFileSync(join(root, path), JSON.stringify(current));
       for (const key of Object.keys(current.dependencies ?? {}).filter((name) => name.startsWith("@thumbmux/"))) {
         writeFileSync(join(root, path), JSON.stringify({ ...current, dependencies: { ...current.dependencies, [key]: "^0.21.0" } }));
-        expect(() => assertReleaseVersion("v0.23.0", root)).toThrow(`${path}: ${key}`);
+        expect(() => assertReleaseVersion("v0.23.1", root)).toThrow(`${path}: ${key}`);
         writeFileSync(join(root, path), JSON.stringify(current));
       }
     }
@@ -2417,7 +2417,7 @@ test("P2 complete built surface matches manifests and immutable .22", () => {
     packageRoot: resolve(import.meta.dir, ".."),
     baselinePackageRoot: p2BaselineRoot(),
   });
-  expect(result.currentVersion).toBe("0.23.0");
+  expect(result.currentVersion).toBe("0.23.1");
   expect(result.errors).toEqual([]);
 });
 
@@ -2497,7 +2497,7 @@ describe("P2 exact .22 to .23 class graph tuples", () => {
     test(`${row[2]}: exact versions, spelling, kind and both digest pairs`, () => {
       expect(pReleaseComparison(row, { to: "0.23.0" }).errors).toEqual([]);
       for (const mutation of [
-        { from: "0.21.0" }, { from: "0.22.1" }, { to: "0.23.1" }, { to: "0.24.0" },
+        { from: "0.21.0" }, { from: "0.22.1" }, { to: "0.23.2" }, { to: "0.24.0" },
         { name: `${row[2]}Unreviewed` }, { subpath: "core" as const }, { wrongKind: true },
         { oldSignature: "1".repeat(64) }, { newSignature: "2".repeat(64) },
         { oldCompatibility: "3".repeat(64) }, { newCompatibility: "4".repeat(64) },
@@ -2509,6 +2509,28 @@ describe("P2 exact .22 to .23 class graph tuples", () => {
       const changed = [...row];
       changed[3] = row[3] === "type" ? "value" : "type";
       expect(pReleaseComparison(changed, { to: "0.23.0" }).errors
+        .some(d => d.code === "baseline-signature-change")).toBe(true);
+    });
+  }
+});
+
+describe("P2 exact .22 to .23.1 class graph tuples", () => {
+  for (const row of P2_WS_SIGNATURES) {
+    test(`${row[2]}: exact versions, spelling, kind and both digest pairs`, () => {
+      expect(pReleaseComparison(row, { to: "0.23.1" }).errors).toEqual([]);
+      for (const mutation of [
+        { from: "0.21.0" }, { from: "0.22.1" }, { to: "0.23.2" }, { to: "0.24.0" },
+        { name: `${row[2]}Unreviewed` }, { subpath: "core" as const }, { wrongKind: true },
+        { oldSignature: "1".repeat(64) }, { newSignature: "2".repeat(64) },
+        { oldCompatibility: "3".repeat(64) }, { newCompatibility: "4".repeat(64) },
+      ]) {
+        expect(pReleaseComparison(row, { to: "0.23.1", ...mutation }).errors
+          .some(d => d.code === "baseline-signature-change")).toBe(true);
+      }
+      // Changing BOTH kinds must also miss the tuple (not just kindChanged).
+      const changed = [...row];
+      changed[3] = row[3] === "type" ? "value" : "type";
+      expect(pReleaseComparison(changed, { to: "0.23.1" }).errors
         .some(d => d.code === "baseline-signature-change")).toBe(true);
     });
   }

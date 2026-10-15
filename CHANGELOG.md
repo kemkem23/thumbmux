@@ -3,6 +3,17 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.22.0-dist`.
 
+## v0.23.1 — release preparation
+
+- Tests: add a controlled pending-at-Q schedule and a pre-emitted control for
+  the final-frame mutation witness; preserve final-data and ordered-Q-ack checks.
+- Tests: add crash-reopen diagnostics and snapshot controls while preserving
+  the original parent reopen, durable-acknowledgement and continuation checks.
+  These changes do not establish or fix the cause of SQLITE_IOERR_SHORT_READ.
+- Release metadata: align the five package versions and internal dependencies
+  at 0.23.1. Release validation is bound to the new source and CI receipts.
+  Stream-first activation remains subject to its separate ON gates.
+
 ## v0.23.0 — Owned WebSocket lifetime
 
 - server: opt in with `ownedLifetime: true` at construction, before starting

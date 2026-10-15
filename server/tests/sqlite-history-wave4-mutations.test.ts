@@ -8,9 +8,243 @@
  * tree is run before the first mutant and again after the last one.
  */
 import { test, expect } from 'bun:test';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+// Read the package's active CI contract once. Monorepo runs must also agree
+// with the frozen Python suite; neither layout has a fallback timeout.
+const childTestTimeoutArgs = (() => {
+  const packageRoot = realpathSync(resolve(import.meta.dir, '../..'));
+  const readContract = (path: string) => {
+    try { return readFileSync(path, 'utf8'); }
+    catch (error) { throw new Error(`M4 child test timeout contract (${path}): cannot read source: ${String(error)}`); }
+  };
+  const requirePackage = (root: string, name: string) => {
+    const path = join(root, 'package.json');
+    try {
+      if (JSON.parse(readContract(path)).name !== name) throw new Error(`expected package ${name}`);
+    } catch (error) { throw new Error(`M4 child test timeout layout (${path}): ${String(error)}`); }
+  };
+  requirePackage(packageRoot, 'thumbmux');
+  // A checkout rooted at the package is public. Check its own marker first:
+  // never walk into ancestors of a public checkout to find a host contract.
+  const markerPath = join(packageRoot, '.git');
+  let publicCheckout: boolean;
+  try {
+    const marker = lstatSync(markerPath, { throwIfNoEntry: false });
+    if (marker && !marker.isFile() && !marker.isDirectory()) throw new Error('unsupported checkout marker');
+    publicCheckout = marker !== undefined;
+  } catch (error) { throw new Error(`M4 child test timeout layout (${markerPath}): ${String(error)}`); }
+  const checkoutRoot = publicCheckout ? packageRoot : resolve(packageRoot, '../..');
+  if (!publicCheckout) {
+    if (packageRoot !== join(checkoutRoot, 'packages/thumbmux')) {
+      throw new Error(`M4 child test timeout layout (${packageRoot}): cannot prove public or monorepo layout`);
+    }
+    // Frozen monorepo exports need not retain .git, but retain this root
+    // manifest and the exact packages/thumbmux position. Missing ops still fails.
+    requirePackage(checkoutRoot, 'cortex-orchestrator');
+  }
+  const actionPath = join(packageRoot, '.github/actions/verify-gate/action.yml');
+  const invalidAction = (detail: string) => new Error(`M4 child test timeout contract (${actionPath}): ${detail}`);
+  const actionSource = readContract(actionPath);
+  if (/\t|\r(?!\n)/.test(actionSource)) throw invalidAction('unsupported action whitespace');
+  const lines = actionSource.split(/\r?\n/).filter(line => line.trim() && !/^ *#/.test(line));
+  // This is a deliberately narrow structural reader, not a YAML interpreter.
+  // Validate the known header so runs/steps cannot come from a quoted scalar,
+  // alias, duplicate mapping or a different root section.
+  const header = /^name: verify-gate\ndescription: >\n(?:  [^\n]+\n)+inputs:\n  e2e-artifact-suffix:\n    description: [A-Za-z][^\n]*\n    required: true\nruns:\n  using: composite\n  steps:\n/;
+  const headerText = header.exec(lines.join('\n') + '\n')?.[0];
+  if (!headerText) throw invalidAction('unsupported composite action header');
+  const steps: string[][] = [];
+  let nested: 'block' | 'mapping' | undefined;
+  for (const line of lines.slice(headerText.split('\n').length - 1)) {
+    if (/^    - (?:name|uses|run): /.test(line)) {
+      steps.push([]); nested = undefined;
+    }
+    const step = steps.at(-1);
+    if (!step) throw invalidAction('missing step boundary');
+    const field = /^(?:    - |      )([a-z][a-z-]*):(?: (.*))?$/.exec(line);
+    if (field) {
+      const value = field[2] ?? '';
+      if (/^["'&*!\[{]/.test(value)) throw invalidAction('unsupported quoted or indirect step field');
+      nested = value === '|' || value === '>' ? 'block' : value === '' ? 'mapping' : undefined;
+    } else if (!/^ {8,}\S/.test(line) || !nested
+      || (nested === 'mapping' && !/^        [A-Za-z_][A-Za-z_0-9-]*: [^"'&*!\[{}|>].*$/.test(line))) {
+      throw invalidAction('unsupported step structure or multiline scalar');
+    }
+    step.push(line);
+  }
+  const named = steps.filter(step => step.some(line =>
+    /^(?:    - |      )name: unit and contract suites$/.test(line)));
+  if (named.length !== 1) throw invalidAction(`expected one unit and contract suites step, found ${named.length}`);
+  const step = named[0]!;
+  if (step.length !== 3 || step[0] !== '    - name: unit and contract suites'
+    || step[2] !== '      shell: /usr/bin/bash --noprofile --norc -p -e -o pipefail {0}') {
+    throw invalidAction('expected one direct run and the supported shell in the active step');
+  }
+  // Exact envelope and suite list: no comments, substitutions, continuation,
+  // second command, extra bun test or duplicate --timeout can match.
+  const command = /^      run: \/usr\/bin\/timeout --kill-after=60s 60m bun test --timeout ([0-9]+) \.\/server\/tests\/\*\.test\.ts \.\/core\/tests\/\*\.test\.ts \.\/core\/src\/\*\.test\.ts \.\/svelte\/tests\/\*\.test\.ts \.\/app\/tests\/\*\.test\.ts \.\/demo\/\*\.test\.ts \.\/scripts\/\*\.test\.ts$/.exec(step[1]!);
+  const actionValue = command?.[1];
+  if (actionValue === undefined || !Number.isSafeInteger(Number(actionValue)) || Number(actionValue) <= 0) {
+    throw invalidAction('expected supported direct bun test command with one positive safe decimal timeout');
+  }
+  if (publicCheckout) return ['--timeout', actionValue] as const;
+  const suitePath = join(checkoutRoot, 'ops/testing/thumbmux-suite.py');
+  const invalid = (detail: string) => new Error(`M4 child test timeout contract (${suitePath}): ${detail}`);
+  let source: string;
+  try { source = readFileSync(suitePath, 'utf8'); }
+  catch (error) { throw invalid(`cannot read suite source: ${String(error)}`); }
+  // Tokenize without executing Python. Strings/comments never become statements;
+  // offsets, indentation and bracket depth still refer to the original source.
+  type Token = { text: string; start: number; end: number; column: number; depth: number;
+    kind: 'code' | 'string' | 'comment'; plain: boolean };
+  const tokens: Token[] = [];
+  const brackets: string[] = [];
+  for (let at = 0; at < source.length;) {
+    if (/\s/.test(source[at]!)) { at++; continue; }
+    const start = at, column = start - source.lastIndexOf('\n', start - 1) - 1;
+    const depth = brackets.length;
+    let kind: Token['kind'] = 'code', plain = false;
+    const word = /^[A-Za-z_][A-Za-z_0-9]*/.exec(source.slice(at))?.[0];
+    const prefix = word && /^[rRuUbBfF]+$/.test(word)
+      && /['"]/.test(source[at + word.length] ?? '') ? word : '';
+    const quoteAt = at + prefix.length, quote = source[quoteAt];
+    if (source[at] === '#') {
+      kind = 'comment';
+      const newline = source.indexOf('\n', at);
+      at = newline < 0 ? source.length : newline;
+    } else if (quote === '"' || quote === "'") {
+      kind = 'string';
+      const triple = source.slice(quoteAt, quoteAt + 3) === quote.repeat(3);
+      const delimiter = triple ? quote.repeat(3) : quote;
+      plain = !prefix && !triple;
+      at = quoteAt + delimiter.length;
+      let closed = false;
+      while (at < source.length) {
+        if (source.startsWith(delimiter, at)) { at += delimiter.length; closed = true; break; }
+        if (source[at] === '\\') { plain = false; at += 2; continue; }
+        if (source[at] === '\n' || source[at] === '\r') {
+          plain = false;
+          if (!triple) throw invalid('unsupported multiline string');
+        }
+        at++;
+      }
+      if (!closed) throw invalid('unterminated string in suite source');
+    } else {
+      at += word?.length ?? 1;
+      const text = source.slice(start, at);
+      if ('([{'.includes(text)) brackets.push(text);
+      else if (')]}'.includes(text)) {
+        const expected = ['(', '[', '{'][')]}'.indexOf(text)];
+        if (brackets.pop() !== expected) throw invalid('unbalanced suite brackets');
+      }
+    }
+    tokens.push({ text: source.slice(start, at), start, end: at, column, depth, kind, plain });
+  }
+  if (brackets.length) throw invalid('unclosed suite brackets');
+  const code = tokens.filter(token => token.kind !== 'comment');
+  const definitions = code.filter((token, index) => token.kind === 'code' && token.text === 'def'
+    && token.column === 0 && token.depth === 0 && code[index + 1]?.text === 'traced_command');
+  if (definitions.length !== 1) throw invalid(`expected one active traced_command, found ${definitions.length}`);
+  const definition = definitions[0]!;
+  if (code[code.indexOf(definition) - 1]?.text === '\\') throw invalid('continued function definition');
+  const headerEnd = source.indexOf('\n', definition.start);
+  if (headerEnd < 0 || !/^def +traced_command\(\s*paths\s*,\s*trace_path\s*,\s*quiet\s*=\s*False\s*\):\s*$/.test(
+    source.slice(definition.start, headerEnd))) throw invalid('unsupported traced_command signature');
+  const end = code.find(token => token.start > headerEnd && token.column === 0 && token.depth === 0)?.start
+    ?? source.length;
+  const body = tokens.filter(token => token.start > headerEnd && token.start < end);
+  if (body.some(token => token.kind === 'comment' || (token.kind === 'string'
+    && (token.text.includes('\n') || token.text.includes('\r') || /^(?:[rRuUbBfF]*)(?:"""|''')/.test(token.text)))
+    || (token.kind === 'code' && (token.text === '\\' || token.text === ';')))
+    || /[^\S \r\n]/.test(source.slice(headerEnd, end))) {
+    throw invalid('unsupported comment, multiline string, continuation or indentation in traced_command');
+  }
+  // Count all command uses except Popen's first argument before examining RHS.
+  // This also rejects aliases, augmented/annotated/tuple targets and mutations.
+  const assignments = body.filter((token, index) => token.kind === 'code' && token.text === 'command'
+    && !(body[index - 1]?.text === '(' && body[index - 2]?.text === 'Popen'
+      && body[index - 3]?.text === '.' && body[index - 4]?.text === 'subprocess'
+      && body[index + 1]?.text === ','));
+  if (assignments.length !== 1) throw invalid(`expected one command assignment, found ${assignments.length}`);
+  const assignment = assignments[0]!, assignmentIndex = body.indexOf(assignment);
+  if (assignment.column !== 4 || assignment.depth !== 0
+    || body[assignmentIndex + 1]?.text !== '=' || body[assignmentIndex + 2]?.text !== '['
+    || !/^command *= *\[$/.test(source.slice(assignment.start, body[assignmentIndex + 2]!.end))) {
+    throw invalid('command must be one direct-body list assignment');
+  }
+  // Only the existing guard may precede the assignment. Its diagnostic is a
+  // string token (including the current f-string), never executable markers.
+  const guard = body.slice(0, assignmentIndex);
+  const colon = guard.findIndex(token => token.kind === 'code' && token.text === ':' && token.depth === 0);
+  const raise = guard.slice(colon + 1);
+  if (guard[0]?.text !== 'if' || guard[0]?.column !== 4 || colon < 2
+    || guard.slice(1, colon).some(token => token.column === 4 || token.text === ':' || token.text === 'def')
+    || raise.length !== 5 || raise[0]?.text !== 'raise' || raise[0]?.column !== 8
+    || raise[1]?.text !== 'ValueError' || raise[2]?.text !== '('
+    || raise[3]?.kind !== 'string' || raise[4]?.text !== ')'
+    || source.slice(guard[0]!.start, guard[colon]!.end).includes('\n')
+    || !/^[ \r]*\n *$/.test(source.slice(guard[colon]!.end, raise[0]!.start))
+    || source.slice(raise[0]!.start, raise[4]!.end).includes('\n')
+    || !/^[ \r]*\n[ \r\n]*$/.test(source.slice(raise[4]!.end, assignment.start))) {
+    throw invalid('unsupported control flow before command assignment');
+  }
+  const openIndex = assignmentIndex + 2;
+  const closeIndex = body.findIndex((token, index) => index > openIndex
+    && token.kind === 'code' && token.text === ']' && token.depth === 1);
+  if (closeIndex < 0) throw invalid('missing command list close');
+  const list = body.slice(openIndex + 1, closeIndex);
+  if (list.some(token => token.kind === 'string' && !token.plain)) {
+    throw invalid('command strings must be unprefixed, unescaped single-line literals');
+  }
+  // Require the list to end the assignment, followed by the existing direct
+  // Popen return. No trailing expression, intervening write or alias is allowed.
+  const suffix = body.slice(closeIndex + 1);
+  if (!/^[ \r]*\n[ \r\n]*$/.test(source.slice(body[closeIndex]!.end, suffix[0]?.start ?? end))
+    || suffix[0]?.column !== 4 || suffix.map(token => token.text).join(' ') !==
+      'return subprocess . Popen ( command , start_new_session = True , stdout = subprocess . DEVNULL if quiet else None , stderr = subprocess . DEVNULL if quiet else None , )'
+    || !/^return +subprocess *\. *Popen *\($/.test(source.slice(suffix[0]!.start, suffix[4]!.end))) {
+    throw invalid('command list must be passed directly to the existing Popen return');
+  }
+  const items: Token[][] = [];
+  let item: Token[] = [];
+  for (const token of list) {
+    if (token.kind === 'code' && token.text === ',' && token.depth === 1) {
+      if (!item.length) throw invalid('empty command list item');
+      items.push(item); item = [];
+    } else item.push(token);
+  }
+  if (item.length) items.push(item);
+  const literal = (part: Token[] | undefined) => part?.length === 1 && part[0]!.kind === 'string'
+    && part[0]!.plain ? part[0]!.text.slice(1, -1) : undefined;
+  // Count options before validating any operand, including missing/nondecimal
+  // operands. A string nested in the paths comprehension is not a top-level option.
+  const timeouts = items.flatMap((part, index) => part.filter(token => token.kind === 'string'
+    && token.depth === 1 && token.text.slice(1, -1) === '--timeout').map(() => index));
+  if (timeouts.length !== 1) throw invalid(`expected one top-level timeout candidate, found ${timeouts.length}`);
+  const timeoutIndex = timeouts[0]!;
+  if (literal(items[timeoutIndex]) !== '--timeout' || literal(items[timeoutIndex - 1]) !== 'test') {
+    throw invalid('timeout option must be a literal immediately after test');
+  }
+  const value = literal(items[timeoutIndex + 1]);
+  if (value === undefined || !/^[0-9]+$/.test(value)) throw invalid('timeout operand must be one complete decimal literal');
+  for (const part of items) {
+    if (literal(part) !== undefined) continue;
+    const spelling = part.map(token => token.kind === 'string' ? '<string>' : token.text).join(' ');
+    if (spelling === 'STRACE' || spelling === 'str ( trace_path )') continue;
+    if (spelling === '* [ <string> + p for p in paths ]' && literal([part[2]!]) === './') continue;
+    throw invalid('unsupported non-literal command item');
+  }
+  if (!Number.isSafeInteger(Number(value)) || Number(value) <= 0) {
+    throw invalid(`timeout must be a positive safe integer, got ${value}`);
+  }
+  if (Number(value) !== Number(actionValue)) {
+    throw invalid(`active traced_command timeout ${value} differs from ${actionPath}: ${actionValue}`);
+  }
+  return ['--timeout', actionValue] as const;
+})();
 
 type Mutant = { name: string; pattern: string; file: string; from: string; to: string };
 
@@ -62,21 +296,28 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
     writeFileSync(join(copiedCore, 'package.json'), '\n{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}\n');
     writeFileSync(join(root, 'package.json'), '\n{"type":"module"}\n');
     const run = async (name: string, pattern?: string) => {
-      const args = [process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts'];
+      const args = [process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts'];
       if (pattern) args.push('--test-name-pattern', pattern);
+      const started = performance.now();
       const child = Bun.spawn(args, { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const elapsedMs = performance.now() - started;
       const output = out + err;
       const ran = /Ran (\d+) tests?/.exec(output);
       // bun 1.3 prints "1 fail"; older reporters printed "(fail)". Either is a real test death.
       const failed = /\(\s*fail\s*\)|\b[1-9]\d* fail\b/.test(output);
-      console.log('WAVE4_MUTANT_RUN', JSON.stringify({ name, code, tests: Number(ran?.[1] ?? 0), failed }));
+      console.log('WAVE4_MUTANT_RUN', JSON.stringify({ name, pattern, elapsedMs, code, tests: Number(ran?.[1] ?? 0), failed }));
       if (code !== 0 && !failed) console.log('WAVE4_MUTANT_INVALID_OUTPUT', output.slice(-4000));
       return { code, output, tests: Number(ran?.[1] ?? 0), failed };
     };
-    const before = await run('clean-before');
+    // All 85 non-HS1/HS2/HPERF controls; the other 20 have clean runners below.
+    const before = await run('clean-before', '^(?!HS[12] |HPERF )');
+    if (before.code !== 0 || before.tests === 0) {
+      console.error('WAVE4_CLEAN_BEFORE_FAILED_OUTPUT', before.output);
+    }
     expect(before.code).toBe(0);
     expect(before.tests).toBeGreaterThan(0);
+    expect(before.tests).toBe(85);
     for (const mutant of mutants) {
       const path = join(root, 'server/src/sqlite-history', mutant.file), original = readFileSync(path, 'utf8');
       // The point the mutant edits must exist before it is edited.
@@ -113,9 +354,10 @@ test('wave4 reader detectors kill every injected fault and the clean tree passes
         if (original === null) rmSync(path); else writeFileSync(path, original);
       }
     }
-    const after = await run('clean-after');
+    const after = await run('clean-after', '^(?!HS[12] |HPERF )');
     expect(after.code).toBe(0);
     expect(after.tests).toBe(before.tests);
+    expect(after.tests).toBe(85);
     console.log('WAVE4_MUTATION_RESULT', JSON.stringify({
       killed: mutants.length + importMutants.length, survived: 0, cleanBefore: true, cleanAfter: true, cleanTests: before.tests,
     }));
@@ -138,6 +380,21 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     { name: 'omit-retry-integrity', pattern: 'same key with changed content',
       from: "if (prior.request.digest !== request.digest) throw Error('event identity collision');",
       to: '/* mutant: accepts divergent retry */' },
+    // Boundary-gated persistence damage is confined to the killed fixture
+    // child. Parent continuation stays real, so earlier schema-only phases
+    // cannot die for a different reason before the intended named assertion.
+    { name: 'rel-drop-crash-input', pattern: 'process SIGKILL around input', assertion: 'REL durable input boundary',
+      from: "        this.db.query('INSERT INTO sh_input VALUES(?,?,?,?,?,?)').run(key, sourceEpoch, packetSeq, event.digest, streamCanonical(event), streamCanonical(receipt));",
+      to: "        if (!this.options.boundary) this.db.query('INSERT INTO sh_input VALUES(?,?,?,?,?,?)').run(key, sourceEpoch, packetSeq, event.digest, streamCanonical(event), streamCanonical(receipt));" },
+    { name: 'rel-drop-crash-rows', pattern: 'process SIGKILL around input', assertion: 'REL durable row boundary',
+      from: "      this.transaction('checkpoint', () => {\n        this.flushRows(key);",
+      to: "      this.transaction('checkpoint', () => {\n        if (!this.options.boundary) this.flushRows(key);" },
+    { name: 'rel-drop-crash-checkpoint', pattern: 'process SIGKILL around input', assertion: 'REL durable checkpoint boundary',
+      from: "        this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision, streamDigest('vt-checkpoint', cp));",
+      to: "        if (!this.options.boundary) this.db.query('INSERT INTO sh_checkpoint VALUES(?,?,?,?,?)').run(key, cp.checkpointId, streamCanonical(cp), cp.revision, streamDigest('vt-checkpoint', cp));" },
+    { name: 'rel-false-continuation-receipt', pattern: 'process SIGKILL around input', assertion: 'REL continuation retry head exactly once',
+      from: "      if (durable) { if (durable.digest !== request.digest) throw Error('event identity collision'); return ok(JSON.parse(String(durable.receipt))); }",
+      to: "      if (durable) { if (durable.digest !== request.digest) throw Error('event identity collision'); return ok({...JSON.parse(String(durable.receipt)), head: 2}); }" },
   ];
   try {
     mkdirSync(join(root, 'server'), { recursive: true });
@@ -151,25 +408,104 @@ test('stream H mutants cannot acknowledge volatile data or falsify frozen reads'
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
+    const originalBytes = readFileSync(file);
+    let fullRuns = 0;
     const run = async (pattern: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
+      const started = performance.now();
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      return { exit, output: out + err };
+      const result = { exit, output: out + err, signal: child.signalCode, elapsedMs: performance.now() - started };
+      if (pattern === 'stream-first H') summary(fullRuns++ === 0 ? 'full-clean-before' : 'full-clean-after', pattern, result);
+      return result;
     };
-    expect((await run('stream-first H')).exit).toBe(0);
-    for (const mutation of mutations) {
+    const summary = (stage: string, name: string, result: Awaited<ReturnType<typeof run>>) => {
+      const namedLine = result.output.split('\n').find(line => /(?:AssertionError[^\n]*: |error: )REL /.test(line));
+      console.log('STREAM_H_RUN', JSON.stringify({ stage, name, exit: result.exit, signal: result.signal,
+        elapsedMs: result.elapsedMs, pass: Number(/\b(\d+) pass\b/.exec(result.output)?.[1] ?? 0),
+        fail: Number(/\b(\d+) fail\b/.exec(result.output)?.[1] ?? 0), namedLine: namedLine?.slice(0, 4000),
+        outputLength: result.output.length, truncated: result.output.length > 4000, tail: result.output.slice(-4000) }));
+    };
+    const restore = () => {
+      writeFileSync(file, originalBytes);
+      expect(readFileSync(file)).toEqual(originalBytes);
+    };
+    // A secondary restoration failure is visible but never replaces the first
+    // failed oracle. The same rule applies to group restored runtime checks.
+    const preservingPrimary = async (work: () => Promise<void>, cleanup: () => Promise<void>) => {
+      let failed = false;
+      try { await work(); }
+      catch (error) { failed = true; throw error; }
+      finally {
+        try { await cleanup(); }
+        catch (error) {
+          console.error('REL_RESTORE_SECONDARY', String(error).slice(-4000));
+          if (!failed) throw error;
+        }
+      }
+    };
+    const damaged = async (mutation: typeof mutations[number]) => {
+      expect(readFileSync(file)).toEqual(originalBytes);
       expect(original.includes(mutation.from)).toBe(true);
-      writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
-      const result = await run(mutation.pattern);
-      console.log('STREAM_H_MUTANT', mutation.name, result.exit, result.output);
-      expect(result.exit).not.toBe(0);
-      expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
-      expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
-      writeFileSync(file, original);
-    }
-    expect((await run('stream-first H')).exit).toBe(0);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+      await preservingPrimary(async () => {
+        writeFileSync(file, original.replaceAll(mutation.from, mutation.to));
+        const result = await run(mutation.pattern);
+        summary('damaged', mutation.name, result);
+        expect(result.exit).not.toBe(0);
+        expect(result.output).toMatch(/\(\s*fail\s*\)|\b[1-9]\d* fail\b/);
+        expect(result.output).not.toMatch(/SyntaxError|ParseError|Cannot find module/);
+        expect(result.output).not.toMatch(/ReferenceError|timed out|TimeoutError|test timeout|Cannot find package|Failed to resolve/i);
+        if ('assertion' in mutation) {
+          // Match FULL output, not the bounded presentation above.
+          expect(result.output).toMatch(new RegExp('(?:AssertionError[^\\n]*: |error: )' + mutation.assertion));
+          expect(result.output).toMatch(/\b1 fail\b/);
+        }
+      }, async () => { restore(); });
+    };
+    await preservingPrimary(async () => {
+      expect((await run('stream-first H')).exit).toBe(0);
+      const legacy = mutations.filter(mutation => !('assertion' in mutation));
+      const rel = mutations.filter(mutation => 'assertion' in mutation);
+      expect(legacy).toHaveLength(4); expect(rel).toHaveLength(4);
+      for (const mutation of legacy) await damaged(mutation);
+      for (const mutation of rel) {
+        expect(mutation.pattern).toBe('process SIGKILL around input');
+        expect(original.split(mutation.from).length - 1).toBe(1);
+      }
+      expect(readFileSync(file)).toEqual(originalBytes);
+      await preservingPrimary(async () => {
+        const clean = await run('process SIGKILL around input');
+        summary('clean-before', 'REL group', clean);
+        expect(clean.exit).toBe(0);
+        expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
+        expect(clean.output).toContain('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement');
+        expect((clean.output.match(/REL_CRASH_AFTER_CLOSE/g) ?? []).length).toBe(6);
+        for (const mutation of rel) await damaged(mutation);
+      }, async () => {
+        // Even a failed byte restoration must not silently skip runtime restore.
+        let restoreError: unknown;
+        try { restore(); } catch (error) { restoreError = error; }
+        try {
+          const restored = await run('process SIGKILL around input');
+          summary('restored-after', 'REL group', restored);
+          expect(restored.exit).toBe(0);
+          expect(restored.output).toMatch(/\b[1-9]\d* pass\b/);
+          expect(restored.output).toContain('process SIGKILL around input and checkpoint transactions preserves every durable acknowledgement');
+          expect((restored.output.match(/REL_CRASH_AFTER_CLOSE/g) ?? []).length).toBe(6);
+        } catch (error) {
+          if (restoreError !== undefined) console.error('REL_RESTORE_SECONDARY', String(error).slice(-4000));
+          else throw error;
+        }
+        if (restoreError !== undefined) throw restoreError;
+      });
+      expect((await run('stream-first H')).exit).toBe(0);
+    }, async () => { restore(); });
+  } catch (error) {
+    try { rmSync(root, { recursive: true, force: true }); }
+    catch (cleanupError) { console.error('REL_CLEANUP_SECONDARY', String(cleanupError).slice(-4000)); }
+    throw error;
+  }
+  rmSync(root, { recursive: true, force: true });
 }, 120000);
 
 test('contract repair mutants go red then restored real seams go green', async () => {
@@ -219,7 +555,7 @@ test('contract repair mutants go red then restored real seams go green', async (
       let mutant=original.replace(m.from,m.to);
       if(m.from2) {expect(mutant.includes(m.from2)).toBe(true);mutant=mutant.replace(m.from2,m.to2!);}
       const run=async()=>{
-        const child=Bun.spawn([process.execPath,'test',`./packages/thumbmux/server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
+        const child=Bun.spawn([process.execPath,'test',...childTestTimeoutArgs,`./packages/thumbmux/server/tests/${m.test??'tmux-capture-normalize.test.ts'}`,'--test-name-pattern',m.pattern],
           {cwd:root,stdout:'pipe',stderr:'pipe'});
         const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);
         return {exit,output:out+err};
@@ -267,7 +603,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
     writeFileSync(join(root,'package.json'),'{"type":"module"}');
     const file=join(root,'server/src/history-engine.ts'),original=readFileSync(file,'utf8');
     const run=async(pattern:string)=>{
-      const child=Bun.spawn([process.execPath,'test','./server/tests/sqlite-history-wave4.test.ts','--test-name-pattern',pattern],{cwd:root,stdout:'pipe',stderr:'pipe'});
+      const child=Bun.spawn([process.execPath,'test',...childTestTimeoutArgs,'./server/tests/sqlite-history-wave4.test.ts','--test-name-pattern',pattern],{cwd:root,stdout:'pipe',stderr:'pipe'});
       const [exit,out,err]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()]);return {exit,output:out+err};
     };
     const clean=await run('flag-on H|H-r2');expect(clean.exit,clean.output).toBe(0);expect(clean.output).toMatch(/\b[1-9]\d* pass\b/);
@@ -283,7 +619,7 @@ test('flag-on H mutants reject lost rows gaps forged ACK early unlink and pin by
 
 
 // Q22 new API: real behavioral red on broken implementations, followed by a
-// restored full-file run. Mutants live only in a private copy INSIDE the cage.
+// restored H v2 run. Mutants live only in a private copy INSIDE the cage.
 test('H v2 mutations reject forged writers, lost incidents, stale audits and non-atomic checkpoints', async () => {
   const pkg = resolve(import.meta.dir, '../..'), root = mkdtempSync(join(tmpdir(), 'h-v2-mutants-'));
   const mutations = [
@@ -313,15 +649,16 @@ test('H v2 mutations reject forged writers, lost incidents, stale audits and non
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string, failed: boolean) => {
-      // Every pre-HS1 test, run 14 times under a fixed timeout; the HS1/HS2 storage
-      // cases (seconds each) have their own mutant runners below.
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^(?!HS[12] |HPERF )'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
+      // All 23 H v2 detectors, for both clean controls and all 12 mutants.
+      const pattern = '^H v2', started = performance.now();
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const elapsedMs = performance.now() - started;
       const output = out + err;
-      console.log('H_V2_MUTANT', JSON.stringify({ name, exit, summary: output.slice(-1600) }));
+      console.log('H_V2_MUTANT', JSON.stringify({ name, pattern, elapsedMs, exit, summary: output.slice(-1600) }));
       expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
       if (failed) { expect(exit).not.toBe(0); expect(output).toMatch(/\(fail\) H v2/); }
-      else expect(exit, output).toBe(0);
+      else { expect(exit, output).toBe(0); expect(output).toMatch(/\b23 pass\b/); }
     };
     await run('clean-before', false);
     for (const mutant of mutations) {
@@ -407,7 +744,7 @@ test('BH mutants: issued prefix readback, durable start/end fence, atomic refusa
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'H v2'],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'H v2'],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
@@ -584,7 +921,7 @@ test('HS1 mutants: canonical storage, lossy codec, hashed bytes, physical segmen
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS1'],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS1'],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
@@ -658,7 +995,7 @@ test('HS2 mutants: cached iterate, profile not persisted or not checked or check
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
     const file = join(root, 'server/src/history-engine.ts'), original = readFileSync(file, 'utf8');
     const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS2'],
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', 'HS2'],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       const output = out + err;
@@ -765,12 +1102,14 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
     cpSync(join(pkg, 'core/src'), join(core, 'src'), { recursive: true });
     writeFileSync(join(core, 'package.json'), '{"name":"@thumbmux/core","type":"module","exports":"./src/index.ts"}');
     writeFileSync(join(root, 'package.json'), '{"type":"module"}');
-    const run = async (name: string) => {
-      const child = Bun.spawn([process.execPath, 'test', './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', '^HPERF '],
+    const run = async (name: string, pattern = '^HPERF ') => {
+      const started = performance.now();
+      const child = Bun.spawn([process.execPath, 'test', ...childTestTimeoutArgs, './server/tests/sqlite-history-wave4.test.ts', '--test-name-pattern', pattern],
         { cwd: root, stdout: 'pipe', stderr: 'pipe' });
       const [exit, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      const elapsedMs = performance.now() - started;
       const output = out + err;
-      console.log('HPERF_MUTANT', JSON.stringify({ name, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [],
+      console.log('HPERF_MUTANT', JSON.stringify({ name, pattern, elapsedMs, exit, failed: output.match(/^\(fail\) .*$/gm) ?? [],
         asserted: output.match(/^error: HPERF-ASSERT .*$/gm) ?? [], thrown: output.match(/^(?:\d+ \| .*)?\b(?:TypeError|ReferenceError)\b.*$/gm) ?? [], summary: output.slice(-600) }));
       expect(output).not.toMatch(/SyntaxError|ParseError|Cannot find module|timed out/);
       return { exit, output };
@@ -783,7 +1122,8 @@ test('HPERF mutants: repeated row work, re-read checkpoint, stale instance or mo
       if (m.from2) { expect(mutant.split(m.from2).length).toBe(2); mutant = mutant.replace(m.from2, m.to2!); }
       try {
         writeFileSync(file, mutant);
-        const red = await run(m.name);
+        const red = await run(m.name, m.name === 'PAGE-quadratic' || m.name === 'PAGE-quadratic-raw'
+          ? '^HPERF page budget:' : undefined);
         expect(red.exit).not.toBe(0);
         expect(red.output).toMatch(m.kills);
         expect(red.output).toMatch(m.assert);
