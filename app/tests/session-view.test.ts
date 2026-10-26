@@ -1323,7 +1323,7 @@ describe('mountable terminal views', () => {
 
     test(`WJ-A ${label}: rejected with a reason restores the draft and names it; a thrown submit uses submissionUncertain`, async () => {
       const noticeText = 'WJ notice: delivery unknown';
-      for (const outcome of ['rejected', 'throws'] as const) {
+      for (const outcome of ['rejected', 'throws', 'bare'] as const) {
         const sessionName = `sh-${label}-submit-${outcome}`;
         let submitCalls = 0;
         let stepCalls = 0;
@@ -1336,6 +1336,7 @@ describe('mountable terminal views', () => {
             submitText: async () => {
               submitCalls += 1;
               if (outcome === 'throws') throw new Error('network down');
+              if (outcome === 'bare') return { status: 'rejected' as const };
               return { status: 'rejected' as const, reason: 'lifecycle_mismatch' };
             },
             labels: { submissionUncertain: noticeText },
@@ -1356,7 +1357,11 @@ describe('mountable terminal views', () => {
         }).toEqual({
           outcome,
           draft: WJ_MULTILINE,
-          notice: outcome === 'throws' ? noticeText : 'รอบเซสชันไม่ตรง (lifecycle_mismatch)',
+          notice: outcome === 'throws'
+            ? noticeText
+            : outcome === 'bare'
+              ? null
+              : 'รอบเซสชันไม่ตรง (lifecycle_mismatch)',
           submitCalls: 1,
           stepCalls: 0,
         });
@@ -1387,6 +1392,9 @@ describe('mountable terminal views', () => {
         ['rejected', 'agent_invalid', 'ชนิดเอเจนต์ใช้ไม่ได้ (agent_invalid)'],
         ['rejected', 'storage-paused', 'ที่เก็บข้อมูลพักอยู่ (storage-paused)'],
         ['rejected', 'unauthorized', 'ไม่ได้รับอนุญาต (unauthorized)'],
+        ['rejected', 'service is quiescing; mutations are unavailable', 'เซิร์ฟเวอร์กำลังปิดรับ (quiescing)'],
+        ['rejected', 'session is temporarily locked for durable history cutover', 'จอถูกล็อกชั่วคราว (cutover_locked)'],
+        ['rejected', 'keys required', 'เซิร์ฟเวอร์ไม่รับใบส่ง (keys_required)'],
         ['rejected', 'http_401', 'เซิร์ฟเวอร์ตอบ 401 (http_401)'],
         ['uncertain', 'custom_gate', 'ส่งไม่สำเร็จ (custom_gate)'],
         ['uncertain', 'not a code CANARY_TEXT_send_reason_9f3a', 'ส่งไม่สำเร็จ (unknown)'],
