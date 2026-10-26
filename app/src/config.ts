@@ -31,10 +31,13 @@ export type SubmissionTransport = (
  * - `sent`: the host delivered the whole text; the shell behaves exactly as a
  *   successful step-by-step submission (the draft stays cleared).
  * - `rejected`: the host refused before any byte reached the terminal; the
- *   shell restores the draft so the user can edit or resend.
+ *   shell restores the draft. A `reason` is named on the existing notice;
+ *   without one the refusal stays silent.
  * - `uncertain`: delivery may or may not have happened (for example the
- *   transport failed after it started). The shell restores the draft, shows
- *   `AppLabels.submissionUncertain`, and never retries on its own.
+ *   transport failed after it started). The shell restores the draft and
+ *   names `reason` on that same notice, or shows
+ *   `AppLabels.submissionUncertain` when the receipt has no reason. It never
+ *   retries on its own.
  *
  * `submissionId` belongs to the host; the shell neither creates nor reads it. */
 export interface SubmissionReceipt {

@@ -3,6 +3,18 @@
 Consumers pin the immutable `vX.Y.Z-dist` tags (prebuilt dists, no lifecycle
 scripts): `thumbmux@github:<owner>/<repo>#v0.22.0-dist`.
 
+## v0.23.2 — SEND failure bar names the reason
+
+- app: the existing compose failure bar now ends with the reason code the
+  submission receipt already carried — `network`, `http_<status>`,
+  `unexpected_response`, `in_doubt`, or a server code — behind a short Thai
+  phrase (`submission-notice.ts`, used by `SessionView` and `EmbedView`).
+  Anything that is not a code shows as `unknown`; the typed text is never echoed.
+  Fixed middleware sentences fold to codes (`keys_required`, `quiescing`,
+  `cutover_locked`, `admission_closed`), matching the host access log.
+- Release metadata: align the five package versions and internal dependencies
+  at 0.23.2.
+
 ## v0.23.1 — release preparation
 
 - Tests: add a controlled pending-at-Q schedule and a pre-emitted control for
