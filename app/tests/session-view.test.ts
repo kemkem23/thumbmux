@@ -1321,7 +1321,7 @@ describe('mountable terminal views', () => {
       expect(submitCalls).toBe(1);
     });
 
-    test(`WJ-A ${label}: rejected restores the draft silently; a rejected promise restores it with the notice`, async () => {
+    test(`WJ-A ${label}: rejected with a reason restores the draft and names it; a thrown submit uses submissionUncertain`, async () => {
       const noticeText = 'WJ notice: delivery unknown';
       for (const outcome of ['rejected', 'throws'] as const) {
         const sessionName = `sh-${label}-submit-${outcome}`;
@@ -1356,10 +1356,63 @@ describe('mountable terminal views', () => {
         }).toEqual({
           outcome,
           draft: WJ_MULTILINE,
-          notice: outcome === 'throws' ? noticeText : null,
+          notice: outcome === 'throws' ? noticeText : 'รอบเซสชันไม่ตรง (lifecycle_mismatch)',
           submitCalls: 1,
           stepCalls: 0,
         });
+      }
+    });
+
+    test(`WJ-A ${label}: the existing bar names each receipt.reason and not the draft`, async () => {
+      const draft = 'CANARY_TEXT_send_reason_9f3a';
+      const cases: ReadonlyArray<readonly ['uncertain' | 'rejected', string, string]> = [
+        ['uncertain', 'network', 'เน็ตขาด (network)'],
+        ['uncertain', 'http_502', 'เซิร์ฟเวอร์ตอบ 502 (http_502)'],
+        ['uncertain', 'unexpected_response', 'คำตอบไม่ใช่ใบรับ (unexpected_response)'],
+        ['uncertain', 'in_doubt', 'เซิร์ฟเวอร์ไม่แน่ใจ (in_doubt)'],
+        ['rejected', 'lifecycle_mismatch', 'รอบเซสชันไม่ตรง (lifecycle_mismatch)'],
+        ['rejected', 'transport_unavailable', 'ส่งเข้าจอไม่ได้ (transport_unavailable)'],
+        ['rejected', 'ledger_unavailable', 'บันทึกการส่งใช้ไม่ได้ (ledger_unavailable)'],
+        ['rejected', 'id_conflict', 'รหัสส่งซ้ำ (id_conflict)'],
+        ['rejected', 'text_empty', 'ข้อความว่าง (text_empty)'],
+        ['rejected', 'text_too_large', 'ข้อความยาวเกิน (text_too_large)'],
+        ['rejected', 'text_bare_cr', 'มีอักขระ CR (text_bare_cr)'],
+        ['rejected', 'text_control_char', 'มีอักขระควบคุม (text_control_char)'],
+        ['rejected', 'text_invalid', 'ข้อความใช้ไม่ได้ (text_invalid)'],
+        ['rejected', 'submission_required', 'ไม่มีใบส่ง (submission_required)'],
+        ['rejected', 'submission_invalid', 'ใบส่งใช้ไม่ได้ (submission_invalid)'],
+        ['rejected', 'keys_with_submission', 'ส่งสองแบบพร้อมกัน (keys_with_submission)'],
+        ['rejected', 'id_invalid', 'รหัสส่งใช้ไม่ได้ (id_invalid)'],
+        ['rejected', 'instance_id_invalid', 'รหัสรอบใช้ไม่ได้ (instance_id_invalid)'],
+        ['rejected', 'agent_invalid', 'ชนิดเอเจนต์ใช้ไม่ได้ (agent_invalid)'],
+        ['rejected', 'storage-paused', 'ที่เก็บข้อมูลพักอยู่ (storage-paused)'],
+        ['rejected', 'unauthorized', 'ไม่ได้รับอนุญาต (unauthorized)'],
+        ['rejected', 'http_401', 'เซิร์ฟเวอร์ตอบ 401 (http_401)'],
+        ['uncertain', 'custom_gate', 'ส่งไม่สำเร็จ (custom_gate)'],
+        ['uncertain', 'not a code CANARY_TEXT_send_reason_9f3a', 'ส่งไม่สำเร็จ (unknown)'],
+      ];
+      for (const [index, [status, reason, expected]] of cases.entries()) {
+        const { target } = mountView(component, {
+          session: `sh-${label}-reason-${index}`,
+          adapters: {
+            termProps: () => ({ claimGeometry: false }),
+            sendKeys: () => {},
+            submitText: async () => ({ status, reason, submissionId: 'host-id' }),
+            labels: { submissionUncertain: 'STATIC_SENTENCE' },
+          } satisfies AppAdapters,
+        });
+        await tick();
+        await composeAndSend(target, draft);
+        await flushPromises();
+        await flushPromises();
+        const notice = submissionNotice(target);
+        expect({ status, reason, notice, draft: composerDraft(target) }).toEqual({
+          status,
+          reason,
+          notice: expected,
+          draft,
+        });
+        expect(notice ?? '').not.toContain(draft);
       }
     });
   }
