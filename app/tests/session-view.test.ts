@@ -1401,12 +1401,18 @@ describe('mountable terminal views', () => {
         ['uncertain', 'not a code CANARY_TEXT_send_reason_9f3a', 'ส่งไม่สำเร็จ (unknown)'],
       ];
       for (const [index, [status, reason, expected]] of cases.entries()) {
+        let submitCalls = 0;
+        let stepCalls = 0;
         const { target } = mountView(component, {
           session: `sh-${label}-reason-${index}`,
           adapters: {
             termProps: () => ({ claimGeometry: false }),
             sendKeys: () => {},
-            submitText: async () => ({ status, reason, submissionId: 'host-id' }),
+            sendSubmissionKeys: async () => { stepCalls += 1; },
+            submitText: async () => {
+              submitCalls += 1;
+              return { status, reason, submissionId: 'host-id' };
+            },
             labels: { submissionUncertain: 'STATIC_SENTENCE' },
           } satisfies AppAdapters,
         });
@@ -1415,11 +1421,20 @@ describe('mountable terminal views', () => {
         await flushPromises();
         await flushPromises();
         const notice = submissionNotice(target);
-        expect({ status, reason, notice, draft: composerDraft(target) }).toEqual({
+        expect({
+          status,
+          reason,
+          notice,
+          draft: composerDraft(target),
+          submitCalls,
+          stepCalls,
+        }).toEqual({
           status,
           reason,
           notice: expected,
           draft,
+          submitCalls: 1,
+          stepCalls: 0,
         });
         expect(notice ?? '').not.toContain(draft);
       }
