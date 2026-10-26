@@ -1394,6 +1394,7 @@ describe('mountable terminal views', () => {
         ['rejected', 'unauthorized', 'ไม่ได้รับอนุญาต (unauthorized)'],
         ['rejected', 'service is quiescing; mutations are unavailable', 'เซิร์ฟเวอร์กำลังปิดรับ (quiescing)'],
         ['rejected', 'session is temporarily locked for durable history cutover', 'จอถูกล็อกชั่วคราว (cutover_locked)'],
+        ['rejected', 'managed session launch admission is closed: POST /api/sessions/x/keys', 'ประตูรับงานปิดอยู่ (admission_closed)'],
         ['rejected', 'keys required', 'เซิร์ฟเวอร์ไม่รับใบส่ง (keys_required)'],
         ['rejected', 'http_401', 'เซิร์ฟเวอร์ตอบ 401 (http_401)'],
         ['uncertain', 'custom_gate', 'ส่งไม่สำเร็จ (custom_gate)'],

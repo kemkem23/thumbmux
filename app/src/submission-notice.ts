@@ -30,19 +30,21 @@ const KNOWN: Readonly<Record<string, string>> = {
   unauthorized: 'ไม่ได้รับอนุญาต',
   quiescing: 'เซิร์ฟเวอร์กำลังปิดรับ',
   cutover_locked: 'จอถูกล็อกชั่วคราว',
+  admission_closed: 'ประตูรับงานปิดอยู่',
   keys_required: 'เซิร์ฟเวอร์ไม่รับใบส่ง',
 };
 
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
 /** Middleware refusals arrive as a sentence in `error`, not a code. Fold the
- * three fixed sentences to the same codes the server log uses, and never
+ * fixed sentences to the same codes the server log uses, and never
  * echo the sentence. */
 function asReasonCode(value: string): string {
   const trimmed = value.trim();
   if (trimmed === 'keys required') return 'keys_required';
   if (trimmed.startsWith('service is quiescing')) return 'quiescing';
   if (trimmed.includes('durable history cutover')) return 'cutover_locked';
+  if (trimmed.includes('admission is closed')) return 'admission_closed';
   return trimmed;
 }
 
