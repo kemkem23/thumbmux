@@ -35,9 +35,20 @@ const KNOWN: Readonly<Record<string, string>> = {
 
 const CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
+/** Middleware refusals arrive as a sentence in `error`, not a code. Fold the
+ * three fixed sentences to the same codes the server log uses, and never
+ * echo the sentence. */
+function asReasonCode(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === 'keys required') return 'keys_required';
+  if (trimmed.startsWith('service is quiescing')) return 'quiescing';
+  if (trimmed.includes('durable history cutover')) return 'cutover_locked';
+  return trimmed;
+}
+
 /** Thai phrase plus the reason code, for one receipt.reason. */
 export function submissionFailureNotice(reason: string): string {
-  const code = reason.trim();
+  const code = asReasonCode(reason);
   const http = /^http_(\d{3})$/.exec(code);
   if (http) return `เซิร์ฟเวอร์ตอบ ${http[1]} (${code})`;
   const phrase = KNOWN[code];
