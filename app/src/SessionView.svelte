@@ -176,6 +176,7 @@
     type OverlayTransition,
     type OverlayState,
   } from './overlay';
+  import { noticeAfterSubmit } from './submission-notice';
   import { normalizeSessionRows } from './sessions-store';
 
   let {
@@ -535,16 +536,18 @@
     void Promise.resolve()
       .then(() => submitText(targetSession, text))
       .then(
-        (receipt) => receipt?.status,
-        () => 'uncertain' as const,
-      )
-      .then((status) => {
-        if (status === 'sent') return;
-        prefillOnError(composer, text);
-        // Anything but an explicit refusal may have reached the terminal.
-        // Never retry here: the host owns ids and retry policy.
-        if (status !== 'rejected') submissionNotice = labels.submissionUncertain;
-      });
+        (receipt) => {
+          if (receipt?.status === 'sent') return;
+          prefillOnError(composer, text);
+          // Never retry here: the host owns ids and retry policy.
+          const notice = noticeAfterSubmit(receipt, labels.submissionUncertain);
+          if (notice) submissionNotice = notice;
+        },
+        () => {
+          prefillOnError(composer, text);
+          submissionNotice = labels.submissionUncertain;
+        },
+      );
   }
 
   function prefillComposer(text: string): void {
@@ -1275,7 +1278,7 @@
   {/if}
 
   {#if submissionNotice}
-    <div class="submission-notice" role="status">
+    <div class="submission-notice" role="status" lang="th">
       <span data-testid="submission-notice">{submissionNotice}</span>
       <button
         type="button"
@@ -1392,7 +1395,9 @@
     background: var(--hud);
     color: var(--hud-fg);
     font: 600 12px var(--font-thai, var(--font-mono));
-    line-height: 1.5;
+    line-height: 1.7;
+    letter-spacing: 0;
+    word-break: keep-all;
   }
   .submission-notice span { flex: 1; min-width: 0; padding: 8px 0; }
   .submission-notice button {
