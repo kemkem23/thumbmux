@@ -1,79 +1,91 @@
 # thumbmux
 
-**thumbmux — the tmux manager for your server.** Run and watch AI agents and long jobs from your phone or browser — smooth 120Hz scrolling, keyboard-aware mobile compose, and zero lost scrollback.
+**thumbmux — the tmux manager for your server.** Run, watch, and steer AI agents (`claude`, `codex`, `agy`, shells) and long-running jobs from your phone or browser — smooth 120Hz scrolling, keyboard-aware compose, and durable scrollback locked inside your private Tailscale mesh.
 
-> จัดการ `tmux` บนเซิร์ฟเวอร์จากมือถือหรือเบราว์เซอร์ — สั่งงานและติดตาม AI agent ได้ลื่นเหมือนอยู่หน้าเครื่อง
+> จัดการ `tmux` บนเซิร์ฟเวอร์จากมือถือหรือเบราว์เซอร์ — สั่งงาน ดูผล และพับบันทึก tool ของ AI agent ได้ลื่นเหมือนนั่งหน้าเครื่อง
 
-**v0.23.2** · **MIT** · **Bun + Svelte 5 + TypeScript** · **0 runtime deps in `thumbmux/core`**
+**`v0.23.2`** · **MIT** · **Bun + Svelte 5 + TypeScript** · **`thumbmux/core`: 10,605 LOC, 0 runtime deps**
 
 ---
 
+## Real UI in production
+
+Live read-only capture from our running server UI (**frosted blur covers private session names, paths, hosts, and tokens — nothing faked**):
+
 <p align="center">
-  <img src="docs/assets/demo-hub-390.png" alt="thumbmux mobile session hub at 390px showing live miniature previews for agent, build, deploy, and logs" width="320" />
+  <img src="docs/assets/live-ui-real.webp" alt="Real live screen recording of thumbmux session sidebar, collapsed agent tool pills, live scroll, and compose dock with sensitive identifiers blurred" width="100%" />
+</p>
+
+<p align="center">
+  <img src="docs/assets/live-mobile-390.png" alt="Real thumbmux mobile 390px view showing Thai and English agent terminal output and compose bar with private fields blurred" width="320" />
   &nbsp;&nbsp;
-  <img src="docs/assets/demo-mobile-390.png" alt="thumbmux mobile session view at 390px showing Thai and CJK text, link detection, shortcut bar, and ComposerDock" width="320" />
+  <img src="docs/assets/live-desktop-1280.png" alt="Real thumbmux desktop 1280px split view showing multi-session sidebar, agent tool pills, and compose dock with private fields blurred" width="600" />
 </p>
 
 <p align="center">
-  <img src="docs/assets/demo-desktop-1280.png" alt="thumbmux desktop session view at 1280x800 showing terminal output, shortcut bar, and action menu" width="90%" />
+  <sub>Captured directly from the live production server at <code>390px</code> mobile and <code>1280px</code> desktop; Gaussian blur masks private hostnames, file paths, and session IDs while preserving genuine terminal output.</sub>
 </p>
 
-## Why thumbmux
+## Why run your agents through thumbmux
 
-- **Stay in flow from your phone** — A 120Hz compositor-scroll viewer (`60`-row overscan per side) and keyboard-aware `ComposerDock` (`COMPOSE` draft editor + `DIRECT` raw keys) let you review diffs, tap links, and send prompts cleanly on a 390px screen. Send-once submission never silently retries, and `v0.23.2` names the exact failure code (`network`, `http_<status>`, `in_doubt`, etc.) if delivery fails.
-- **Keep AI agents & long jobs alive across drops** — Sessions live inside server `tmux`, so closing your phone or switching networks never interrupts a run. `FileHistoryArchive` retains `20,000` archived lines per session by default (`TermView` keeps `10,000` rows or `8 MiB` in browser RAM), and `v0.23.0` adds opt-in `ownedLifetime` graceful WebSocket drain across restarts.
-- **Read agent output without tool-call spam** — Run Claude Code, Codex, `agy`, or any CLI in `tmux`. Built-in `TOOLS` folding (`SHOW` / `HIDE` / `DISTILL` for Claude Code; `SHOW` / `HIDE` for Codex), clickable URLs & OSC 8 hyperlinks, and pane search keep noisy tool blocks tidy.
-- **Crisp Thai, CJK & box-drawing layout** — Proper combining-mark cell metrics, wide CJK glyphs, emoji, `U+2500–257F` alignment, and responsive `UI-COMPACT` layouts tuned for both phones and small screens.
-- **Private by design over Tailscale** — Binds loopback (`127.0.0.1`) by default with zero public ports. Expose it strictly to your own devices with `tailscale serve` (no Funnel, no extra password over your tailnet), or attach `createTokenGuard()` for LAN access.
+- **Walk away from your desk without losing context** — Your jobs and AI agents run inside server `tmux`. Reconnect from cellular or Wi-Fi anytime: `FileHistoryArchive` retains `20,000` archived lines per session by default (`TermView` holds `10,000` rows or `8 MiB` in the browser), and `v0.23.0` adds opt-in `ownedLifetime` graceful WebSocket quiesce and drain across restarts.
+- **Built for one-handed phone control, not pinch-zoomed desktop panes** — A 120Hz `translate3d` compositor viewer (`60`-row overscan per side) pairs with a keyboard-aware `ComposerDock` (`COMPOSE` draft editor + `DIRECT` raw key mode). Since `v0.22.0`, compose delivery sends strictly once (`SubmissionReceipt`) without silent retries, and `v0.23.2` names the exact failure code (`network`, `http_<status>`, `in_doubt`, etc.) if delivery fails.
+- **Collapse noisy agent tool calls on a 6-inch screen** — Run Claude Code, Codex, `agy`, or any CLI in `tmux`. Built-in `TOOLS` folding (`SHOW` / `HIDE` / `DISTILL` for Claude Code; `SHOW` / `HIDE` for Codex) keeps terminal transcripts clean while preserving clickable OSC 8 / URL links, raw copy, and in-pane search.
+- **Readable Thai, CJK, emoji & box-drawing geometry** — Correct Thai combining-mark cell metrics, wide CJK glyphs, `U+2500–257F` line alignment, and `UI-COMPACT` responsive chrome tuned for phones and short laptop viewports.
+- **Private by default over Tailscale** — Binds loopback (`127.0.0.1`) with zero public ports. Expose privately to your own devices via `tailscale serve` (no Tailscale Funnel, no extra tailnet login wall), or wrap routes with `createTokenGuard()` when sharing over a LAN.
 
-## Who it's for
-
-- **Solo devs & server operators** running Claude Code, Codex, `agy`, builds, or migrations on a home server or VPS and checking in from a phone over Tailscale.
-- **Tool & dashboard builders** who want embeddable Svelte 5 + Bun components (`thumbmux/app`, `thumbmux/svelte`, `thumbmux/server`, `thumbmux/core`) instead of building a bespoke PTY/tmux streaming layer.
-
-## How it works
+## Inside the engine
 
 <p align="center">
-  <img src="docs/assets/stack-flow.svg" alt="thumbmux architecture flow: CLI agents in tmux to Bun server and WebSocket mux push-on-change diff to Svelte 5 120Hz viewer on phone and desktop over Tailscale" width="100%" />
+  <img src="docs/assets/stack-flow.svg" alt="thumbmux cyberpunk HUD animated SVG flowchart: AI agents and shells in tmux, Bun TmuxWsMux 3D core with push-on-change diff and deflate, Svelte 5 120Hz viewer, magenta Compose return loop, and private Tailscale mesh" width="100%" />
 </p>
 
 <p align="center">
-  <sub>Animated SVG · <a href="docs/assets/stack-flow.png">View static PNG fallback</a></sub>
+  <sub>Self-contained CSS + SMIL animated SVG (no scripts, no external fetches) · <a href="docs/assets/stack-flow.png">Static PNG fallback</a> · <a href="docs/assets/hero-stack.mp4">Watch full 1280×760 30fps MP4</a></sub>
 </p>
 
-1. **Agents & shells run inside `tmux`** — Any CLI (`claude`, `codex`, `agy`, builds, logs) stays persistent on your server regardless of browser state.
-2. **Bun server + `TmuxWsMux` fans out one stream to many viewers** — Instead of polling every connected phone or tab independently, `pipe-pane` dirty signals push only changed lines over WebSocket (paired with Bun per-message deflate and slow-client backpressure protection), falling back to adaptive polling (`250 ms` idle / `100 ms` for `5 s` after input) when `pipes` is omitted.
-3. **Svelte 5 `TermView` + `ComposerDock` renders at display refresh rate** — GPU-translated viewport rows (`60`-row overscan per side), touch-first selection & compose dock, and multi-session `SessionGrid` previews.
-4. **Tailscale keeps the perimeter private** — Proxy localhost cleanly through `tailscale serve` so only your tailnet devices can connect.
+<p align="center">
+  <img src="docs/assets/hero-stack.webp" alt="3D WebSocket mux telemetry HUD showing 3-orb split-merge burst phase, self-drawing pipeline bezier trails, odometer counters, and live event waterfall log" width="100%" />
+</p>
 
-### By the numbers (verified on `0.23.2`)
+1. **Agents & shells stay alive inside `tmux`** — Interactive CLIs (`claude`, `codex`, `agy`, `sh`, builds, monitors) attach to persistent `tmux` panes addressed explicitly (`=session:0.0`).
+2. **One `TmuxWsMux` fans out one capture to every connected browser** — `pipe-pane` dirty triggers push changed lines over WebSocket with optional Bun per-message deflate and slow-viewer backpressure protection (dropping backlogged sockets after `30 s` / `8 MiB`). Without `pipes`, adaptive polling steps down automatically (`250 ms` idle / `100 ms` for `5 s` after input).
+3. **Svelte 5 `TermView` + `ComposerDock` paints smoothly at refresh rate** — GPU-translated viewport rows (`60`-row overscan per side), `TOOLS` call folding (`SHOW` / `HIDE` / `DISTILL`), and a bidirectional magenta input control loop (`COMPOSE` / `DIRECT` → `submitPlan()` → `tmux`).
+4. **Tailscale closes the perimeter** — Loopback binding on the server paired with `tailscale serve` restricts access cleanly to devices on your tailnet.
 
-| Metric | Verified value in source |
+### Verified numbers on `0.23.2`
+
+| Surface | Measured fact in source |
 |---|---|
 | **Shipped release** | `0.23.2` (`v0.23.2-dist`) |
 | **Core engine (`core/src`)** | `10,605` lines of production TypeScript, **0 runtime dependencies** |
 | **Viewport overscan** | `60` rows rendered above & below visible viewport (`TermView`) |
-| **Client scrollback retention** | `10,000` rows or `8 MiB` byte budget |
-| **Server archive default** | `20,000` lines per session (`FileHistoryArchive.maxLines`) |
-| **Fallback poll interval** | `250 ms` idle / `100 ms` for `5 s` after input (no `pipe-pane`) |
-| **Slow-client shed defaults** | Drops slow viewer only after `30 s` continuous backpressure or `8 MiB` backlog |
+| **Client scrollback budget** | `10,000` rows or `8 MiB` byte limit |
+| **Server history archive** | `20,000` lines per session default (`FileHistoryArchive.maxLines`) |
+| **Fallback poll interval** | `250 ms` idle / `100 ms` for `5 s` after input (when `pipe-pane` is off) |
+| **Backpressure shed guard** | `30 s` continuous backpressure or `8 MiB` queue depth |
+
+## Who uses thumbmux
+
+- **Engineers running overnight AI agents & builds** who want to check progress, collapse tool noise, inspect diffs, and send next steps from iOS/Android over Tailscale.
+- **Tool & orchestrator builders** composing `thumbmux/app`, `thumbmux/svelte`, `thumbmux/server`, and `thumbmux/core` directly inside their own Svelte 5 + Bun UI.
 
 ## 60-second start
 
-### Option 1: Try the isolated demo right now
+### Try the standalone demo
 
-Requires `bun` and `tmux` on macOS or Linux:
+Requires `bun` and `tmux` on Linux or macOS:
 
 ```bash
 git clone https://github.com/kemkem23/thumbmux
 cd thumbmux && bun install
 bun run demo            # binds 127.0.0.1 only
-bun run demo -- --host  # LAN access protected by one-time URL token
+bun run demo -- --host  # LAN access guarded by a one-time URL token
 ```
 
-### Option 2: Install in your Bun + Svelte 5 app
+### Add the prebuilt package to a Bun + Svelte 5 project
 
-Pin the newest published prebuilt immutable `-dist` tag (`v0.x.y-dist` contains built `core`, `server`, `svelte`, and `app` outputs with zero lifecycle scripts). Never hardcode a minor glob like `v0.8.*-dist` — list all `refs/tags/v0.*-dist` tags so upgrades keep moving forward:
+Pin the latest published immutable `-dist` tag (`v0.x.y-dist` bundles prebuilt `core`, `server`, `svelte`, and `app` outputs with zero install scripts). Always query `'refs/tags/v0.*-dist'` rather than hardcoding a minor glob like `v0.8.*-dist`:
 
 ```bash
 THUMBMUX_TAG="$(git ls-remote --tags https://github.com/kemkem23/thumbmux \
@@ -88,9 +100,9 @@ fi
 
 ## Quickstart
 
-This minimal pair runs the stock tmux driver, HTTP/WebSocket routes, and full `ThumbmuxApp` UI on loopback `127.0.0.1` (keep it loopback-only unless guarded by Tailscale tailnet identity or `createTokenGuard()`).
+This minimal server/client pair wires the stock `tmux` driver, HTTP/WebSocket routes, and `ThumbmuxApp` UI on loopback `127.0.0.1`. Keep it loopback-only unless shielded by Tailscale or `createTokenGuard()`.
 
-**Server (`server.ts`)** — `createAppRoutes()` supplies `GET /api/sessions`, `POST /api/spawn`, `DELETE /api/sessions/:name`, and the `/ws/tmux` WebSocket mux:
+**Server (`server.ts`)** — `createAppRoutes()` serves `GET /api/sessions`, `POST /api/spawn`, `DELETE /api/sessions/:name`, and `/ws/tmux`:
 
 <!-- quickstart:server -->
 ```ts
@@ -123,26 +135,26 @@ const adapters: AppAdapters = {};
 mount(ThumbmuxApp, { target, props: { adapters } });
 ```
 
-Expose your loopback listener privately to your phone and laptop over Tailscale (never `--funnel`):
+Expose privately across your tailnet (never `--funnel`):
 
 ```bash
 tailscale serve --bg http://127.0.0.1:3000
 ```
 
-See [docs/app.md](docs/app.md) before adding authentication wrappers, image paste uploads, server preferences, or custom host adapters.
+See [docs/app.md](docs/app.md) before adding custom auth guards, image uploads, server preferences, or host panels.
 
 ## Security & FAQ
 
-- **Why Tailscale-only?** Terminal access equals shell access. Binding `127.0.0.1` and serving via `tailscale serve` (without Funnel or public port forwards) lets WireGuard device identity protect the socket — no extra login password needed over your private tailnet. If you expose directly on a LAN or reverse proxy, wrap routes with `createTokenGuard()` (see the demo for a working pattern).
-- **Is `POST /api/spawn` safe to expose?** `createSpawnHandler` can start caller-supplied shell commands inside `tmux`. Always guard it behind tailnet isolation or interactive auth and restrict working directories with `validateCwd`.
-- **Which AI agent CLIs work?** Any TUI or CLI works inside `tmux` (`agy`, `claude`, `codex`, builds, repls). Tool-call folding (`SHOW` / `HIDE` / `DISTILL`) recognizes Claude Code and Codex output directly.
-- **How do updates work?** Consumers pin immutable `v0.x.y-dist` tags (prebuilt `dist/` outputs committed on the tag). Hosts can safely automate updates between `-dist` tags by verifying HTTP health and rolling back the pinned ref + lockfile if health checks fail.
+- **How does Tailscale security work here?** Your server binds only `127.0.0.1`, and `tailscale serve` terminates TLS exclusively for authenticated nodes on your tailnet (no public internet port, no password database needed on a personal tailnet). For shared LAN or reverse-proxy setups, guard endpoints with `createTokenGuard()`.
+- **Is `POST /api/spawn` dangerous if unguarded?** Yes — `createSpawnHandler` runs caller-supplied commands in `tmux`. Protect it behind tailnet isolation or auth and restrict paths with `validateCwd`.
+- **Which agents work?** Any TUI or CLI in `tmux` (`claude`, `codex`, `agy`, shells, `htop`, `vim`). Built-in `TOOLS` folding supports Claude Code (`SHOW` / `HIDE` / `DISTILL`) and Codex (`SHOW` / `HIDE`).
+- **How are upgrades kept safe?** Every release publishes an immutable `v0.x.y-dist` tag containing compiled artifacts, allowing deterministic pinning and clean HTTP-health rollback between releases.
 
 ## Developer Reference
 
 ### Lower-level building blocks
 
-Every public layer can also be imported directly below `ThumbmuxApp`:
+All four package layers are exported individually below `ThumbmuxApp`:
 
 ```ts
 import {
@@ -179,15 +191,15 @@ import {
 </script>
 ```
 
-**TypeScript consumers of `thumbmux/svelte` and `thumbmux/app` must set `"moduleResolution": "bundler"`** (or an equivalent resolver that resolves `./TermView.svelte` to its adjacent `.d.ts`). Under `moduleResolution` `node16` / `nodenext`, the published Svelte declarations fail with TS2307 on sibling `.svelte` imports (`thumbmux/server` and `thumbmux/core` stay clean under both).
+**TypeScript consumers of `thumbmux/svelte` and `thumbmux/app` must set `"moduleResolution": "bundler"`** (or an equivalent resolver that resolves `./TermView.svelte` to its adjacent `.d.ts`). Under `moduleResolution` `node16` / `nodenext`, published Svelte declarations fail with TS2307 on sibling `.svelte` imports (`thumbmux/server` and `thumbmux/core` stay clean under both).
 
 ### Opt-in dense session chrome
 
-`TermHud` supports `layout="dense"` and `SessionGrid` supports `cardLayout="dense"` (alongside `SessionThumb density="dense"`) for hosts displaying dense operator notes/summaries without losing the stock layout by default. See [docs/hub.md](docs/hub.md) and [docs/app.md](docs/app.md).
+`TermHud` accepts `layout="dense"`, `SessionGrid` accepts `cardLayout="dense"`, and `SessionThumb` accepts `density="dense"` for compact metadata bars (`hubPresentation.cardLayout` / `sessionPresentation.headerLayout` on `ThumbmuxApp`). See [docs/hub.md](docs/hub.md) and [docs/app.md](docs/app.md).
 
 ## Wiring
 
-Attach `FileHistoryArchive`, optional `pipe-pane` dirty signals, and per-message compression to a single shared `TmuxWsMux`:
+Attach `FileHistoryArchive`, optional `pipe-pane` triggers, and per-message compression to a shared `TmuxWsMux`:
 
 ```ts
 import { FileHistoryArchive, TmuxWsMux } from 'thumbmux/server';
@@ -216,11 +228,11 @@ ws.onmessage = (e) => mux.handleMessage(JSON.parse(e.data), ws);
 ws.onclose  = () => mux.unsubscribeAll(ws);
 ```
 
-Without `pipes`, live updates fall back to adaptive polling (`250 ms` idle / `100 ms` for `5 s` after input). Without `archive`, live viewing works normally and older history expansion returns an empty page. Forward Bun's `drain(ws)` callback via `mux.onDrain(ws)` when enabling backpressure scheduling.
+Without `pipes`, updates fall back cleanly to adaptive polling (`250 ms` idle / `100 ms` for `5 s` after input). Forward Bun's `drain(ws)` hook via `mux.onDrain(ws)` when enabling slow-client backpressure scheduling.
 
 ### Spawn endpoint (`createSpawnHandler`)
 
-`LaunchSheet` emits a `LaunchSpec` via `onLaunch(spec, contextId)` without hardcoding transport policy:
+`LaunchSheet` emits a `LaunchSpec` via `onLaunch(spec, contextId)`:
 
 ```ts
 import type { LaunchSpec } from 'thumbmux/core';
@@ -240,7 +252,7 @@ async function launch(spec: LaunchSpec, contextId: string | null) {
 }
 ```
 
-The JSON contract accepted by `createSpawnHandler`:
+Accepted payload contract:
 
 ```ts
 type SpawnPayload = {
@@ -275,31 +287,31 @@ if (url.pathname === '/api/spawn' && req.method === 'POST') {
 }
 ```
 
-Successful spawns return `201 { ok: true, name }`; duplicate exact names return `409`; invalid payloads, blocked `cwd` paths, or `worktree: true` without both hooks return `400`.
+Successful spawns return `201 { ok: true, name }`; exact-name collisions return `409`; invalid payloads, blocked `cwd`, or `worktree: true` without both hooks return `400`.
 
 ## Host CSS custom properties (theming surface)
 
-Shipped Svelte components read host-supplied CSS custom properties mapped from `TerminalSurface` (`deriveSurface` / `defaultSurface` in `thumbmux/core`):
+Svelte components read host-supplied CSS custom properties mapped from `TerminalSurface` (`deriveSurface` / `defaultSurface` in `thumbmux/core`):
 
 | Property | Required? | Purpose |
 |---|---|---|
-| `--font-mono` | **yes** | Primary terminal font stack. `TermView` measures character width from the **computed** font to calculate columns/rows; cover box-drawing `U+2500–257F` and Thai/CJK glyphs consistently (see [docs/desktop.md](docs/desktop.md)). |
+| `--font-mono` | **yes** | Primary terminal font stack. `TermView` measures character width from computed styles; cover box-drawing `U+2500–257F` and Thai/CJK glyphs consistently (see [docs/desktop.md](docs/desktop.md)). |
 | `--font-thai` | optional | Chrome UI mixing Thai (composer, prompts, shortcuts); falls back to `--font-mono`. |
 | `--tbg` | **yes** | Terminal surface background. |
 | `--tfg` | **yes** | Primary terminal text color. |
 | `--tstage` | recommended | Outer stage backdrop behind HUD and dock. |
-| `--agent` | recommended | Accent color for borders, LEDs, focus ring. |
+| `--agent` | recommended | Accent color for borders, focus rings, LEDs. |
 | `--hud` | recommended | HUD bar background. |
-| `--hud-fg` | recommended | HUD foreground text / icons. |
+| `--hud-fg` | recommended | HUD foreground text and icons. |
 | `--hud-line` | recommended | HUD hairlines and control borders. |
 | `--dock-inset` / `--dock-full` | optional | Mobile `ComposerDock` layout insets. |
-| `--kb-inset` | optional | Extra bottom inset while software keyboard is open. |
+| `--kb-inset` | optional | Extra bottom inset while a software keyboard is open. |
 
-`SessionView` and `EmbedView` in `thumbmux/app` apply surface variables automatically; mounting `TermView` standalone requires setting `--font-mono`, `--tbg`, and `--tfg` on an ancestor.
+`SessionView` and `EmbedView` apply surface variables automatically; mounting `TermView` standalone requires setting `--font-mono`, `--tbg`, and `--tfg` on an ancestor.
 
-## Compatibility & release notes
+## Compatibility & release history
 
-Public API stability follows [CONTRACT.md](CONTRACT.md). In a source checkout:
+API stability follows [CONTRACT.md](CONTRACT.md). In a source checkout:
 
 ```bash
 bun run build:git-dist
@@ -310,24 +322,23 @@ THUMBMUX_CONTRACT_BASELINE_ROOT=/tmp/thumbmux-baseline bun run contract
 <details>
 <summary>Release highlights: v0.7.0 → v0.23.2 (click to expand)</summary>
 
-- **v0.23.2**: Compose SEND failure banner surfaces the exact failure code (`network`, `http_<status>`, `unexpected_response`, `in_doubt`, etc.) instead of generic errors, without echoing draft text.
-- **v0.23.1**: Deterministic crash-reopen diagnostics and final-frame mutation controls for durable storage tests.
-- **v0.23.0**: Opt-in `ownedLifetime: true` on `TmuxWsMux` + `quiesceAndDrain()` and `getOwnedTaskInventory()` for deterministic shutdown cleanup; portable package-local Playwright resolution.
-- **v0.22.0**: Send-once semantic COMPOSE via `SubmissionReceipt` & structured `PromptEntry` sections; opt-in NEWARCH v2 protocol & projection types (`thumbmux/pipe-history-runtime`, flag off by default).
-- **v0.20.x**: `UI-COMPACT` responsive layouts (`ActionFab`, dense `TermHud` & `SessionGrid`, compact `ComposerDock`), async `createBunTmuxDriver` activity poll, schema-5 durable projection archive & HP7 coalesced checkpoint recovery.
-- **v0.8.0 – v0.19.x**: Assembled `thumbmux/app` shell & `createAppRoutes()`, `FileHistoryArchive`, `createSpawnHandler`, `createTokenGuard`, `TOOLS` call folding (`SHOW`/`HIDE`/`DISTILL`), Thai/CJK cell fidelity, searchable terminal buffer, and OSC 8 hyperlinks.
+- **v0.23.2**: Compose SEND failure notice names the exact failure code (`network`, `http_<status>`, `unexpected_response`, `in_doubt`, admission codes) without echoing typed drafts.
+- **v0.23.1**: Deterministic crash-reopen diagnostics and final-frame mutation controls for storage verification.
+- **v0.23.0**: Opt-in `ownedLifetime: true` on `TmuxWsMux` + `quiesceAndDrain()` & `getOwnedTaskInventory()` for clean host shutdown drain; portable package-local Playwright resolution.
+- **v0.22.0 / v0.21.0**: Send-once semantic `COMPOSE` via `SubmissionReceipt` & structured `PromptEntry` sections; opt-in NEWARCH v2 protocol & projection surface (`thumbmux/pipe-history-runtime`, flag off by default).
+- **v0.20.x**: `UI-COMPACT` responsive layouts (`ActionFab`, dense `TermHud` / `SessionGrid`, single-row compact `ComposerDock`), async `createBunTmuxDriver` activity poll, schema-5 archive & coalesced recovery.
+- **v0.8.0 – v0.19.x**: Assembled `thumbmux/app` shell & `createAppRoutes()`, `FileHistoryArchive`, `createSpawnHandler()`, `createTokenGuard()`, `TOOLS` call folding (`SHOW`/`HIDE`/`DISTILL`), Thai/CJK cell accuracy, pane search, and OSC 8 links.
 
 </details>
 
 <details>
-<summary>Docs & iOS Safari notes (click to expand)</summary>
+<summary>Docs map & iOS Safari notes (click to expand)</summary>
 
-- **Application shell guide**: [docs/app.md](docs/app.md)
-- **Multi-session hub guide**: [docs/hub.md](docs/hub.md)
-- **Desktop keys & font metrics contract**: [docs/desktop.md](docs/desktop.md)
-- **Full changelog**: [CHANGELOG.md](CHANGELOG.md)
-- **Contract policy & release split**: [CONTRACT.md](CONTRACT.md) · [SPLIT.md](SPLIT.md)
-- **iOS Safari layout model**: Uses `100dvh` fixed stage with `overflow: clip`, `visualViewport` keyboard offset tracking (`--kb-inset`), explicit `touch-action` zones, and opaque HUD header so lines never slide under browser chrome.
+- **Application shell**: [docs/app.md](docs/app.md)
+- **Multi-session hub**: [docs/hub.md](docs/hub.md)
+- **Desktop keys & font metrics**: [docs/desktop.md](docs/desktop.md)
+- **Changelog · Contract · Split release**: [CHANGELOG.md](CHANGELOG.md) · [CONTRACT.md](CONTRACT.md) · [SPLIT.md](SPLIT.md)
+- **iOS Safari geometry**: Fixed `100dvh` stage with `overflow: clip`, `visualViewport` keyboard offset (`--kb-inset`), explicit `touch-action` zones, and opaque top HUD bar.
 
 </details>
 
